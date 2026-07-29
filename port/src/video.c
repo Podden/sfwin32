@@ -326,8 +326,9 @@ static void render_frame(void)
         frames++;
         if (!t0) t0 = SDL_GetTicks();
         else if (SDL_GetTicks() - t0 >= 2000) {
-            LOGT("sdl thread: %.1f loops/s", frames * 1000.0 /
-                 (SDL_GetTicks() - t0));
+            LOGI("sdl thread: %.1f loops/s, %u framebuffer accesses faulted",
+                 frames * 1000.0 / (SDL_GetTicks() - t0), g_vram_faults);
+            g_vram_faults = 0;
             frames = 0; t0 = SDL_GetTicks();
         }
     }

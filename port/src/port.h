@@ -72,6 +72,7 @@ extern int g_dump_keys;
 /* --no-extern-irq: deliver interrupts only from inside the fault handler,
  * never via SuspendThread/SetThreadContext. */
 extern int g_extern_irq;
+extern uint32_t g_vram_faults;
 
 /* DPMI descriptor table (implemented in emu.c, driven from services.c). */
 uint16_t descr_alloc(int count);

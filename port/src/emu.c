@@ -323,8 +323,17 @@ static void *xlat(int seg, uint32_t off, int *ok)
     {   /* a descriptor the game allocated and based itself: base + offset is a
          * linear address in the game's world, translated like any other */
         int i = descr_find(sel);
-        if (i >= 0 && g_descr[i].based)
-            return lin_to_ptr(g_descr[i].base_lin + off);
+        if (i >= 0 && g_descr[i].based) {
+            void *p = lin_to_ptr(g_descr[i].base_lin + off);
+            /* Accesses that land in the framebuffer are the expensive case: a
+             * game blitting through a selector faults once per pixel, which is
+             * both slow and only as correct as this translation. Counted so
+             * the cost is visible rather than guessed at. */
+            if (g_vram && (uint8_t *)p >= g_vram &&
+                (uint8_t *)p < g_vram + g_vram_size)
+                g_vram_faults++;
+            return p;
+        }
     }
 
     /* inside the loaded image -> rebase it */
@@ -1111,7 +1120,8 @@ static uint32_t g_last_ok_eip, g_handled;
  * question that matters when an init flag never gets set -- whether anything
  * writes it at all, and roughly where. */
 int g_dump_keys;                 /* --dumpkeys: log what the game thinks is held */
-int g_extern_irq = 1;            /* --no-extern-irq disables the fallback path  */
+int g_extern_irq = 1;
+uint32_t g_vram_faults;            /* --no-extern-irq disables the fallback path  */
 
 uint32_t g_watch_addr;
 int      g_watch_dwords = 1;     /* --watch ADDR:N covers a whole struct */
