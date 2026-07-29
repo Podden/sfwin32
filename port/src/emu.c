@@ -799,6 +799,13 @@ static LONG emu_veh_inner(EXCEPTION_POINTERS *ep)
     int pfx, n, mod, rf, rm;
     uint32_t ea;
 
+    /* The mouse event handler has run and returned to the address we planted
+     * for it, which is why we are here. Restore the registers the callback was
+     * injected over and put the game back where it was. Must precede the
+     * in-game test below, since the planted address is deliberately not a
+     * valid one. */
+    if (mouse_cb_returning(c)) return EXCEPTION_CONTINUE_EXECUTION;
+
     /* A vectored handler is process-wide: it sees exceptions from the SDL
      * thread's renderer, the CRT, and anything else in the process. Only the
      * game's own code is ours to emulate -- everything else must be left to
@@ -1371,7 +1378,15 @@ static void irq_deliver_pending(CONTEXT *c)
 
     if      (g_pend_irq1 > 0 && kbd_pending()) vec = 9;
     else if (g_pend_irq0 > 0)                  vec = 8;
-    else return;
+    else {
+        /* No hardware interrupt due, so this is a good moment to hand the game
+         * its mouse events -- the checks above are exactly the ones a callback
+         * needs too, and the clearance test below applies equally. */
+        if (mouse_cb_ready() &&
+            (uintptr_t)c->Esp >= (uintptr_t)c + sizeof(CONTEXT) + 64)
+            mouse_cb_deliver(c, stack_writable);
+        return;
+    }
 
     handler = dos_get_ivec(vec);
     if (handler < lo || handler >= hi) {       /* not installed yet */

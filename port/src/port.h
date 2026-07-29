@@ -183,6 +183,14 @@ void mouse_sdl_motion(int dx, int dy);      /* deltas in game pixels */
 void mouse_sdl_button(int button, int pressed);
 void mouse_sdl_release_all(void);
 int  mouse_cursor_visible(void);
+
+/* int 33h function 0x0C event handler. DESKTOP.EXE never polls for position,
+ * so the pointer only moves if the driver calls back into the game. Delivered
+ * from the same vetted point as a hardware interrupt; `mouse_cb_returning`
+ * catches the planted return address and restores the interrupted registers. */
+int  mouse_cb_ready(void);
+int  mouse_cb_deliver(CONTEXT *c, int (*stack_ok)(uintptr_t, SIZE_T));
+int  mouse_cb_returning(CONTEXT *c);
 int  ioport_in(uint16_t port, int width, uint32_t *out);
 int  ioport_out(uint16_t port, int width, uint32_t val);
 

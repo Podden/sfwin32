@@ -216,11 +216,32 @@ means anything. Buttons are released on focus loss for the same reason held
 keys are.
 
 `FIGHT.EXE` never calls int 33h — verified, with the vector confirmed routed —
-so this exists for `DESKTOP.EXE`, whose station UI is mouse-driven. Function
-0x0C (install an event handler the driver calls back on every event) is the one
-gap: nothing here can issue that far call. It is logged rather than silently
-succeeding, because a game steering from it would sit perfectly still instead
-of misbehaving visibly.
+so this exists for `DESKTOP.EXE`, whose station UI is mouse-driven.
+
+**DESKTOP reaches the driver two different ways**, and both have to work. Most
+calls go through DPMI `int 31h AX=0300` "simulate real-mode interrupt" with
+`0x33` in the call structure — the dispatcher at `0x70B3C` builds a packet
+whose first word is the function number. That arm used to answer "no mouse"
+from a stub of its own, so `mouse.c` was never consulted and the game exited
+102. Function 0x0C arrives as a *direct* `int 33h` instead.
+
+**It never polls function 0x03.** It installs an event handler with function
+0x0C and expects to be called back, so without that the pointer never moves at
+all. A real driver issues that call from inside its own interrupt, where the
+interrupted registers are already saved; we are injecting it into arbitrary
+game code, so they have to be preserved here. The handler ends in `retf`, which
+supplies the hook: it returns to whatever address we push, so we push one that
+cannot execute. The resulting fault is recognised by EIP, the registers are
+restored, and the game resumes where it was. No generated code and no second
+stack — and delivery reuses the same vetted point as a hardware interrupt.
+
+**The game's coordinate range is not the screen's.** DESKTOP sets 5120 × 3840,
+exactly 8× the 640×480 mode — sub-pixel precision. Adding raw screen pixels to
+the position therefore moved the pointer about an eighth as far as it should,
+which is a mouse that works but feels far too slow. Motion is scaled from the
+window into whatever range functions 0x07/0x08 last set, carrying the
+remainder rather than truncating it, so slow movement in a large range still
+moves instead of rounding to zero.
 
 **The second binary.** Schleichfahrt is two DOS/4GW executables that a 15 KB
 `SF.EXE` launcher chains between: `FIGHT.EXE` (combat) and `DESKTOP.EXE`
@@ -269,16 +290,23 @@ after two wrong theories drawn from a Release build's approximate
 nearest-symbol attribution.
 
 **Where DESKTOP stands.** It loads (16436 fixups, 0 skipped), takes all four
-patches, hooks its own 16 Miles entry points, installs its timer and int 24
-handlers, and enumerates VBE modes. It wants a start mode as `argv[1]` —
-`cold`, `warm`, `ice` or `autosave`, not FIGHT's `solo` — and with one of those
-it reaches its config stage, rewrites `CONFIGI.DES`, and then exits 102.
+patches, hooks its own 16 Miles entry points, sets 640×480×16 with the linear
+framebuffer, plays audio, holds its programmed 18.2 Hz timer, and responds to
+the mouse. It wants a start mode as `argv[1]` — `cold`, `warm`, `ice` or
+`autosave`, not FIGHT's `solo`.
 
-`main` is a chain of init steps, each `call <init>; test eax,eax; jne <next>`
-with its own exit code. The one returning 0 is `0x17910`, which succeeds only
-if the object at `0x1060E8` is initialised; `--watch 1060e8` proves nothing
-ever writes it. So an earlier init step is failing silently — that is the next
-thread to pull.
+Getting there meant finding why it exited 102. `main` is a chain of init steps,
+each `call <init>; test eax,eax; jne <next>` with its own exit code; the one
+returning 0 was `0x17910`, which succeeds only if the object at `0x1060E8` is
+initialised. That object turned out to be the *mouse*: the methods invoked on
+it build int 33h packets and hand them to the DPMI dispatcher. Exit 102 meant
+"no mouse", and the DPMI stub described above was the reason.
+
+Finding it needed watching a struct rather than a dword, which is why `--watch`
+now takes `ADDR:NDWORDS`. Watching `0x1060E8` alone said "never written";
+watching `0x1060E8:16` showed fields `+0C/+10/+14` being set — turning "never
+initialised" into "initialised but one field left zero", which is what pointed
+at a missing *installed* flag rather than a missing init step.
 
 **Sound.** The game drives a Sound Blaster through Miles Sound System 3.50F
 and an `AIL3DIG` driver — 16-bit real-mode code that would need an 8086

@@ -22,6 +22,7 @@
 static volatile int g_mx, g_my;             /* virtual position              */
 static volatile int g_buttons;              /* bit 0 left, 1 right, 2 middle */
 static volatile int g_mickey_x, g_mickey_y; /* since the last 0x0B           */
+static int g_acc_x, g_acc_y;                /* sub-unit motion carried over  */
 
 static int g_min_x, g_max_x, g_min_y, g_max_y;
 static int g_cursor_shown;                  /* driver-drawn cursor counter   */
@@ -36,6 +37,15 @@ static volatile int g_release_x[3], g_release_y[3];
  * the driver's own: 8 horizontally, 16 vertically. */
 static int g_mickeys_x = 8, g_mickeys_y = 16;
 static int g_double_speed = 64;
+
+/* Event-handler condition mask bits, as the driver defines them. */
+#define MEV_MOVE        0x0001
+#define MEV_LDOWN       0x0002
+#define MEV_LUP         0x0004
+#define MEV_RDOWN       0x0008
+#define MEV_RUP         0x0010
+
+static void cb_raise(int events);        /* defined with the callback below */
 
 static void mouse_set_default_range(void)
 {
@@ -59,13 +69,42 @@ static void clamp_position(void)
  * event coordinates into logical space for us, so no conversion is needed. */
 void mouse_sdl_motion(int dx, int dy)
 {
+    int sw = g_vid_w > 0 ? g_vid_w : 640;
+    int sh = g_vid_h > 0 ? g_vid_h : 480;
+    int rx = g_max_x - g_min_x + 1;
+    int ry = g_max_y - g_min_y + 1;
+    int step;
+
     if (!dx && !dy) return;
-    g_mx += dx;
-    g_my += dy;
+
+    /* The game's coordinate range is not the screen's. DESKTOP.EXE sets a
+     * range of several thousand units, so adding raw screen pixels to the
+     * position moved the pointer a fraction of the way across it -- the
+     * symptom was a mouse that worked but felt far too slow.
+     *
+     * Motion is therefore scaled from the window into whatever range function
+     * 0x07/0x08 last established, so one sweep of the window is one sweep of
+     * the range whatever units the game chose. The remainder is carried rather
+     * than truncated, or slow movement in a large range would round to zero
+     * and never move at all. */
+    if (rx > 0 && sw > 0) {
+        g_acc_x += dx * rx;
+        step = g_acc_x / sw;
+        g_acc_x -= step * sw;
+        g_mx += step;
+    }
+    if (ry > 0 && sh > 0) {
+        g_acc_y += dy * ry;
+        step = g_acc_y / sh;
+        g_acc_y -= step * sh;
+        g_my += step;
+    }
     clamp_position();
+
     /* Function 0x0B reports mickeys, not pixels. */
     g_mickey_x += dx * g_mickeys_x / 8;
     g_mickey_y += dy * g_mickeys_y / 8;
+    cb_raise(MEV_MOVE);
 }
 
 void mouse_sdl_button(int button, int pressed)
@@ -84,6 +123,8 @@ void mouse_sdl_button(int button, int pressed)
         g_release_x[button] = g_mx;
         g_release_y[button] = g_my;
     }
+    if (button == 0) cb_raise(pressed ? MEV_LDOWN : MEV_LUP);
+    else if (button == 1) cb_raise(pressed ? MEV_RDOWN : MEV_RUP);
 }
 
 /* Buttons must not stay stuck down when the window loses focus, for exactly
@@ -96,6 +137,89 @@ void mouse_sdl_release_all(void)
 }
 
 int mouse_cursor_visible(void) { return g_installed && g_cursor_shown >= 0; }
+
+/* ------------------------------------------------- event handler callback
+ *
+ * DESKTOP.EXE never polls function 0x03. It installs a handler with function
+ * 0x0C and expects the driver to *call* it whenever something happens, so
+ * without this the pointer simply never moves.
+ *
+ * A real driver issues that call from inside its own interrupt, where the
+ * interrupted registers are already saved. We are injecting it into arbitrary
+ * game code instead, so the registers have to be preserved here -- and the
+ * handler ends in `retf`, which gives us the hook to do it: it returns to
+ * whatever address we push, so we push one that cannot execute. The fault
+ * that follows is caught by EIP in the emulator, which restores the registers
+ * and resumes the game where it left off. No generated code, no second stack,
+ * and the delivery point is the one the interrupt machinery already vets. */
+#define MOUSE_CB_MAGIC 0xF0DE0000u
+
+static uint32_t g_cb_handler, g_cb_mask;
+static volatile int g_cb_pending;          /* events since the last call */
+static volatile int g_cb_events;           /* accumulated condition mask */
+
+static CONTEXT g_cb_saved;
+static int     g_cb_active;
+static uint32_t g_cb_calls;
+
+static void cb_raise(int events)
+{
+    if (!g_cb_handler) return;
+    g_cb_events |= events;
+    g_cb_pending = 1;
+}
+
+int mouse_cb_ready(void)
+{
+    return g_cb_handler && g_cb_pending && !g_cb_active;
+}
+
+/* Called from the same vetted delivery point as a hardware interrupt. */
+int mouse_cb_deliver(CONTEXT *c, int (*stack_ok)(uintptr_t, SIZE_T))
+{
+    uint32_t *sp;
+    int events;
+
+    if (!mouse_cb_ready()) return 0;
+    if (!stack_ok((uintptr_t)c->Esp - 16, 16)) return 0;
+
+    events = g_cb_events & (int)g_cb_mask;
+    g_cb_events = 0;
+    g_cb_pending = 0;
+    if (!events) return 0;              /* nothing the game asked for */
+
+    g_cb_saved = *c;
+    g_cb_active = 1;
+    if (++g_cb_calls <= 3 || (g_cb_calls % 500) == 0)
+        LOGI("mouse callback #%u: events=0x%02X at (%d,%d) buttons=%d",
+             g_cb_calls, events, g_mx, g_my, g_buttons);
+
+    /* A far call pushes CS then the return offset, which is what the
+     * handler's `retf` expects to find. */
+    c->Esp -= 8;
+    sp = (uint32_t *)(uintptr_t)c->Esp;
+    sp[0] = MOUSE_CB_MAGIC;             /* return offset -- deliberately bad */
+    sp[1] = c->SegCs;
+
+    c->Eax = (uint32_t)events;
+    c->Ebx = (uint32_t)g_buttons;
+    c->Ecx = (uint32_t)g_mx;
+    c->Edx = (uint32_t)g_my;
+    c->Esi = (uint32_t)g_mickey_x;
+    c->Edi = (uint32_t)g_mickey_y;
+    c->EFlags &= ~0x100u;               /* the handler must not single-step */
+    c->Eip = g_cb_handler;
+    return 1;
+}
+
+/* The handler has returned to the address we planted. Put the game back. */
+int mouse_cb_returning(CONTEXT *c)
+{
+    if (!g_cb_active || c->Eip != MOUSE_CB_MAGIC) return 0;
+    *c = g_cb_saved;
+    g_cb_active = 0;
+    return 1;
+}
 
 /* ------------------------------------------------------ game thread side */
 
@@ -195,15 +319,19 @@ int mouse_int33(CONTEXT *c)
         return 1;
 
     case 0x000C:                            /* set event handler           */
-    case 0x0014:                            /* swap event handler          */
-        /* A far call from the driver into game code on every event. Nothing
-         * here can issue one, and a game that steers from it would sit
-         * perfectly still rather than misbehave -- so this is worth knowing
-         * about explicitly rather than silently returning success. */
-        todo_hit("int33_callback", ax, c->Eip);
-        LOGW("int 33h AX=%04X: event handler requested; not supported. "
-             "If the mouse does nothing, this is why.", ax);
+    case 0x0014: {                          /* swap event handler          */
+        uint32_t old_h = g_cb_handler, old_m = g_cb_mask;
+        g_cb_mask    = LO16(c->Ecx);
+        g_cb_handler = c->Edx;              /* flat model: the offset is it */
+        LOGI("int 33h AX=%04X: event handler at 0x%08X (orig 0x%08X), "
+             "mask 0x%04X", ax, g_cb_handler,
+             g_img.mem ? g_cb_handler - g_img.delta : 0, g_cb_mask);
+        if (ax == 0x0014) {                 /* swap returns the previous    */
+            set16(&c->Ecx, old_m);
+            c->Edx = old_h;
+        }
         return 1;
+    }
 
     case 0x000F:                            /* set mickeys per 8 pixels    */
         g_mickeys_x = (int16_t)LO16(c->Ecx);
