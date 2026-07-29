@@ -32,6 +32,7 @@ port\build\Release\fightport.exe --assets D:\Schleichfahrt\Schleichfahrt\SF
 | `--patch A=HEX` | overwrite bytes at an original link-time address, e.g. `--patch A8F1B=EB37`; repeatable. Nothing beyond the automatic patches below is needed to run |
 | `--voices N` | sound polyphony, 1–16 (default 16; the game itself asks for 8) |
 | `--watch A` | poll a global at an original address and log every change |
+| `--dumpkeys` | every 2 s, log which scancodes the game believes are held, and the exact game port read count |
 | `--trace` | log every DOS/DPMI call |
 
 Everything is written to `fightport.log` next to the executable. `F12` or
@@ -158,8 +159,52 @@ Three details matter:
   arrive as the numeric-keypad codes.
 
 Verified end to end with `--watch`: a keypress moves the game's own key-state
-byte at `0x15DFCF + scancode` from `0x00` to `0x03` on make and to `0x02` on
-release, which is precisely what the ISR's `or`/`and` pair does.
+byte from `0x00` to `0x03` on make and to `0x02` on release, which is precisely
+what the ISR's `or`/`and` pair does. (Extended keys do not land at
+`0x15DFCF + scancode`; the ISR looks the code up in a 16-entry table at
+`0x15DC79` and stores at `0x15DFCF + 0x57 + index`, so LEFT is at `0x15E02F`.)
+
+**Held keys must be released when the window loses focus.** The ISR only clears
+a key on its break code, and SDL delivers no key-up for a key that was held
+when focus went away — so alt-tabbing mid-turn leaves the game steering in
+that direction forever. The SDL thread tracks which keys it has reported down
+and sends break codes for all of them on `FOCUS_LOST` or `MINIMIZED`
+(deliberately not on `LEAVE`, since the mouse leaving the window is normal
+during play). Confirmed by holding LEFT, minimising, and watching the state
+byte go `0x03` → `0x02`.
+
+The scancode ring between the two threads is `volatile` with an explicit
+barrier between writing the byte and publishing the tail. Without it the
+compiler is free to reorder those stores, and a consumer that sees a stale
+slot gets half of a two-byte extended sequence — a key that never comes back
+up.
+
+**The game port must read as empty, not as zero.** The symptom was the sub
+steering left and down constantly, without a single key ever being pressed.
+Keyboard, mouse and joystick all looked innocent at first: the key-state array
+at `0x15DFCF` was verifiably all-zero, the pointer the game actually indexes
+(`[0x15DFCB]`) pointed exactly where it should, `int 33h` reset reports no
+mouse, and a counter on port `0x201` seemed to show only three reads.
+
+That last one was a bad measurement, and it cost the most time. The counter
+logged on `reads < 4 || reads % 500 == 0`, so "three lines" meant *anywhere
+from 3 to 499 reads* — it could not distinguish startup detection from a
+per-frame poll. The lesson is the one that has paid off repeatedly here:
+instrument the exact quantity, not a sampled proxy.
+
+The bug itself is in how a game port is read. Bits 0-3 are one-shots: software
+strobes `0x201`, then polls until each bit falls, and *the number of iterations
+is the axis value*. The stub returned `0xF0` — low bits already clear — so
+every axis read as zero on the first poll. The game saw a perfectly functional
+stick held hard into the bottom-left corner and flew there. With nothing
+plugged in the one-shots never fire, the bits stay high, and the poll loop hits
+its own timeout; returning `0xFF` makes detection fail, and the game now
+strobes the port exactly once at startup and never again.
+
+`--dumpkeys` logs, every two seconds, which scancodes the game believes are
+held (both directly and through its indirection pointer) plus the exact game
+port read count. That combination is what separated "the input layer is lying"
+from "the input layer is fine and something else is steering".
 
 **Sound.** The game drives a Sound Blaster through Miles Sound System 3.50F
 and an `AIL3DIG` driver — 16-bit real-mode code that would need an 8086

@@ -147,6 +147,7 @@ int main(int argc, char **argv)
             audio_set_voice_count(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--watch") && i + 1 < argc)
             g_watch_addr = (uint32_t)strtoul(argv[++i], NULL, 16);
+        else if (!strcmp(argv[i], "--dumpkeys")) g_dump_keys = 1;
         else if (!strcmp(argv[i], "--trace"))  g_log_level = LOG_TRACE;
         else { usage(argv[0]); return 2; }
     }

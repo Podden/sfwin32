@@ -13,6 +13,7 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <intrin.h>     /* _ReadWriteBarrier */
 
 /* ---------------------------------------------------------------- logging */
 
@@ -520,10 +521,19 @@ int mouse_int33(CONTEXT *c)
 
 /* ------------------------------------------------------------- port I/O */
 
+/* Exact count, not a sampled one: a modulo-threshold log cannot distinguish
+ * "polled three times at startup" from "polled every frame". */
+volatile uint32_t g_joy_reads;
+
 /* VGA DAC state: writes arrive as index then R,G,B triples. */
 static int g_dac_index, g_dac_phase, g_dac_rgb[3];
-static uint8_t g_kbd_queue[64];
-static int g_kbd_head, g_kbd_tail;
+/* Written by the SDL thread, drained by the game thread's int 9 handler.
+ * Volatile and explicitly ordered: the byte must be visible before the tail
+ * that publishes it, or the consumer can read a stale slot -- which for an
+ * extended key means half of a two-byte sequence and a key that never comes
+ * back up. */
+static volatile uint8_t g_kbd_queue[64];
+static volatile int g_kbd_head, g_kbd_tail;
 
 /* The 8042 acknowledges every command byte with 0xFA, and the startup spins on
  * that ACK after sending "set LEDs" (0xED). Without it the game never gets
@@ -539,6 +549,7 @@ void kbd_push_scancode(uint8_t sc)
     int n = (g_kbd_tail + 1) % (int)sizeof g_kbd_queue;
     if (n == g_kbd_head) return;               /* full: drop, as hardware would */
     g_kbd_queue[g_kbd_tail] = sc;
+    _ReadWriteBarrier();                       /* publish the byte, then the tail */
     g_kbd_tail = n;
 }
 
@@ -581,8 +592,20 @@ int ioport_in(uint16_t port, int width, uint32_t *out)
     case 0x40: case 0x41: case 0x42:        /* PIT counters */
         *out = (uint8_t)(GetTickCount() & 0xFF);
         return 1;
-    case 0x201:                             /* joystick: none present */
-        *out = 0xF0;
+    case 0x201:
+        g_joy_reads++;
+        /* Game port, no joystick attached.
+         *
+         * An axis is read by strobing 0x201 to fire the four one-shots, then
+         * polling until the matching bit falls; the number of iterations *is*
+         * the axis value. Bits 4-7 are the buttons, active low.
+         *
+         * Returning the low bits clear says "the pulse already ended", so
+         * every axis reads as zero -- a stick pegged into the bottom-left
+         * corner, which the game dutifully flew into. With nothing plugged in
+         * the one-shots never fire at all and the bits stay high, so the poll
+         * loop hits its own timeout and the axis is discarded. */
+        *out = 0xFF;
         return 1;
     default:
         todo_hit("in", port, 0);

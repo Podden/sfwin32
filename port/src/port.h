@@ -65,6 +65,9 @@ extern const char *g_cmdline;
  * whenever it changes. Debug aid for tracking down init flags. */
 extern uint32_t g_watch_addr;
 
+/* --dumpkeys: periodically log which scancodes the game believes are held. */
+extern int g_dump_keys;
+
 /* DPMI descriptor table (implemented in emu.c, driven from services.c). */
 uint16_t descr_alloc(int count);
 void     descr_set_base(uint16_t sel, uint32_t linear);
@@ -169,6 +172,9 @@ int  dpmi_int2f(CONTEXT *c);
 int  mouse_int33(CONTEXT *c);
 int  ioport_in(uint16_t port, int width, uint32_t *out);
 int  ioport_out(uint16_t port, int width, uint32_t val);
+
+/* How many times the game has read the game port. */
+extern volatile uint32_t g_joy_reads;
 
 void kbd_push_scancode(uint8_t sc);
 int  kbd_pending(void);

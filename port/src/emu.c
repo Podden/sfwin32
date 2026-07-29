@@ -1068,6 +1068,8 @@ static uint32_t g_last_ok_eip, g_handled;
  * serviced fault and report when it changes. Cheap, and it answers the only
  * question that matters when an init flag never gets set -- whether anything
  * writes it at all, and roughly where. */
+int g_dump_keys;                 /* --dumpkeys: log what the game thinks is held */
+
 uint32_t g_watch_addr;
 static uint32_t g_watch_last;
 static int      g_watch_primed;
@@ -1429,6 +1431,36 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 
         if (g_pend_irq0 < 4) InterlockedIncrement(&g_pend_irq0);
         else                 InterlockedIncrement(&g_ticks_skipped);
+
+        {   /* Debug aid: what does the game currently believe is held down?
+             * Its int 9 ISR keeps a key-state array at 0x15DFCF indexed by
+             * scancode (extended keys at 0x57 + table index), bit 0 = down. */
+            static LARGE_INTEGER t_keys;
+            if (g_dump_keys && g_img.mem) {
+                if (!t_keys.QuadPart) t_keys = now;
+                if (now.QuadPart - t_keys.QuadPart > freq.QuadPart * 2) {
+                    const uint8_t *ks = (const uint8_t *)gp(0x0015DFCFu);
+                    /* Consumers do not use that address directly: they load a
+                     * pointer from 0x15DFCB and index *that* by scancode. If
+                     * the pointer is stale the game reads someone else's
+                     * memory as key state. */
+                    uint32_t ptr = *(uint32_t *)gp(0x0015DFCBu);
+                    const uint8_t *via = lin_to_ptr(ptr);
+                    char buf[256], buf2[256];
+                    int k, o = 0, o2 = 0;
+                    buf[0] = buf2[0] = '\0';
+                    for (k = 0; k < 0x80 && o < 200; k++)
+                        if (ks[k] & 1) o += sprintf(buf + o, "%02X ", k);
+                    for (k = 0; k < 0x80 && o2 < 200; k++)
+                        if (via[k] & 1) o2 += sprintf(buf2 + o2, "%02X ", k);
+                    LOGI("keystate: direct=[%s] ptr[0x15DFCB]=0x%08X "
+                         "(expect 0x%08X) via-ptr=[%s] joyreads=%u",
+                         buf, ptr, (uint32_t)(uintptr_t)gp(0x0015DFCFu), buf2,
+                         g_joy_reads);
+                    t_keys = now;
+                }
+            }
+        }
 
         {   /* Report the achieved rate so a mismatch with the programmed one
              * is visible rather than silently degrading the game's timing. */

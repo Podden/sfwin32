@@ -75,6 +75,7 @@ static volatile LONG g_mode_dirty;
 
 static void render_frame(void);
 static void queue_key(SDL_Scancode sc, int pressed);
+static void release_all_keys(const char *why);
 
 static DWORD WINAPI vid_thread_main(LPVOID arg)
 {
@@ -114,8 +115,14 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                      (int)e.key.keysym.scancode);
                 queue_key(e.key.keysym.scancode, e.type == SDL_KEYDOWN);
             }
-            else if (e.type == SDL_WINDOWEVENT)
+            else if (e.type == SDL_WINDOWEVENT) {
                 LOGT("SDL window event %d", (int)e.window.event);
+                /* Deliberately not LEAVE: the mouse leaving the window is
+                 * normal during play and must not drop held keys. */
+                if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
+                    e.window.event == SDL_WINDOWEVENT_MINIMIZED)
+                    release_all_keys("focus loss");
+            }
         }
         if (g_quit) {
             LOGI("window closed; shutting down");
@@ -355,18 +362,40 @@ static const keymap_ent g_keymap[] = {
 };
 #define NKEYMAP ((int)(sizeof g_keymap / sizeof g_keymap[0]))
 
+/* Which keys we have reported as held. The game's ISR keeps a key-state array
+ * and only clears a key on its break code, so a make without a matching break
+ * leaves it down forever. */
+static uint8_t g_key_down[SDL_NUM_SCANCODES];
+
 /* Queue a key event as the controller would report it: the 0xE0 prefix first
  * where applicable, then make code, or break code with bit 7 set. */
 static void queue_key(SDL_Scancode sc, int pressed)
 {
     int i;
+    if (sc < 0 || sc >= SDL_NUM_SCANCODES) return;
     for (i = 0; i < NKEYMAP; i++) {
         if (g_keymap[i].sdl != sc) continue;
+        if (pressed == g_key_down[sc]) return;      /* no redundant edges */
         if (g_keymap[i].ext) kbd_push_scancode(0xE0);
         kbd_push_scancode(pressed ? g_keymap[i].code
                                   : (uint8_t)(g_keymap[i].code | 0x80));
+        g_key_down[sc] = (uint8_t)pressed;
         return;
     }
+}
+
+/* Losing focus swallows the key-up: alt-tab away mid-turn and the game steers
+ * in that direction forever, because as far as its ISR is concerned the key
+ * was never released. Send break codes for everything we believe is held. */
+static void release_all_keys(const char *why)
+{
+    int sc, n = 0;
+    for (sc = 0; sc < SDL_NUM_SCANCODES; sc++) {
+        if (!g_key_down[sc]) continue;
+        queue_key((SDL_Scancode)sc, 0);
+        n++;
+    }
+    if (n) LOGI("input: released %d held key(s) on %s", n, why);
 }
 
 /* Game-thread side. Events and presentation belong to the SDL thread, so all
