@@ -141,6 +141,19 @@ extern uint8_t *g_window;         /* 64 KB window into g_vram              */
 extern int      g_vid_w, g_vid_h, g_vid_bpp, g_vid_pitch;
 extern int      g_vid_active;
 
+/* ------------------------------------------------------------------ audio */
+
+/* Miles Sound System reimplemented over SDL audio. `audio_init` opens the
+ * device; `audio_install_hooks` patches the AIL entry points and must run
+ * after the image is loaded and relocated. */
+int  audio_init(void);
+void audio_install_hooks(void);
+void audio_shutdown(void);
+
+/* Polyphony. The game requests NumOfVoices from CONFIG.DES (ships as 8); this
+ * raises the request. 16 is the most its own per-voice arrays can hold. */
+void audio_set_voice_count(int n);
+
 /* ------------------------------------------------------------------- host */
 
 uint32_t dos_get_ivec(int vec);

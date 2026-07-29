@@ -80,7 +80,7 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
 {
     (void)arg;
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO) != 0) {
         LOGE("SDL_Init failed: %s", SDL_GetError());
         InterlockedExchange(&g_vid_ready, -1);
         return 1;

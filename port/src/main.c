@@ -143,6 +143,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--patch") && i + 1 < argc) {
             if (!parse_patch(argv[++i])) { usage(argv[0]); return 2; }
         }
+        else if (!strcmp(argv[i], "--voices") && i + 1 < argc)
+            audio_set_voice_count(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--watch") && i + 1 < argc)
             g_watch_addr = (uint32_t)strtoul(argv[++i], NULL, 16);
         else if (!strcmp(argv[i], "--trace"))  g_log_level = LOG_TRACE;
@@ -174,6 +176,11 @@ int main(int argc, char **argv)
     add_default_patches();
     apply_patches();
     relocate_isr_stack();
+
+    /* Replaces the Miles driver stack with our own mixer. Must come after
+     * relocation, since the hooks are written into the loaded image. */
+    audio_init();
+    audio_install_hooks();
 
     /* Object 1 is code. It needs to stay writable as well as executable: the
      * startup patches selector values into its own instruction stream. */

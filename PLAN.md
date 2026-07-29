@@ -343,6 +343,8 @@ logic, and it has to be replaced anyway.
 | `ints.py` | recovers the `AH` function number at every interrupt site |
 | `dump.py` | `python dump.py 0xa8270:60` — disassembly around an address |
 | `segscan.py` | separates real `0x26` segment overrides from cosmetic `es:` on string ops → `segsites.json` |
+| `ailmap.py` | recovers the Miles Sound System API map from its debug strings |
+| `ailverify.py` | proves each hooked address by the format string it pushes; exits non-zero on mismatch |
 | `vehtest/` | the feasibility test above; `cmake -S vehtest -B vehtest/build -A Win32 && cmake --build vehtest/build --config Release` |
 
 `obj1.bin` + `obj2.bin` are already exactly what must be mapped at `0x10000`

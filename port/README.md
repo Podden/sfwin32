@@ -30,6 +30,7 @@ port\build\Release\fightport.exe --assets D:\Schleichfahrt\Schleichfahrt\SF
 | `--assets DIR` | asset directory; becomes the working directory |
 | `--args "solo"` | PSP command tail. `FIGHT.EXE` refuses to run unless `argv[1]` is `solo` — that is how `SF.EXE` launches it |
 | `--patch A=HEX` | overwrite bytes at an original link-time address, e.g. `--patch A8F1B=EB37`; repeatable. Nothing beyond the automatic patches below is needed to run |
+| `--voices N` | sound polyphony, 1–16 (default 16; the game itself asks for 8) |
 | `--watch A` | poll a global at an original address and log every change |
 | `--trace` | log every DOS/DPMI call |
 
@@ -160,6 +161,100 @@ Verified end to end with `--watch`: a keypress moves the game's own key-state
 byte at `0x15DFCF + scancode` from `0x00` to `0x03` on make and to `0x02` on
 release, which is precisely what the ISR's `or`/`and` pair does.
 
+**Sound.** The game drives a Sound Blaster through Miles Sound System 3.50F
+and an `AIL3DIG` driver — 16-bit real-mode code that would need an 8086
+interpreter plus DMA, DSP and IRQ emulation just to reach the speakers. None
+of that is necessary, because the driver is only the bottom of the stack:
+`audio.c` hooks the AIL API itself and mixes with SDL, replacing the entire
+driver layer with a few hundred lines.
+
+Two properties made that practical:
+
+- **MSS carries its own symbol table, by accident.** It is built with a debug
+  facility in which every entry point logs its own name
+  (`"AIL_start_sample(0x%X)"`), and each string is referenced from inside the
+  function it names. The relocation table therefore yields an exact API map —
+  `ailmap.py` recovers 54 entry points the game calls, with no guesswork.
+- **Miles is cdecl**, not the Watcom register convention the game itself uses,
+  so the hooks are ordinary C functions needing no thunks. `AIL_set_sample_file`
+  reading its arguments from `[esp+0x9c…]` and returning with a bare `ret` is
+  what shows this.
+
+`AIL_install_DIG_INI` returns 0 for success and fills in a driver handle, so
+handing back a token is enough for the game to consider sound available. It
+then allocates sample handles in a loop until one comes back NULL, which makes
+the voice count ours to choose (16).
+
+**Pairing a string with the nearest function start is a hint, not proof.**
+`ailmap.py` does that, and it got **six of sixteen wrong** — including one that
+pointed at `AIL_release_sequence_handle`, a MIDI call that was being answered
+with a sample count, and another at `AIL_sample_status`, which the game polls
+to find finished voices and which was being served by a three-argument no-op
+returning garbage. The result was sounds that never appeared to end.
+
+`ailverify.py` settles it properly: every wrapper *pushes its own format
+string* before calling the logger, so scanning forward from a function start
+for that push identifies it beyond doubt. It checks the table `audio.c`
+actually hooks and exits non-zero on any mismatch — worth re-running after any
+change there. The corrected map also renamed several entries:
+`set_sample_file` is really `AIL_set_sample_address`, `stop_sample` is
+`AIL_end_sample`, and what looked like `allocate_file_sample` is
+`AIL_release_sample_handle`.
+
+Semantics come from the published MSS header rather than inference:
+`SMP_FREE 1`, `SMP_DONE 2` ("finished playing, or has never been started"),
+`SMP_PLAYING 4`, and a loop count of **0 means loop forever**. Guessing at
+these produced two wrong turns — first a status polarity that made the game
+restart playing voices every frame, then silence — before the documentation
+settled them.
+
+Two further details were settled from the call sites:
+
+- `AIL_set_sample_file` is used as `AIL_set_sample_address` — the pointer is
+  raw PCM with no header of any kind and the third argument is a byte count
+  (`sub eax,2; push eax; lea eax,[esi+6]; push eax` at `0xACB5E`).
+- The data is **signed** 8-bit mono. A dump of a live buffer reads
+  `00 FF FE FD … F8 … FF 00 01 03` — a smooth waveform about zero, not about
+  `0x80`. Treating it as unsigned is audible as noise.
+
+Mixing needs one more thing. Each voice can reach full scale by itself, so
+summing several overflows, and the game routinely runs eight at once — heard
+as crackle and distortion the moment more than one sound plays. Permanently
+attenuating everything would make a lone sound quiet, and clipping sounds
+broken, so the mixer rides the gain instead: it drops immediately when a buffer
+would overflow and eases back afterwards. A single sound plays at full level, a
+busy moment is turned down smoothly. Measured with eight voices active, peaks
+sit around 17000–25000 of 32767 rather than pinned at the rail.
+
+The setters take the audio lock as well as the obvious ones: rate, volume and
+pan are read together per sample, so a half-applied change is audible even
+though the individual stores could not tear on x86.
+
+Two behaviours only show up once sound is actually working:
+
+**Setting sample data must reset the loop count.** The game sets an infinite
+loop (count 0) on some sounds and then simply does not call
+`AIL_set_sample_loop_count` for one-shots, relying on Miles clearing it when
+new data is set — visible at `0x23FC0`, where the call is skipped entirely
+unless a comparison holds. Sample handles are a reused pool, so without that
+reset a weapon firing on a handle that previously held a looping sound loops
+forever.
+
+**Polyphony is requested, not offered.** Supplying 16 sample handles achieves
+nothing on its own: the pool routine at `0x23DE0(this, count)` asks for
+`NumOfVoices` from CONFIG.DES, which ships as 8, and stops there. With eight
+voices busy a new sound has nowhere to go and the game steals a playing one,
+so firing cuts whatever else was sounding. A trampoline raises the request to
+16 — the ceiling the game itself is built for, not a guess: two parallel
+per-voice arrays (handles at `+0x11C` stride 4, a second at `+0x160` stride 8)
+both end exactly at `+0x1E0`, where the "sound available" flag lives, so 16
+fills each precisely and 17 would overwrite it. `--voices N` overrides.
+
+For the record, the sample length is right as the game passes it. The size
+helper at `0xACDD0` returns `record[0] >> 8`, counted from offset 4, and the
+record carries two header bytes (the Sound Blaster time constant at `+4`)
+before PCM at `+6` — so the `size - 2` at the call site is exact.
+
 ## Status
 
 **The game is playable.** It loads, shows its mission briefing, starts the
@@ -175,10 +270,10 @@ patches are needed.
 
 Not done yet:
 
-- **Sound.** The driver files (`SB16.DIG`) are opened but nothing is
-  implemented; ports are stubbed to silence.
 - **Mouse** reports "not installed"; the game configures it anyway and those
   calls are no-ops.
+- **Music / Redbook CD audio.** Only digital samples are implemented; the
+  sequencer and CD calls are left alone.
 - **Playing a mission to completion** has not been done; sessions so far have
   ended in an in-game death, which the game exits cleanly on
   (`int 21h AH=4Ch`, code 2).

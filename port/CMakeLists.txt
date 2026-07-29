@@ -19,6 +19,7 @@ add_executable(fightport
   src/emu.c
   src/services.c
   src/video.c
+  src/audio.c
 )
 
 target_include_directories(fightport PRIVATE src "${SDL2_ROOT}/include")

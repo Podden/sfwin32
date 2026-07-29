@@ -1,0 +1,544 @@
+/* Sound: the Miles Sound System API, reimplemented on SDL audio.
+ *
+ * The game ships Miles 3.50F statically linked, driving a Sound Blaster
+ * through an AIL3DIG driver -- 16-bit real-mode code that would need an 8086
+ * interpreter plus DMA, DSP and IRQ emulation to run. None of that is
+ * necessary: the driver is only the bottom of the stack. Hooking the AIL API
+ * itself replaces the whole thing with a few hundred lines of mixer.
+ *
+ * Two things made this practical:
+ *
+ *  - MSS is built with a debug-logging facility, so every entry point carries
+ *    a format string naming itself ("AIL_start_sample(0x%X)"). Each is
+ *    referenced from inside the function it names, so the relocation table
+ *    yields an exact symbol map -- see ../../ailmap.py.
+ *  - Miles is compiled cdecl, not the Watcom register convention the game
+ *    itself uses, so the hooks are ordinary C functions with no thunks.
+ *
+ * Sample data arrives as raw signed 8-bit mono PCM with an explicit byte
+ * count -- see h_set_sample_address below, where the call sites settle both the
+ * signature and the signedness. Rate, volume, pan and looping all come from
+ * the game through the API rather than from any header.
+ */
+
+#include "port.h"
+#include <SDL.h>
+#include <string.h>
+
+/* ---- AIL entry points (original link-time addresses) -------------------
+ *
+ * Verified by ailverify.py, which reads each wrapper's own debug format
+ * string instead of pairing strings with the nearest preceding function.
+ * That distinction is not academic: the adjacency heuristic in ailmap.py got
+ * six of these wrong, and two were actively harmful -- one pointed at
+ * AIL_release_sequence_handle, a MIDI call that was being answered with a
+ * sample count. Re-run ailverify.py after editing this table; it exits
+ * non-zero on any mismatch.
+ */
+#define AIL_INSTALL_DIG_INI            0x00041EC0u
+#define AIL_UNINSTALL_DIG_DRIVER       0x00041D00u
+#define AIL_ALLOCATE_SAMPLE_HANDLE     0x00041C00u
+#define AIL_RELEASE_SAMPLE_HANDLE      0x00041A30u
+#define AIL_INIT_SAMPLE                0x00041980u
+#define AIL_SET_SAMPLE_ADDRESS         0x00041790u
+#define AIL_SET_SAMPLE_TYPE            0x000416C0u
+#define AIL_START_SAMPLE               0x00041610u
+#define AIL_END_SAMPLE                 0x00041400u
+#define AIL_SET_SAMPLE_PLAYBACK_RATE   0x00041340u
+#define AIL_SET_SAMPLE_VOLUME          0x00041280u
+#define AIL_SET_SAMPLE_PAN             0x000411C0u
+#define AIL_SET_SAMPLE_LOOP_COUNT      0x00041100u
+#define AIL_SAMPLE_STATUS              0x00040F30u
+#define AIL_SET_DIGITAL_MASTER_VOLUME  0x00040A70u
+#define AIL_SAMPLE_USER_DATA           0x0003FAC0u
+
+/* Documented Miles status flags (MSS.H). SMP_DONE is "sample has finished
+ * playing, or has never been started" -- the value the game tests for at
+ * 0x23EF1 before skipping a voice. */
+#define SMP_FREE     0x0001
+#define SMP_DONE     0x0002
+#define SMP_PLAYING  0x0004
+#define SMP_STOPPED  0x0008
+
+#define MAX_VOICES   16
+#define MIX_RATE     22050
+#define MIX_CHANNELS 2
+#define MIX_SAMPLES  1024
+
+typedef struct {
+    int             used;
+    int             playing;
+    const uint8_t  *data;
+    uint32_t        len;        /* in source samples (8-bit mono) */
+    double          pos;        /* fractional read position */
+    int             rate;       /* source playback rate, Hz */
+    int             volume;     /* 0..127 */
+    int             pan;        /* 0..127, 64 = centre */
+    int             loops;      /* remaining plays; 0 = forever (Miles) */
+    uint32_t        wraps;      /* diagnostic: times this voice has looped */
+    int32_t         user[8];    /* AIL_sample_user_data slots */
+} voice;
+
+static voice            g_voice[MAX_VOICES];
+static int              g_driver_token;      /* address handed out as HDIGDRIVER */
+static int              g_master = 127;
+static SDL_AudioDeviceID g_dev;
+static int32_t         *g_mixbuf;
+static int              g_mixframes;      /* capacity of g_mixbuf, in frames */
+static double           g_gain = 1.0;     /* limiter, see mix_cb */
+
+/* ------------------------------------------------------------- the mixer */
+
+static void SDLCALL mix_cb(void *ud, Uint8 *stream, int len)
+{
+    int frames = len / (MIX_CHANNELS * (int)sizeof(int16_t));
+    int16_t *out = (int16_t *)stream;
+    int i, v;
+    int32_t peak = 0;
+    double target;
+
+    (void)ud;
+    if (frames > g_mixframes) frames = g_mixframes;   /* never overrun */
+    memset(g_mixbuf, 0, (size_t)frames * MIX_CHANNELS * sizeof(int32_t));
+
+    for (v = 0; v < MAX_VOICES; v++) {
+        voice *s = &g_voice[v];
+        double step;
+        int lvol, rvol;
+
+        if (!s->playing || !s->data || !s->len) continue;
+
+        step = (double)s->rate / (double)MIX_RATE;
+        /* Miles pan: 0 hard left, 64 centre, 127 hard right. */
+        lvol = s->volume * (127 - s->pan) * g_master;
+        rvol = s->volume * s->pan * g_master;
+
+        for (i = 0; i < frames; i++) {
+            uint32_t idx = (uint32_t)s->pos;
+            int sample;
+
+            if (idx >= s->len) {
+                if (s->loops == 1) { s->playing = 0; break; }
+                if (s->wraps < 1000000) s->wraps++;
+                if (s->loops > 1) s->loops--;
+                /* Loop, keeping the fractional phase. A single subtraction is
+                 * not enough when the sample is shorter than one step. */
+                while (s->pos >= (double)s->len) s->pos -= (double)s->len;
+                if (s->pos < 0) s->pos = 0;
+                idx = (uint32_t)s->pos;
+                if (idx >= s->len) { s->playing = 0; break; }
+            }
+            sample = (int)(int8_t)s->data[idx] << 8;   /* signed 8-bit mono */
+            g_mixbuf[i * 2 + 0] += (int32_t)((int64_t)sample * lvol / (127 * 127 * 127));
+            g_mixbuf[i * 2 + 1] += (int32_t)((int64_t)sample * rvol / (127 * 127 * 127));
+            s->pos += step;
+        }
+    }
+
+    /* Every voice can reach full scale on its own, so summing several of them
+     * overflows -- which is what simultaneous sounds turn into: hard clipping,
+     * heard as crackle and distortion.
+     *
+     * Rather than permanently attenuating everything (which makes a lone sound
+     * quiet) or clipping (which sounds broken), ride the gain: drop it
+     * immediately when a buffer would overflow, and recover gently afterwards.
+     * A single sound therefore plays at full level and a busy moment is turned
+     * down smoothly instead of breaking up. */
+    for (i = 0; i < frames * MIX_CHANNELS; i++) {
+        int32_t a = g_mixbuf[i] < 0 ? -g_mixbuf[i] : g_mixbuf[i];
+        if (a > peak) peak = a;
+    }
+    target = (peak > 32767) ? 32767.0 / (double)peak : 1.0;
+    if (target < g_gain) g_gain = target;                 /* attack at once */
+    else                 g_gain += (target - g_gain) * 0.05;   /* ease back */
+
+    for (i = 0; i < frames * MIX_CHANNELS; i++) {
+        int32_t x = (int32_t)(g_mixbuf[i] * g_gain);
+        if (x >  32767) x =  32767;
+        if (x < -32768) x = -32768;
+        out[i] = (int16_t)x;
+    }
+
+    {   /* Is anything actually reaching the speakers? Reported roughly every
+         * two seconds so a silent mixer is visible in the log. */
+        static int    cbs;
+        static int32_t peak;
+        for (i = 0; i < frames * MIX_CHANNELS; i++) {
+            int32_t a = out[i] < 0 ? -out[i] : out[i];
+            if (a > peak) peak = a;
+        }
+        if (++cbs >= (MIX_RATE / MIX_SAMPLES) * 2) {
+            int act = 0;
+            for (i = 0; i < MAX_VOICES; i++) if (g_voice[i].playing) act++;
+            LOGT("audio: %d voice(s) playing, peak %d/32767", act, peak);
+            /* A voice still looping long after it started is the runaway
+             * case: report it once so the log names the culprit. */
+            for (i = 0; i < MAX_VOICES; i++) {
+                voice *s = &g_voice[i];
+                if (s->playing && s->wraps == 40)
+                    LOGW("audio: voice %d has looped %u times "
+                         "(len=%u rate=%d loops=%d) -- runaway?",
+                         i, s->wraps, s->len, s->rate, s->loops);
+                if (s->playing)
+                    LOGT("   voice %d: vol=%d pan=%d len=%u pos=%u loops=%d "
+                         "wraps=%u", i, s->volume, s->pan, s->len,
+                         (unsigned)s->pos, s->loops, s->wraps);
+            }
+            cbs = 0; peak = 0;
+        }
+    }
+}
+
+/* --------------------------------------------------------- API emulation */
+
+static voice *as_voice(void *h)
+{
+    voice *s = (voice *)h;
+    if (s >= g_voice && s < g_voice + MAX_VOICES) return s;
+    return NULL;
+}
+
+static int32_t __cdecl h_install_DIG_INI(void **dig)
+{
+    if (dig) *dig = &g_driver_token;
+    LOGI("audio: AIL_install_DIG_INI -> emulated driver");
+    return 0;                       /* 0 = success; the caller tests for it */
+}
+
+static void __cdecl h_uninstall_DIG_driver(void *dig)
+{
+    int v;
+    (void)dig;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    for (v = 0; v < MAX_VOICES; v++) g_voice[v].playing = 0;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+}
+
+static void *__cdecl h_allocate_sample_handle(void *dig)
+{
+    int v;
+    (void)dig;
+    /* The game allocates in a loop until this returns NULL, and remembers how
+     * many it got, so the voice count is ours to choose. */
+    for (v = 0; v < MAX_VOICES; v++) {
+        if (!g_voice[v].used) {
+            memset(&g_voice[v], 0, sizeof g_voice[v]);
+            g_voice[v].used = 1;
+            g_voice[v].rate = MIX_RATE;
+            g_voice[v].volume = 127;
+            g_voice[v].pan = 64;
+            g_voice[v].loops = 1;
+            return &g_voice[v];
+        }
+    }
+    {   /* The game allocates until this returns NULL and sizes its pool from
+         * the count, so this is where the achieved polyphony is known. */
+        static int reported;
+        if (!reported) {
+            int n = 0;
+            reported = 1;
+            for (v = 0; v < MAX_VOICES; v++) if (g_voice[v].used) n++;
+            LOGI("audio: game took %d sample handles (polyphony)", n);
+        }
+    }
+    return NULL;
+}
+
+static void __cdecl h_init_sample(void *h)
+{
+    voice *s = as_voice(h);
+    if (!s) return;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->playing = 0; s->data = NULL; s->len = 0; s->pos = 0;
+    s->rate = MIX_RATE; s->volume = 127; s->pan = 64; s->loops = 1;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+}
+
+/* AIL_set_sample_address(HSAMPLE, start, len): the second argument points
+ * straight at PCM data with no header of any kind, and the third is a byte
+ * count. From 0xACB5E:
+ *
+ *      call  0xACDD0              ; eax = record[0] >> 8
+ *      sub   eax, 2
+ *      push  eax                  ; length
+ *      lea   eax, [esi + 6]
+ *      push  eax                  ; data
+ *      push  ebx                  ; HSAMPLE
+ *      call  0x41790
+ *
+ * The size is counted from offset 4 of the sound record, which carries two
+ * bytes of header (the Sound Blaster time constant at +4) before the PCM at
+ * +6 -- so "size - 2" is exactly the data length, not an approximation.
+ *
+ * The data is *signed* 8-bit mono -- a dump of a live buffer reads
+ * 00 FF FE FD ... F8 ... FF 00 01 03, a smooth waveform about zero rather
+ * than about 0x80. */
+static int32_t __cdecl h_set_sample_address(void *h, const void *data, int32_t len)
+{
+    voice *s = as_voice(h);
+    if (!s || !data || len <= 0) return 0;
+    if ((uint32_t)len > 64u * 1024 * 1024) {
+        LOGW("audio: implausible sample length %d ignored", len);
+        return 0;
+    }
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->data = (const uint8_t *)data;
+    s->len  = (uint32_t)len;
+    s->pos  = 0;
+    s->playing = 0;
+    /* New sample data resets the loop count, as Miles does. This matters:
+     * the game sets an infinite loop (count 0) on some sounds and then simply
+     * does not call set_sample_loop_count for one-shots, relying on the reset.
+     * Since sample handles are a reused pool, without this a weapon firing on
+     * a handle that previously held a looping sound would loop forever. */
+    s->loops = 1;
+    s->wraps = 0;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+    return 1;                        /* Miles returns 1 on success */
+}
+
+/* Ends playback. Status then reports SMP_DONE, which is what the game polls
+ * for before reusing a slot. */
+static void __cdecl h_end_sample(void *h)
+{
+    voice *s = as_voice(h);
+    if (!s) return;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->playing = 0;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+}
+
+/* Returns the slot to the pool, so a later allocate can hand it out again. */
+static void __cdecl h_release_sample_handle(void *h)
+{
+    voice *s = as_voice(h);
+    if (!s) return;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->playing = 0;
+    s->used = 0;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+}
+
+static void __cdecl h_set_digital_master_volume(void *dig, int32_t vol)
+{
+    (void)dig;
+    g_master = vol < 0 ? 0 : (vol > 127 ? 127 : vol);
+}
+
+/* Per-sample scratch the game stores things in. Answering this with a made-up
+ * constant -- as an earlier mis-hook did -- corrupts its bookkeeping. */
+static int32_t __cdecl h_sample_user_data(void *h, uint32_t index)
+{
+    voice *s = as_voice(h);
+    if (!s || index >= 8) return 0;
+    return s->user[index];
+}
+
+static void __cdecl h_set_sample_type(void *h, int32_t fmt, uint32_t flags)
+{   /* Everything shipped here is unsigned 8-bit mono; recorded for the log
+     * only, so an unexpected format shows up rather than playing as noise. */
+    voice *s = as_voice(h);
+    (void)flags;
+    if (s && fmt != 0)
+        LOGW("audio: sample format %d is not 8-bit mono; playing as-is", fmt);
+}
+
+static void __cdecl h_start_sample(void *h)
+{
+    voice *s = as_voice(h);
+    if (!s || !s->data) return;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->pos = 0;
+    s->playing = 1;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+    {   /* A few at INFO so the log shows sound really started, then quiet. */
+        static int n;
+        log_msg(n++ < 3 ? LOG_INFO : LOG_TRACE,
+                "audio: start voice %d len=%u rate=%d vol=%d pan=%d loops=%d",
+                (int)(s - g_voice), s->len, s->rate, s->volume, s->pan,
+                s->loops);
+    }
+}
+
+
+/* The setters run on the game thread while the mixer is reading the same
+ * voice, so they take the audio lock too. Individual int stores would not tear
+ * on x86, but rate and volume are read together per sample and a half-applied
+ * change is audible. */
+static void __cdecl h_set_sample_playback_rate(void *h, int32_t rate)
+{
+    voice *s = as_voice(h);
+    if (!s || rate <= 0) return;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->rate = rate;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+}
+static void __cdecl h_set_sample_volume(void *h, int32_t vol)
+{
+    voice *s = as_voice(h);
+    if (!s) return;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->volume = vol < 0 ? 0 : (vol > 127 ? 127 : vol);
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+}
+static void __cdecl h_set_sample_pan(void *h, int32_t pan)
+{
+    voice *s = as_voice(h);
+    if (!s) return;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->pan = pan < 0 ? 0 : (pan > 127 ? 127 : pan);
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+}
+static void __cdecl h_set_sample_loop_count(void *h, int32_t n)
+{
+    voice *s = as_voice(h);
+    if (!s) return;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->loops = n;                    /* Miles: 0 means loop forever */
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+    LOGT("audio: voice %d loop count <- %d%s", (int)(s - g_voice), n,
+         n == 0 ? "  (forever)" : "");
+}
+/* The game polls this to manage its voice pool: at 0x23EE9 it asks for a
+ * handle's status and compares against SMP_DONE before reusing the slot.
+ *
+ * Getting this wrong is why sounds appeared to run forever. It was previously
+ * stubbed as a three-argument no-op (the adjacent debug string names
+ * set_sample_loop_block), so the game read a garbage return value, never saw a
+ * sample finish, and kept treating spent voices as busy. */
+static int32_t __cdecl h_sample_status(void *h)
+{
+    voice *s = as_voice(h);
+    if (!s)         return SMP_FREE;
+    if (!s->used)   return SMP_FREE;
+    return s->playing ? SMP_PLAYING : SMP_DONE;
+}
+
+/* ------------------------------------------------- voice pool enlargement */
+
+/* The game asks for its polyphony rather than taking whatever we offer, so
+ * supplying 16 sample handles is not enough on its own -- it only requests
+ * `NumOfVoices` from CONFIG.DES, which ships as 8. With eight voices already
+ * busy, a new sound has nowhere to go and the game steals a playing one:
+ * firing a weapon audibly cuts whatever else was sounding.
+ *
+ * 16 is the ceiling the game itself is built for, not a guess. Two parallel
+ * per-voice arrays live in its sound object -- handles at +0x11C with stride
+ * 4, and a second at +0x160 with stride 8 -- and both end exactly at +0x1E0,
+ * where the "digital sound available" flag sits. 16 entries fill each of them
+ * precisely; 17 would run into that flag.
+ *
+ * The request is raised where it is made, at the pool setup routine
+ * 0x23DE0(this=EAX, count=EDX). Its first five bytes are five single-byte
+ * pushes, so a five-byte detour lands on an instruction boundary and the
+ * prologue can simply be replayed in the trampoline.
+ */
+#define VOICE_POOL_FN  0x00023DE0u
+#define VOICE_MAX      MAX_VOICES
+
+static int32_t  g_want_voices = VOICE_MAX;
+static uint32_t g_pool_resume;          /* VOICE_POOL_FN + 5, rebased */
+
+static void __declspec(naked) voice_pool_thunk(void)
+{
+    __asm {
+        cmp  edx, g_want_voices
+        jae  keep                       /* already asking for enough */
+        mov  edx, g_want_voices
+    keep:
+        push ebx                        /* the prologue we displaced */
+        push ecx
+        push esi
+        push edi
+        push ebp
+        jmp  dword ptr [g_pool_resume]
+    }
+}
+
+void audio_set_voice_count(int n)
+{
+    if (n < 1) n = 1;
+    if (n > VOICE_MAX) n = VOICE_MAX;
+    g_want_voices = n;
+}
+
+/* ------------------------------------------------------------- hooking */
+
+/* Overwrite an AIL entry point with a jump to ours. Object 1 is mapped
+ * execute/read/write, so this needs no VirtualProtect dance. */
+static void hook(uint32_t orig_addr, void *fn, const char *name)
+{
+    uint8_t *p = (uint8_t *)gp(orig_addr);
+    int32_t rel = (int32_t)((uint8_t *)fn - (p + 5));
+    p[0] = 0xE9;
+    memcpy(p + 1, &rel, 4);
+    LOGT("audio: hooked %s at orig 0x%08X -> %p", name, orig_addr, fn);
+}
+
+int audio_init(void)
+{
+    SDL_AudioSpec want, have;
+
+    SDL_zero(want);
+    want.freq     = MIX_RATE;
+    want.format   = AUDIO_S16SYS;
+    want.channels = MIX_CHANNELS;
+    want.samples  = MIX_SAMPLES;
+    want.callback = mix_cb;
+
+    g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (!g_dev) {
+        LOGW("audio: SDL_OpenAudioDevice failed (%s); running silent",
+             SDL_GetError());
+        return 0;                    /* hooks still install: game stays happy */
+    }
+
+    /* Size the accumulator from what the device actually gave us. */
+    g_mixframes = have.samples;
+    g_mixbuf = (int32_t *)malloc((size_t)g_mixframes * MIX_CHANNELS *
+                                 sizeof(int32_t));
+    if (!g_mixbuf) {
+        LOGE("audio: mix buffer alloc failed");
+        SDL_CloseAudioDevice(g_dev);
+        g_dev = 0;
+        return 0;
+    }
+    SDL_PauseAudioDevice(g_dev, 0);
+    LOGI("audio: SDL device open at %d Hz, %d channels, %d-sample buffer",
+         have.freq, have.channels, have.samples);
+    return 1;
+}
+
+void audio_install_hooks(void)
+{
+    hook(AIL_INSTALL_DIG_INI,          h_install_DIG_INI,          "AIL_install_DIG_INI");
+    hook(AIL_UNINSTALL_DIG_DRIVER,     h_uninstall_DIG_driver,     "AIL_uninstall_DIG_driver");
+    hook(AIL_ALLOCATE_SAMPLE_HANDLE,   h_allocate_sample_handle,   "AIL_allocate_sample_handle");
+    hook(AIL_RELEASE_SAMPLE_HANDLE,    h_release_sample_handle,    "AIL_release_sample_handle");
+    hook(AIL_INIT_SAMPLE,              h_init_sample,              "AIL_init_sample");
+    hook(AIL_SET_SAMPLE_ADDRESS,       h_set_sample_address,          "AIL_set_sample_address");
+    hook(AIL_SET_SAMPLE_TYPE,          h_set_sample_type,          "AIL_set_sample_type");
+    hook(AIL_START_SAMPLE,             h_start_sample,             "AIL_start_sample");
+    hook(AIL_END_SAMPLE,               h_end_sample,               "AIL_end_sample");
+    hook(AIL_SET_SAMPLE_PLAYBACK_RATE, h_set_sample_playback_rate, "AIL_set_sample_playback_rate");
+    hook(AIL_SET_SAMPLE_VOLUME,        h_set_sample_volume,        "AIL_set_sample_volume");
+    hook(AIL_SET_SAMPLE_PAN,           h_set_sample_pan,           "AIL_set_sample_pan");
+    hook(AIL_SET_SAMPLE_LOOP_COUNT,    h_set_sample_loop_count,    "AIL_set_sample_loop_count");
+    hook(AIL_SAMPLE_STATUS,            h_sample_status,            "AIL_sample_status");
+    hook(AIL_SET_DIGITAL_MASTER_VOLUME,h_set_digital_master_volume,"AIL_set_digital_master_volume");
+    hook(AIL_SAMPLE_USER_DATA,         h_sample_user_data,         "AIL_sample_user_data");
+    LOGI("audio: %d Miles entry points hooked", 16);
+
+    g_pool_resume = (uint32_t)(uintptr_t)gp(VOICE_POOL_FN) + 5;
+    hook(VOICE_POOL_FN, voice_pool_thunk, "voice pool setup");
+    LOGI("audio: voice pool raised to %d (game asks for %s)",
+         g_want_voices, "NumOfVoices from CONFIG.DES");
+}
+
+void audio_shutdown(void)
+{
+    if (g_dev) { SDL_CloseAudioDevice(g_dev); g_dev = 0; }
+    free(g_mixbuf);
+    g_mixbuf = NULL;
+    g_mixframes = 0;
+}
