@@ -161,6 +161,9 @@ static volatile int g_cb_events;           /* accumulated condition mask */
 static CONTEXT g_cb_saved;
 static int     g_cb_active;
 static uint32_t g_cb_calls;
+static DWORD    g_cb_t0;
+static uint32_t g_cb_mark;
+static DWORD    g_cb_enter;
 
 static void cb_raise(int events)
 {
@@ -190,9 +193,20 @@ int mouse_cb_deliver(CONTEXT *c, int (*stack_ok)(uintptr_t, SIZE_T))
 
     g_cb_saved = *c;
     g_cb_active = 1;
-    if (++g_cb_calls <= 3 || (g_cb_calls % 500) == 0)
-        LOGI("mouse callback #%u: events=0x%02X at (%d,%d) buttons=%d",
-             g_cb_calls, events, g_mx, g_my, g_buttons);
+    g_cb_enter = GetTickCount();
+    /* Rate matters more than any single call: the pointer is only as smooth as
+     * this is frequent, so report calls-per-second rather than a sample. */
+    g_cb_calls++;
+    {
+        DWORD now = GetTickCount();
+        if (!g_cb_t0) { g_cb_t0 = now; g_cb_mark = g_cb_calls; }
+        else if (now - g_cb_t0 >= 2000) {
+            LOGT("mouse callback rate: %.1f/s (total %u, at %d,%d)",
+                 (g_cb_calls - g_cb_mark) * 1000.0 / (now - g_cb_t0),
+                 g_cb_calls, g_mx, g_my);
+            g_cb_t0 = now; g_cb_mark = g_cb_calls;
+        }
+    }
 
     /* A far call pushes CS then the return offset, which is what the
      * handler's `retf` expects to find. */
@@ -218,6 +232,18 @@ int mouse_cb_returning(CONTEXT *c)
     if (!g_cb_active || c->Eip != MOUSE_CB_MAGIC) return 0;
     *c = g_cb_saved;
     g_cb_active = 0;
+    {   /* How long the game spends inside its own handler bounds the rate at
+         * which we can call it again. */
+        static uint32_t n; static DWORD acc, t0;
+        DWORD dt = GetTickCount() - g_cb_enter;
+        acc += dt; n++;
+        if (!t0) t0 = GetTickCount();
+        else if (GetTickCount() - t0 >= 2000) {
+            LOGT("mouse handler round trip: %.1f ms avg over %u calls",
+                 acc / (double)n, n);
+            acc = 0; n = 0; t0 = GetTickCount();
+        }
+    }
     return 1;
 }
 

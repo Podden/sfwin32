@@ -252,6 +252,10 @@ int main(int argc, char **argv)
             g_watch_addr = (uint32_t)strtoul(a, NULL, 16);
             g_watch_dwords = colon ? atoi(colon + 1) : 1;
         }
+        else if (!strcmp(argv[i], "--pixfmt") && i + 1 < argc)
+            g_pixfmt_555 = !strcmp(argv[++i], "555");
+        else if (!strcmp(argv[i], "--dumpvram") && i + 1 < argc)
+            g_dumpvram_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dumpkeys")) g_dump_keys = 1;
         else if (!strcmp(argv[i], "--no-extern-irq")) g_extern_irq = 0;
         else if (!strcmp(argv[i], "--trace"))  g_log_level = LOG_TRACE;

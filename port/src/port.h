@@ -132,6 +132,10 @@ void video_shutdown(void);
  * register block when non-NULL. Returns 1 if handled. */
 int  vbe_dispatch(CONTEXT *c);
 
+/* --pixfmt 555: interpret a 16bpp framebuffer as 5:5:5 instead of 5:6:5. */
+extern int g_pixfmt_555;
+extern int g_dumpvram_frames;
+
 /* DPMI "map physical address to linear" lands here. Returns NULL if the
  * address is not one we handed out. */
 void *video_map_phys(uint32_t phys, uint32_t size);

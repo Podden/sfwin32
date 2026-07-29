@@ -13,6 +13,7 @@
 #include "port.h"
 #include <SDL.h>
 #include <string.h>
+#include <stdio.h>
 
 uint8_t *g_vram;
 uint32_t g_vram_size;
@@ -69,6 +70,9 @@ static const vbe_mode *find_mode(uint16_t m)
  * there is then nothing left to drive presentation from. So SDL gets its own
  * thread: it owns the window, renderer and event queue, while the game thread
  * only ever writes pixels into g_vram. */
+int g_pixfmt_555;
+int g_dumpvram_frames;                      /* --pixfmt 555: read 16bpp as 5:5:5 */
+
 static HANDLE        g_vid_thread;
 static volatile LONG g_vid_ready;      /* 1 = up, -1 = failed */
 static volatile LONG g_mode_dirty;
@@ -267,11 +271,22 @@ static void render_frame(void)
             }
             break;
         case 16:
-            for (x = 0; x < g_vid_w; x++) {
-                uint16_t p = ((const uint16_t *)row)[x];
-                uint32_t r = (p >> 11) & 0x1F, g = (p >> 5) & 0x3F, b = p & 0x1F;
-                *dst++ = 0xFF000000u | (r * 255 / 31 << 16)
-                                     | (g * 255 / 63 << 8) | (b * 255 / 31);
+            if (g_pixfmt_555) {          /* --pixfmt 555: diagnostic */
+                for (x = 0; x < g_vid_w; x++) {
+                    uint16_t p = ((const uint16_t *)row)[x];
+                    uint32_t r = (p >> 10) & 0x1F, g = (p >> 5) & 0x1F,
+                             b = p & 0x1F;
+                    *dst++ = 0xFF000000u | (r * 255 / 31 << 16)
+                                         | (g * 255 / 31 << 8) | (b * 255 / 31);
+                }
+            } else {
+                for (x = 0; x < g_vid_w; x++) {
+                    uint16_t p = ((const uint16_t *)row)[x];
+                    uint32_t r = (p >> 11) & 0x1F, g = (p >> 5) & 0x3F,
+                             b = p & 0x1F;
+                    *dst++ = 0xFF000000u | (r * 255 / 31 << 16)
+                                         | (g * 255 / 63 << 8) | (b * 255 / 31);
+                }
             }
             break;
         case 24:
@@ -286,11 +301,36 @@ static void render_frame(void)
             break;
         }
     }
+    /* --dumpvram N: write the raw framebuffer once, N frames in. Whether the
+     * dark areas hold zeros or real pixels decides between "nothing was drawn"
+     * and "drawn but converted wrong", which no amount of looking can. */
+    if (g_dumpvram_frames > 0 && --g_dumpvram_frames == 0) {
+        FILE *f = fopen("vram.bin", "wb");
+        if (f) {
+            fwrite(g_vram, 1, (size_t)g_vid_pitch * g_vid_h, f);
+            fclose(f);
+            LOGI("dumped %dx%d %dbpp pitch=%d framebuffer to vram.bin",
+                 g_vid_w, g_vid_h, g_vid_bpp, g_vid_pitch);
+        }
+    }
+
     SDL_UpdateTexture(g_tex, NULL, g_conv, g_vid_w * 4);
     SDL_RenderClear(g_ren);
     SDL_RenderCopy(g_ren, g_tex, NULL, NULL);
     SDL_RenderPresent(g_ren);
     g_last_present = SDL_GetTicks();
+
+    {   /* The SDL thread also drains the event queue, so its loop rate is the
+         * ceiling on mouse responsiveness. */
+        static uint32_t frames; static Uint32 t0;
+        frames++;
+        if (!t0) t0 = SDL_GetTicks();
+        else if (SDL_GetTicks() - t0 >= 2000) {
+            LOGT("sdl thread: %.1f loops/s", frames * 1000.0 /
+                 (SDL_GetTicks() - t0));
+            frames = 0; t0 = SDL_GetTicks();
+        }
+    }
 }
 
 /* Called from the game thread when it flips a page. The SDL thread presents
