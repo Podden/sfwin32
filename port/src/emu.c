@@ -1107,19 +1107,36 @@ int g_dump_keys;                 /* --dumpkeys: log what the game thinks is held
 int g_extern_irq = 1;            /* --no-extern-irq disables the fallback path  */
 
 uint32_t g_watch_addr;
-static uint32_t g_watch_last;
+int      g_watch_dwords = 1;     /* --watch ADDR:N covers a whole struct */
+#define WATCH_MAX 64
+static uint32_t g_watch_last[WATCH_MAX];
 static int      g_watch_primed;
 
+/* Watching a single dword answers "did this change"; watching a struct answers
+ * the more useful question "was this object touched at all", which is what
+ * separates "never initialised" from "initialised but one field left zero". */
 static void watch_poll(CONTEXT *c)
 {
-    uint32_t v;
+    int i, n = g_watch_dwords;
     if (!g_watch_addr) return;
-    v = *(volatile uint32_t *)gp(g_watch_addr);
-    if (!g_watch_primed) { g_watch_last = v; g_watch_primed = 1; return; }
-    if (v != g_watch_last) {
-        LOGI("WATCH 0x%08X: 0x%08X -> 0x%08X  (near orig 0x%08X, fault #%u)",
-             g_watch_addr, g_watch_last, v, c->Eip - g_img.delta, g_handled);
-        g_watch_last = v;
+    if (n < 1) n = 1;
+    if (n > WATCH_MAX) n = WATCH_MAX;
+
+    if (!g_watch_primed) {
+        for (i = 0; i < n; i++)
+            g_watch_last[i] = ((volatile uint32_t *)gp(g_watch_addr))[i];
+        g_watch_primed = 1;
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t v = ((volatile uint32_t *)gp(g_watch_addr))[i];
+        if (v != g_watch_last[i]) {
+            LOGI("WATCH 0x%08X+%02X: 0x%08X -> 0x%08X  "
+                 "(near orig 0x%08X, fault #%u)",
+                 g_watch_addr, i * 4, g_watch_last[i], v,
+                 c->Eip - g_img.delta, g_handled);
+            g_watch_last[i] = v;
+        }
     }
 }
 

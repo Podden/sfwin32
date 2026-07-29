@@ -64,6 +64,7 @@ extern const char *g_cmdline;
 /* --watch <hex>: original (link-time) address of a global to poll and report
  * whenever it changes. Debug aid for tracking down init flags. */
 extern uint32_t g_watch_addr;
+extern int      g_watch_dwords;   /* --watch ADDR:N -- watch a whole struct */
 
 /* --dumpkeys: periodically log which scancodes the game believes are held. */
 extern int g_dump_keys;

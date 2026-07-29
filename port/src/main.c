@@ -245,8 +245,13 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--voices") && i + 1 < argc)
             audio_set_voice_count(atoi(argv[++i]));
-        else if (!strcmp(argv[i], "--watch") && i + 1 < argc)
-            g_watch_addr = (uint32_t)strtoul(argv[++i], NULL, 16);
+        else if (!strcmp(argv[i], "--watch") && i + 1 < argc) {
+            /* ADDR or ADDR:NDWORDS */
+            const char *a = argv[++i];
+            const char *colon = strchr(a, ':');
+            g_watch_addr = (uint32_t)strtoul(a, NULL, 16);
+            g_watch_dwords = colon ? atoi(colon + 1) : 1;
+        }
         else if (!strcmp(argv[i], "--dumpkeys")) g_dump_keys = 1;
         else if (!strcmp(argv[i], "--no-extern-irq")) g_extern_irq = 0;
         else if (!strcmp(argv[i], "--trace"))  g_log_level = LOG_TRACE;

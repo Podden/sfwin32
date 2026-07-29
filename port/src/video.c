@@ -656,12 +656,38 @@ int vbe_dispatch(CONTEXT *c)
             r->ebx = 0;
             break;
 
-        case 0x33:                                       /* mouse */
-            /* No mouse is reported, but the game still configures ranges and
-             * sensitivity afterwards. Those are harmless no-ops. */
-            if ((eax & 0xFFFF) == 0x0000) { eax = 0; r->ebx = 0; }
-            else LOGT("mouse fn 0x%04X ignored", (uint16_t)(eax & 0xFFFF));
+        case 0x33: {                                     /* mouse */
+            /* DESKTOP.EXE does not issue `int 33h` -- it goes through DPMI
+             * "simulate real-mode interrupt" with 0x33 in the call structure
+             * (the dispatcher at 0x70B3C builds the packet and calls int 31h
+             * AX=0300). This arm used to answer "no mouse" here, which meant
+             * the driver in mouse.c was never consulted no matter what it
+             * reported, and DESKTOP exited 102 -- its mouse object at
+             * 0x1060E8 never got its "installed" field set.
+             *
+             * Route it to the same implementation the direct path uses, by
+             * borrowing a CONTEXT for the register subset int 33h defines. */
+            CONTEXT m;
+            LOGT("rm int 33h fn 0x%04X", (uint16_t)(eax & 0xFFFF));
+            if ((eax & 0xFFFF) == 0x000C || (eax & 0xFFFF) == 0x0014)
+                LOGI("int 33h fn 0x%04X: handler at %04X:%04X, mask 0x%04X",
+                     (uint16_t)(eax & 0xFFFF), r->es, (uint16_t)(r->edx & 0xFFFF),
+                     (uint16_t)(r->ecx & 0xFFFF));
+            memset(&m, 0, sizeof m);
+            m.Eax = eax;
+            m.Ebx = r->ebx;
+            m.Ecx = r->ecx;
+            m.Edx = r->edx;
+            m.Esi = r->esi;
+            m.Edi = r->edi;
+            mouse_int33(&m);
+            eax    = m.Eax;
+            r->ebx = m.Ebx;
+            r->ecx = m.Ecx;
+            r->edx = m.Edx;
+            r->esi = m.Esi;
             break;
+        }
 
         default:
             todo_hit("rmint", vec, c->Eip);
