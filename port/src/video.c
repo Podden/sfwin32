@@ -115,13 +115,28 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                      (int)e.key.keysym.scancode);
                 queue_key(e.key.keysym.scancode, e.type == SDL_KEYDOWN);
             }
+            else if (e.type == SDL_MOUSEMOTION) {
+                /* Logical-size scaling is on, so these deltas are already in
+                 * the game's pixels. */
+                mouse_sdl_motion(e.motion.xrel, e.motion.yrel);
+            }
+            else if (e.type == SDL_MOUSEBUTTONDOWN ||
+                     e.type == SDL_MOUSEBUTTONUP) {
+                int b = e.button.button == SDL_BUTTON_LEFT   ? 0 :
+                        e.button.button == SDL_BUTTON_RIGHT  ? 1 :
+                        e.button.button == SDL_BUTTON_MIDDLE ? 2 : -1;
+                if (b >= 0)
+                    mouse_sdl_button(b, e.type == SDL_MOUSEBUTTONDOWN);
+            }
             else if (e.type == SDL_WINDOWEVENT) {
                 LOGT("SDL window event %d", (int)e.window.event);
                 /* Deliberately not LEAVE: the mouse leaving the window is
                  * normal during play and must not drop held keys. */
                 if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
-                    e.window.event == SDL_WINDOWEVENT_MINIMIZED)
+                    e.window.event == SDL_WINDOWEVENT_MINIMIZED) {
                     release_all_keys("focus loss");
+                    mouse_sdl_release_all();
+                }
             }
         }
         if (g_quit) {

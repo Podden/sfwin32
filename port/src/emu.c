@@ -738,6 +738,7 @@ static int shadow_dirty(void)
 }
 
 static uint32_t g_ss_count;
+static uint32_t g_tf_dropped;    /* single steps caught inside our own code */
 
 static void sync_tf(CONTEXT *c)
 {
@@ -809,6 +810,40 @@ static LONG emu_veh_inner(EXCEPTION_POINTERS *ep)
         uintptr_t glo = (uintptr_t)g_img.mem;
         int in_game = g_img.mem && c->Eip >= glo &&
                       c->Eip < glo + g_img.obj1_size;
+        /* One exception to "not ours, don't touch": a single step outside the
+         * image is *always* ours, because we are the only thing in the process
+         * that sets the trap flag.
+         *
+         * It happens because the game does not only fault into this handler --
+         * it also jumps directly into code we substituted for its own. Each of
+         * the 16 Miles hooks is a five-byte JMP out of game code into a C
+         * function here. If TF happened to be armed for segment tracking at
+         * that moment, every instruction of that C function traps, lands
+         * outside the image, gets declined, and takes the process down with an
+         * unhandled STATUS_SINGLE_STEP.
+         *
+         * DESKTOP.EXE hit this immediately where FIGHT.EXE never had: it calls
+         * the sound API while a foreign selector is live. Drop TF for the
+         * duration -- the tail of this handler re-arms it from shadow_dirty()
+         * the next time the game itself faults, so nothing is lost but the few
+         * steps spent inside our own code. */
+        if (!in_game &&
+            ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+            c->EFlags &= ~0x100u;
+            if (++g_tf_dropped <= 12 || (g_tf_dropped % 5000) == 0)
+                LOGT("TF dropped at %08X eflags=%08X tid=%lu (#%u)",
+                     c->Eip, c->EFlags, GetCurrentThreadId(), g_tf_dropped);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        if (!in_game) {
+            static uint32_t nother;
+            if (++nother <= 12)
+                LOGT("foreign exception code=%08X eip=%08X eflags=%08X tid=%lu",
+                     ep->ExceptionRecord->ExceptionCode, c->Eip, c->EFlags,
+                     GetCurrentThreadId());
+        }
+
         if (!in_game &&
             ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
             return EXCEPTION_CONTINUE_SEARCH;
@@ -1069,6 +1104,7 @@ static uint32_t g_last_ok_eip, g_handled;
  * question that matters when an init flag never gets set -- whether anything
  * writes it at all, and roughly where. */
 int g_dump_keys;                 /* --dumpkeys: log what the game thinks is held */
+int g_extern_irq = 1;            /* --no-extern-irq disables the fallback path  */
 
 uint32_t g_watch_addr;
 static uint32_t g_watch_last;
@@ -1098,7 +1134,35 @@ static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
 {
     LONG r;
 
-    if (g_veh_depth) return EXCEPTION_CONTINUE_SEARCH;
+    /* Clear the trap flag for *this handler's own* execution.
+     *
+     * Windows does not clear TF when it dispatches an exception to user mode:
+     * the handler inherits the interrupted context's flags. Since the emulator
+     * deliberately runs the game with TF set whenever a shadow selector is
+     * foreign, any fault taken during that window drops us in here still in
+     * single-step mode -- and then every instruction of this handler raises
+     * STATUS_SINGLE_STEP. The nested ones arrive with g_veh_depth already
+     * non-zero, get declined below, and take the process down.
+     *
+     * FIGHT.EXE survived on luck: its faults during a TF window are rare.
+     * DESKTOP.EXE scans its environment block with ES foreign and faults on
+     * every byte, so it died within a second of starting, every time. */
+    __asm {
+        pushfd
+        and  dword ptr [esp], 0xFFFFFEFF
+        popfd
+    }
+
+    if (g_veh_depth) {
+        static uint32_t nnest;
+        if (++nnest <= 12)
+            LOGW("NESTED exception declined: code=%08X eip=%08X eflags=%08X "
+                 "tid=%lu (#%u)",
+                 ep->ExceptionRecord->ExceptionCode,
+                 ep->ContextRecord->Eip, ep->ContextRecord->EFlags,
+                 GetCurrentThreadId(), nnest);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     g_veh_depth++;
 
     /* If the handler itself faults, Windows tears the process down without
@@ -1125,8 +1189,23 @@ static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
 
     if (r == EXCEPTION_CONTINUE_EXECUTION) {
         CONTEXT *c = ep->ContextRecord;
-        if (shadow_dirty()) { c->EFlags |= 0x100u; g_ss_prev_eip = c->Eip; }
-        else                  c->EFlags &= ~0x100u;
+        uintptr_t glo = (uintptr_t)g_img.mem;
+        int resuming_game = g_img.mem && c->Eip >= glo &&
+                            c->Eip < glo + g_img.obj1_size;
+
+        /* Only single-step the *game*. Re-arming TF for a resume into our own
+         * code is what made DESKTOP.EXE unrunnable: an exception taken while
+         * TF was armed leaves the handler itself in single-step mode, and this
+         * line put the flag straight back after the handler had just dropped
+         * it -- so execution crawled one instruction per exception through our
+         * own code until something declined a nested trap and the process
+         * died. The shadow is unaffected; the next fault in game code re-arms
+         * it from shadow_dirty() as before. */
+        if (shadow_dirty() && resuming_game) {
+            c->EFlags |= 0x100u; g_ss_prev_eip = c->Eip;
+        } else {
+            c->EFlags &= ~0x100u;
+        }
         /* Hardware interrupts are delivered here, on the context we are about
          * to hand back, rather than by rewriting a running thread from
          * outside. */
@@ -1402,7 +1481,7 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 
         /* If the game has not faulted recently it is inside a loop the
          * in-handler path cannot reach, so go in from outside. */
-        if ((g_pend_irq0 || g_pend_irq1) &&
+        if (g_extern_irq && (g_pend_irq0 || g_pend_irq1) &&
             (LONG)(GetTickCount() - (DWORD)g_fault_tick) > 3)
             irq_inject_external();
 

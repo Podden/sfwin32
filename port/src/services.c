@@ -505,19 +505,7 @@ int dpmi_int2f(CONTEXT *c)
     return 1;
 }
 
-/* -------------------------------------------------------------- int 33h */
-
-int mouse_int33(CONTEXT *c)
-{
-    uint16_t ax = (uint16_t)(c->Eax & 0xFFFF);
-    if (ax == 0x0000) {          /* reset: report "no mouse" for now */
-        c->Eax = 0;
-        c->Ebx = 0;
-        return 1;
-    }
-    todo_hit("int33", ax, c->Eip);
-    return 1;
-}
+/* int 33h lives in mouse.c. */
 
 /* ------------------------------------------------------------- port I/O */
 

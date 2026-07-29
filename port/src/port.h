@@ -68,6 +68,10 @@ extern uint32_t g_watch_addr;
 /* --dumpkeys: periodically log which scancodes the game believes are held. */
 extern int g_dump_keys;
 
+/* --no-extern-irq: deliver interrupts only from inside the fault handler,
+ * never via SuspendThread/SetThreadContext. */
+extern int g_extern_irq;
+
 /* DPMI descriptor table (implemented in emu.c, driven from services.c). */
 uint16_t descr_alloc(int count);
 void     descr_set_base(uint16_t sel, uint32_t linear);
@@ -150,6 +154,8 @@ extern int      g_vid_active;
  * device; `audio_install_hooks` patches the AIL entry points and must run
  * after the image is loaded and relocated. */
 int  audio_init(void);
+/* Picks the per-image AIL address table. Must precede audio_install_hooks. */
+void audio_select_image(int desktop);
 void audio_install_hooks(void);
 void audio_shutdown(void);
 
@@ -169,7 +175,13 @@ uint32_t dos_get_ivec(int vec);
 int  dos_int21(CONTEXT *c);
 int  dpmi_int31(CONTEXT *c);
 int  dpmi_int2f(CONTEXT *c);
+/* int 33h mouse driver (mouse.c). The SDL thread feeds motion and buttons in;
+ * the game thread reads them back through the int 33h handler. */
 int  mouse_int33(CONTEXT *c);
+void mouse_sdl_motion(int dx, int dy);      /* deltas in game pixels */
+void mouse_sdl_button(int button, int pressed);
+void mouse_sdl_release_all(void);
+int  mouse_cursor_visible(void);
 int  ioport_in(uint16_t port, int width, uint32_t *out);
 int  ioport_out(uint16_t port, int width, uint32_t val);
 

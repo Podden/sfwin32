@@ -27,6 +27,7 @@ port\build\Release\fightport.exe --assets D:\Schleichfahrt\Schleichfahrt\SF
 | option | meaning |
 |---|---|
 | `--exe FILE` | the LE executable (default `FIGHT.EXE`, resolved after `--assets`) |
+| `--mode fight\|desktop` | which of the game's two DOS/4GW binaries to run. Selects the automatic patch set and the Miles address table, both of which are per-image. Also picks the default `--exe` and the log name |
 | `--assets DIR` | asset directory; becomes the working directory |
 | `--args "solo"` | PSP command tail. `FIGHT.EXE` refuses to run unless `argv[1]` is `solo` — that is how `SF.EXE` launches it |
 | `--patch A=HEX` | overwrite bytes at an original link-time address, e.g. `--patch A8F1B=EB37`; repeatable. Nothing beyond the automatic patches below is needed to run |
@@ -205,6 +206,79 @@ strobes the port exactly once at startup and never again.
 held (both directly and through its indirection pointer) plus the exact game
 port read count. That combination is what separated "the input layer is lying"
 from "the input layer is fine and something else is steering".
+
+**Mouse.** `mouse.c` implements int 33h over SDL, split the way the audio is:
+the SDL thread feeds motion and buttons in, the game thread reads them back.
+The position is integrated from *relative* motion and clamped to the range the
+game sets, rather than sampled from the host cursor — that is what a real
+driver does, and it is the only version where function 0x04 (set position)
+means anything. Buttons are released on focus loss for the same reason held
+keys are.
+
+`FIGHT.EXE` never calls int 33h — verified, with the vector confirmed routed —
+so this exists for `DESKTOP.EXE`, whose station UI is mouse-driven. Function
+0x0C (install an event handler the driver calls back on every event) is the one
+gap: nothing here can issue that far call. It is logged rather than silently
+succeeding, because a game steering from it would sit perfectly still instead
+of misbehaving visibly.
+
+**The second binary.** Schleichfahrt is two DOS/4GW executables that a 15 KB
+`SF.EXE` launcher chains between: `FIGHT.EXE` (combat) and `DESKTOP.EXE`
+(station, dialogue, trading — it announces itself as `MASSIVE Desktop V1.120`).
+They are the same format, compiler and middleware, so the loader, emulator,
+services, video and audio all apply unchanged. What does *not* transfer is
+every address, and there are two sets of them.
+
+The patch set is now per-mode and each patch states the bytes it expects,
+so a wrong `--mode` is rejected instead of corrupting the image. Finding
+DESKTOP's equivalents by eye is how you patch a function that merely starts
+with the same opcode — `cmp dword ptr [m32], 0` is `833D`, and there are many
+of those — so they are found by signature instead:
+
+- `isrfind.py` locates the timer ISR by `mov ax,ds / mov ss,ax / mov esp,imm32`,
+  which nothing else in either image does, and derives the device-API and
+  BIOS-chaining sites from it.
+- `ailtable.py` names every Miles entry point by the `AIL_` format string that
+  function pushes for its own debug logging, inverting `ailverify.py`.
+
+Both were validated by reproducing FIGHT's hand-derived answers exactly —
+`isrfind.py` regenerates the identical `A8F1B=EB37`, and `ailtable.py` returns
+all 16 addresses including the six that were originally wrong and corrected by
+hand. None of FIGHT's 16 Miles addresses are valid in DESKTOP.
+
+**The trap flag must not be re-armed for a resume into our own code.** This is
+the bug that made `DESKTOP.EXE` unrunnable, and it had been latent all along.
+
+Windows does not clear TF when it dispatches an exception to user mode: the
+handler inherits the interrupted context's flags. Since the emulator runs the
+game with TF set whenever a shadow selector is foreign, a fault taken during
+that window lands in the handler still in single-step mode. The tail of the
+handler then re-armed TF from `shadow_dirty()` regardless of *where* it was
+resuming — so after the handler dropped the flag, that line put it straight
+back, and execution crawled one instruction per exception through our own code
+until a nested trap was declined and the process died with an unhandled
+`STATUS_SINGLE_STEP`.
+
+`FIGHT.EXE` survived on luck: faults during a TF window are rare there.
+`DESKTOP.EXE` scans its environment block with `ES` foreign and faults on every
+byte, so it died within a second, every time. TF is now armed only when the
+resumed EIP is inside the game image. The diagnosis came from logging EIP,
+EFlags and thread id per exception — the marching consecutive addresses
+(`4056A4, A7, A9, AC…`) through our own code are what made it unambiguous,
+after two wrong theories drawn from a Release build's approximate
+nearest-symbol attribution.
+
+**Where DESKTOP stands.** It loads (16436 fixups, 0 skipped), takes all four
+patches, hooks its own 16 Miles entry points, installs its timer and int 24
+handlers, and enumerates VBE modes. It wants a start mode as `argv[1]` —
+`cold`, `warm`, `ice` or `autosave`, not FIGHT's `solo` — and with one of those
+it reaches its config stage, rewrites `CONFIGI.DES`, and then exits 102.
+
+`main` is a chain of init steps, each `call <init>; test eax,eax; jne <next>`
+with its own exit code. The one returning 0 is `0x17910`, which succeeds only
+if the object at `0x1060E8` is initialised; `--watch 1060e8` proves nothing
+ever writes it. So an earlier init step is failing silently — that is the next
+thread to pull.
 
 **Sound.** The game drives a Sound Blaster through Miles Sound System 3.50F
 and an `AIL3DIG` driver — 16-bit real-mode code that would need an 8086
