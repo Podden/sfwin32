@@ -730,6 +730,26 @@ int vbe_dispatch(CONTEXT *c)
             break;
         }
 
+        case 0x66:
+            /* Miles' classic low-level digital driver (DIGPAK) lives on this
+             * fixed vector, with documented functions at AH=06 (0688h-069Fh)
+             * and AH=07 (0701h, a MIDI-driver's digital-capability check
+             * called from inside DIGPAK's own CheckIn). The one call
+             * DESKTOP.EXE actually makes is AX=0401h, matching neither, and
+             * answering it either way (confirmed empirically: "present" and
+             * "absent" were both tried) produces no further calls through
+             * this vector -- so whatever it is, it is not the gate for the
+             * cutscene audio. Answered as DIGPAK's own CheckIn failure
+             * convention (AX=0) since that is what a real system missing
+             * this optional legacy driver would also report. */
+            LOGI("real-mode int 66h (Miles low-level driver): ax=%04X "
+                 "bx=%04X cx=%04X dx=%04X si=%04X di=%04X -- reporting "
+                 "no driver present",
+                 (uint16_t)eax, (uint16_t)r->ebx, (uint16_t)r->ecx,
+                 (uint16_t)r->edx, (uint16_t)r->esi, (uint16_t)r->edi);
+            eax &= 0xFFFF0000u;
+            break;
+
         default:
             todo_hit("rmint", vec, c->Eip);
             /* todo_hit's own WARN flags the gap once; the register state is a
