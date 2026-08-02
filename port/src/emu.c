@@ -1120,8 +1120,9 @@ static uint32_t g_last_ok_eip, g_handled;
  * question that matters when an init flag never gets set -- whether anything
  * writes it at all, and roughly where. */
 int g_dump_keys;                 /* --dumpkeys: log what the game thinks is held */
-int g_extern_irq = 1;
-uint32_t g_vram_faults;            /* --no-extern-irq disables the fallback path  */
+int g_extern_irq = 1;             /* --no-extern-irq disables the fallback path  */
+uint32_t g_vram_faults;
+uint32_t g_pit_divisor_addr = GAME_PIT_DIVISOR_ADDR_FIGHT;
 
 uint32_t g_watch_addr;
 int      g_watch_dwords = 1;     /* --watch ADDR:N covers a whole struct */
@@ -1386,17 +1387,27 @@ static void irq_deliver_pending(CONTEXT *c)
      * shadow stale and the next translated access pointing at wrong memory. */
     if (shadow_dirty())              { g_skip_shadow++; return; }
 
+    /* Mouse events get first refusal, not last. They were originally handed
+     * the "nothing else is due" leftover slot, which was fine while the timer
+     * rarely queued a tick (DESKTOP.EXE's real 200 Hz divisor was going
+     * unread and it ran its IRQ0 at the default 18.2 Hz). Once that was fixed,
+     * g_pend_irq0 is non-zero on nearly every fault -- a queue running at its
+     * intended rate is busy far more often than a starved one -- and the
+     * leftover slot almost never came up, so the pointer stopped moving in
+     * all but the sparsest traffic.
+     *
+     * Mouse events are comparatively rare (one per SDL motion/button event,
+     * not one per tick), so letting one preempt a queued timer tick costs at
+     * most a few microseconds of IRQ0 latency and is never visible; starving
+     * the mouse instead was the visible bug. */
+    if (mouse_cb_ready() &&
+        (uintptr_t)c->Esp >= (uintptr_t)c + sizeof(CONTEXT) + 64 &&
+        mouse_cb_deliver(c, stack_writable))
+        return;
+
     if      (g_pend_irq1 > 0 && kbd_pending()) vec = 9;
     else if (g_pend_irq0 > 0)                  vec = 8;
-    else {
-        /* No hardware interrupt due, so this is a good moment to hand the game
-         * its mouse events -- the checks above are exactly the ones a callback
-         * needs too, and the clearance test below applies equally. */
-        if (mouse_cb_ready() &&
-            (uintptr_t)c->Esp >= (uintptr_t)c + sizeof(CONTEXT) + 64)
-            mouse_cb_deliver(c, stack_writable);
-        return;
-    }
+    else return;
 
     handler = dos_get_ivec(vec);
     if (handler < lo || handler >= hi) {       /* not installed yet */
@@ -1531,7 +1542,7 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
         if (now.QuadPart < next.QuadPart) continue;
 
         /* Honour whatever rate the game programmed into the PIT. */
-        div = *(volatile uint32_t *)gp(GAME_PIT_DIVISOR_ADDR) & 0xFFFF;
+        div = *(volatile uint32_t *)gp(g_pit_divisor_addr) & 0xFFFF;
         if (div == 0) div = 0x10000;
         if (div != last_div) {
             LOGI("timer rate: divisor %u -> %.2f Hz", div, 1193182.0 / div);

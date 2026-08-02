@@ -291,9 +291,37 @@ nearest-symbol attribution.
 
 **Where DESKTOP stands.** It loads (16436 fixups, 0 skipped), takes all four
 patches, hooks its own 16 Miles entry points, sets 640×480×16 with the linear
-framebuffer, plays audio, holds its programmed 18.2 Hz timer, and responds to
-the mouse. It wants a start mode as `argv[1]` — `cold`, `warm`, `ice` or
-`autosave`, not FIGHT's `solo`.
+framebuffer, plays audio, runs its timer at the 200 Hz it actually asks for,
+and responds to the mouse. It wants a start mode as `argv[1]` — `cold`, `warm`,
+`ice` or `autosave`, not FIGHT's `solo`.
+
+**The PIT-divisor shadow global is per-image, and reading the wrong one is a
+silent bug, not a crash.** `GAME_PIT_DIVISOR_ADDR` was a single hardcoded
+constant — FIGHT's address for its own copy of the last-programmed divisor —
+used unconditionally regardless of mode. In DESKTOP's address space that same
+numeric address is something else entirely, so the timer thread always read a
+stray value there rather than DESKTOP's real state, landed on "not
+reprogrammed" every time, and ran the timer at the BIOS default 18.2 Hz. There
+was no crash and no log warning to point at it: the game looked like it was
+just designed to run its station scenes slowly.
+
+`--watch f9ce6` (found the same way as the ISR patch sites: the divisor is
+stored to a global at the exact point the command byte and both divisor bytes
+are written to ports 0x43/0x40) showed `0x0000 -> 0x174E` shortly after boot —
+1193182/0x174E is 200.0 Hz, the identical rate FIGHT programs. DESKTOP was
+never slow by design; it was asking for 200 Hz and silently being refused.
+`g_pit_divisor_addr` is now set from the resolved mode before the timer thread
+starts, alongside `GAME_PIT_DIVISOR_ADDR_FIGHT` / `_DESKTOP`.
+
+Fixing it exposed a second bug the first one had been masking: the mouse
+event-handler callback was only delivered on the "no hardware IRQ pending"
+leftover slot in `irq_deliver_pending`. That was invisible while IRQ0 rarely
+queued a tick (the 18.2 Hz bug above), but once the timer ran at its correct
+200 Hz, that slot almost never came up and the pointer stopped moving in all
+but the sparsest traffic. Mouse delivery is now tried first, ahead of the
+timer and keyboard — one mouse event competing against a queued tick costs at
+most a few microseconds of IRQ0 latency, which is never visible, whereas
+starving the mouse behind a healthy timer was.
 
 Getting there meant finding why it exited 102. `main` is a chain of init steps,
 each `call <init>; test eax,eax; jne <next>` with its own exit code; the one

@@ -294,6 +294,12 @@ int main(int argc, char **argv)
     apply_patches();
     relocate_isr_stack();
 
+    /* Per-image: the game's own shadow copy of the PIT divisor it last
+     * programmed, at a different address in each binary. Must be set before
+     * timer_start(). */
+    g_pit_divisor_addr = (g_mode == MODE_DESKTOP) ? GAME_PIT_DIVISOR_ADDR_DESKTOP
+                                                   : GAME_PIT_DIVISOR_ADDR_FIGHT;
+
     /* Replaces the Miles driver stack with our own mixer. Must come after
      * relocation, since the hooks are written into the loaded image. */
     audio_init();

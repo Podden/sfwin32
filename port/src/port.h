@@ -173,10 +173,18 @@ void audio_set_voice_count(int n);
 
 uint32_t dos_get_ivec(int vec);
 
-/* The PIT divisor the game programs through port 0x40 is also kept in this
+/* The PIT divisor the game programs through port 0x40 is also kept in a
  * global by its own timer-rate routine, which is the easiest place to read it
- * back from. 0 means the full 65536. */
-#define GAME_PIT_DIVISOR_ADDR 0x0015803Eu
+ * back from. 0 means the full 65536. The address is per-image -- FIGHT.EXE and
+ * DESKTOP.EXE are different link addresses -- and reading FIGHT's address in
+ * DESKTOP left the timer thread always seeing 0, so DESKTOP silently ran at
+ * the base 18.2 Hz tick despite programming the identical 200 Hz divisor
+ * FIGHT does (confirmed with --watch f9ce6: 0x0000 -> 0x174E, and
+ * 1193182/0x174E is 200.0 Hz). g_pit_divisor_addr is set from the resolved
+ * mode in main() before the timer thread starts. */
+#define GAME_PIT_DIVISOR_ADDR_FIGHT   0x0015803Eu
+#define GAME_PIT_DIVISOR_ADDR_DESKTOP 0x000F9CE6u
+extern uint32_t g_pit_divisor_addr;
 
 int  dos_int21(CONTEXT *c);
 int  dpmi_int31(CONTEXT *c);
