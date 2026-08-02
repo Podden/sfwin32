@@ -15,10 +15,14 @@
  *  - Miles is compiled cdecl, not the Watcom register convention the game
  *    itself uses, so the hooks are ordinary C functions with no thunks.
  *
- * Sample data arrives as raw signed 8-bit mono PCM with an explicit byte
- * count -- see h_set_sample_address below, where the call sites settle both the
- * signature and the signedness. Rate, volume, pan and looping all come from
- * the game through the API rather than from any header.
+ * Sample data arrives as raw PCM with an explicit byte count -- see
+ * h_set_sample_address below, where the call sites settle both the signature
+ * and the signedness. Every sound effect is signed 8-bit mono (AIL format 0),
+ * but the desktop's movie soundtracks turned out to be format 2 (16-bit
+ * mono); AIL_set_sample_type's format code selects between all four Miles
+ * formats (mono/stereo x 8/16-bit) rather than assuming one. Rate, volume,
+ * pan and looping all come from the game through the API rather than from
+ * any header.
  */
 
 #include "port.h"
@@ -86,8 +90,10 @@ typedef struct {
     int             used;
     int             playing;
     const uint8_t  *data;
-    uint32_t        len;        /* in source samples (8-bit mono) */
-    double          pos;        /* fractional read position */
+    uint32_t        raw_bytes;  /* what set_sample_address actually received */
+    uint32_t        len;        /* in source frames -- raw_bytes / frame size */
+    int             fmt;        /* AIL format: 0=mono8 1=stereo8 2=mono16 3=stereo16 */
+    double          pos;        /* fractional read position, in frames */
     int             rate;       /* source playback rate, Hz */
     int             volume;     /* 0..127 */
     int             pan;        /* 0..127, 64 = centre */
@@ -96,6 +102,30 @@ typedef struct {
     int32_t         user[8];    /* AIL_sample_user_data slots */
 } voice;
 
+/* Bytes per playback frame for each AIL format. Sound effects are all format
+ * 0 (see h_set_sample_address's comment on the byte-for-byte dump that
+ * proved that), but the desktop's cinematics turned out to be format 2 --
+ * 16-bit mono -- and reading them as 8-bit produced noise at roughly twice
+ * the intended pitch, since every other byte was treated as its own sample
+ * and the frame count (bytes, for an 8-bit assumption) was twice the real
+ * one. */
+static int fmt_frame_bytes(int fmt)
+{
+    switch (fmt) {
+    case 1: case 2: return 2;      /* stereo 8-bit, or mono 16-bit  */
+    case 3:          return 4;      /* stereo 16-bit                 */
+    default:         return 1;      /* mono 8-bit, and any unknown fmt */
+    }
+}
+
+/* set_sample_address and set_sample_type can arrive in either order, and
+ * both need to agree on the frame count -- so both call this after updating
+ * whichever field they own. */
+static void voice_recompute_len(voice *s)
+{
+    s->len = s->raw_bytes / (uint32_t)fmt_frame_bytes(s->fmt);
+}
+
 static voice            g_voice[MAX_VOICES];
 static int              g_driver_token;      /* address handed out as HDIGDRIVER */
 static int              g_master = 127;
@@ -103,6 +133,39 @@ static SDL_AudioDeviceID g_dev;
 static int32_t         *g_mixbuf;
 static int              g_mixframes;      /* capacity of g_mixbuf, in frames */
 static double           g_gain = 1.0;     /* limiter, see mix_cb */
+
+/* Reads one playback frame at index `idx` from `s->data`, in whatever format
+ * the voice is set to, and returns left/right in the same -32768..32767
+ * range regardless of source width -- 8-bit samples are widened by the shift
+ * that always applied here; 16-bit samples are simply signed PCM already in
+ * that range, read as little-endian regardless of host alignment. */
+static void fetch_frame(const voice *s, uint32_t idx, int *l, int *r)
+{
+    switch (s->fmt) {
+    case 1: {                                    /* 8-bit stereo */
+        const int8_t *p = (const int8_t *)s->data + (size_t)idx * 2;
+        *l = (int)p[0] << 8; *r = (int)p[1] << 8;
+        break;
+    }
+    case 2: {                                    /* 16-bit mono */
+        int16_t v;
+        memcpy(&v, s->data + (size_t)idx * 2, 2);
+        *l = *r = v;
+        break;
+    }
+    case 3: {                                    /* 16-bit stereo */
+        int16_t lv, rv;
+        const uint8_t *p = s->data + (size_t)idx * 4;
+        memcpy(&lv, p, 2);
+        memcpy(&rv, p + 2, 2);
+        *l = lv; *r = rv;
+        break;
+    }
+    default:                                      /* 8-bit mono */
+        *l = *r = (int)(int8_t)s->data[idx] << 8;
+        break;
+    }
+}
 
 /* ------------------------------------------------------------- the mixer */
 
@@ -132,7 +195,7 @@ static void SDLCALL mix_cb(void *ud, Uint8 *stream, int len)
 
         for (i = 0; i < frames; i++) {
             uint32_t idx = (uint32_t)s->pos;
-            int sample;
+            int sl, sr;
 
             if (idx >= s->len) {
                 if (s->loops == 1) { s->playing = 0; break; }
@@ -145,9 +208,12 @@ static void SDLCALL mix_cb(void *ud, Uint8 *stream, int len)
                 idx = (uint32_t)s->pos;
                 if (idx >= s->len) { s->playing = 0; break; }
             }
-            sample = (int)(int8_t)s->data[idx] << 8;   /* signed 8-bit mono */
-            g_mixbuf[i * 2 + 0] += (int32_t)((int64_t)sample * lvol / (127 * 127 * 127));
-            g_mixbuf[i * 2 + 1] += (int32_t)((int64_t)sample * rvol / (127 * 127 * 127));
+            fetch_frame(s, idx, &sl, &sr);
+            /* Pan still applies per output channel even when the source is
+             * already stereo -- Miles honours AIL_set_sample_pan regardless
+             * of source format, and nothing here has reason to differ. */
+            g_mixbuf[i * 2 + 0] += (int32_t)((int64_t)sl * lvol / (127 * 127 * 127));
+            g_mixbuf[i * 2 + 1] += (int32_t)((int64_t)sr * rvol / (127 * 127 * 127));
             s->pos += step;
         }
     }
@@ -266,7 +332,8 @@ static void __cdecl h_init_sample(void *h)
     voice *s = as_voice(h);
     if (!s) return;
     if (g_dev) SDL_LockAudioDevice(g_dev);
-    s->playing = 0; s->data = NULL; s->len = 0; s->pos = 0;
+    s->playing = 0; s->data = NULL; s->len = 0; s->raw_bytes = 0; s->fmt = 0;
+    s->pos = 0;
     s->rate = MIX_RATE; s->volume = 127; s->pan = 64; s->loops = 1;
     if (g_dev) SDL_UnlockAudioDevice(g_dev);
 }
@@ -300,14 +367,21 @@ static int32_t __cdecl h_set_sample_address(void *h, const void *data, int32_t l
     }
     if (g_dev) SDL_LockAudioDevice(g_dev);
     s->data = (const uint8_t *)data;
-    s->len  = (uint32_t)len;
-    s->pos  = 0;
-    s->playing = 0;
+    s->raw_bytes = (uint32_t)len;
     /* New sample data resets the loop count, as Miles does. This matters:
      * the game sets an infinite loop (count 0) on some sounds and then simply
      * does not call set_sample_loop_count for one-shots, relying on the reset.
      * Since sample handles are a reused pool, without this a weapon firing on
-     * a handle that previously held a looping sound would loop forever. */
+     * a handle that previously held a looping sound would loop forever.
+     *
+     * Format is reset the same way and for the same reason: a handle that
+     * just played 16-bit cinematic audio and gets reused for an ordinary
+     * effect must not stay interpreted as 16-bit if the game does not call
+     * set_sample_type again for it. */
+    s->fmt = 0;
+    voice_recompute_len(s);
+    s->pos  = 0;
+    s->playing = 0;
     s->loops = 1;
     s->wraps = 0;
     if (g_dev) SDL_UnlockAudioDevice(g_dev);
@@ -352,12 +426,23 @@ static int32_t __cdecl h_sample_user_data(void *h, uint32_t index)
 }
 
 static void __cdecl h_set_sample_type(void *h, int32_t fmt, uint32_t flags)
-{   /* Everything shipped here is unsigned 8-bit mono; recorded for the log
-     * only, so an unexpected format shows up rather than playing as noise. */
+{   /* Format 0 (8-bit mono) covers every sound effect; the desktop's movie
+     * soundtracks turned out to be format 2 (16-bit mono) instead. Formats
+     * 1 and 3 (the stereo variants) have not been observed, but are handled
+     * identically by the mixer, so there is nothing to special-case if they
+     * ever do turn up. */
     voice *s = as_voice(h);
     (void)flags;
-    if (s && fmt != 0)
-        LOGW("audio: sample format %d is not 8-bit mono; playing as-is", fmt);
+    if (!s) return;
+    if (fmt < 0 || fmt > 3) {
+        LOGW("audio: sample format %d is not a recognised AIL format; "
+             "treating as 8-bit mono", (int)fmt);
+        fmt = 0;
+    }
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    s->fmt = (int)fmt;
+    voice_recompute_len(s);
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
 }
 
 static void __cdecl h_start_sample(void *h)
