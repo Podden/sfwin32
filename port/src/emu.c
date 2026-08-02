@@ -637,6 +637,64 @@ static int emulate_seg_mov(CONTEXT *c, insn *in, int pfx)
     }
 }
 
+/* x87 FPU instructions with a memory operand (opcodes 0xD8-0xDF).
+ *
+ * The game's 3D math is full of `fld dword ptr [reg]` / `fsub dword ptr
+ * [reg]` / `fstp dword ptr [reg+n]`, and like any other memory access these
+ * fault when the effective address lands below 1 MB or behind a foreign
+ * selector -- e.g. an object whose per-surface shading data failed to load
+ * stays a null pointer, and the game still walks a small member offset off
+ * it (orig 0x961BB, ea=0x104), which is harmless address-space noise under
+ * DOS/4GW's zero-based flat selector but a real Win32 access violation here.
+ * This is what crashed a played mission: unhandled fault at 0x961BB, opcode
+ * 0xD8, "access reading address 0x00000104".
+ *
+ * There are on the order of thirty distinct forms across m32/m64/m80 real
+ * and m16/m32/m64 integer operands, and hand-writing software equivalents
+ * for all of them risks subtly wrong rounding -- exactly the kind of
+ * guesswork this project avoids elsewhere. Real hardware already has the
+ * right answer: this handler runs on the same thread the game does, so the
+ * x87 register stack it sees *is* the game's, untouched by the fault.
+ * Redirecting is therefore only a question of making the same instruction
+ * operate on a reachable address, not of understanding what it computes.
+ *
+ * In 32-bit code, ModRM mod=00/rm=101 means `[disp32]` -- flat absolute
+ * addressing, no base register. Rewriting only the mod/rm bits (keeping the
+ * reg field, which selects fld vs fsub vs fstp and so on) and appending the
+ * translated pointer as that displacement turns any of these thirty forms
+ * into a drop-in replacement, copied into a small scratch buffer and called
+ * like a function. If the translated pointer were somehow still unreachable,
+ * executing it here would fault again, and the existing __except around the
+ * whole handler in emu_veh already catches that and reports it rather than
+ * corrupting anything -- but every address this project's xlat() hands back
+ * for the low-memory/foreign-selector cases is one of ours (g_dosmem or a
+ * mapped part of the image), so that path is not expected to be taken. */
+static uint8_t *g_fpu_tramp;
+
+static int emulate_fpu_mem(CONTEXT *c, insn *in, int pfx)
+{
+    const uint8_t *p = in->p + pfx + 1;
+    int mod, rf, rm, n, ok;
+    uint32_t ea;
+    void *ptr;
+
+    n = decode_modrm(c, p, &ea, &rf, &mod, &rm);
+    if (mod == 3) return 0;            /* register-only form: never faults */
+    ptr = xlat(in->seg < 0 ? SEG_DS : in->seg, ea, &ok);
+    if (!ok) return 0;
+
+    if (!g_fpu_tramp) return 0;        /* allocated once in emu_install() */
+    g_fpu_tramp[0] = in->op;
+    g_fpu_tramp[1] = (uint8_t)(0x05 | (rf << 3));  /* mod=00 reg=rf rm=101 */
+    *(uint32_t *)(g_fpu_tramp + 2) = (uint32_t)(uintptr_t)ptr;
+    g_fpu_tramp[6] = 0xC3;                                       /* ret */
+    ((void (*)(void))(uintptr_t)g_fpu_tramp)();
+
+    LOGT("fpu mem op 0x%02X /%d at orig 0x%08X -> host %p",
+         in->op, rf, c->Eip - g_img.delta, ptr);
+    return pfx + 1 + n;
+}
+
 /* String instructions take ES:EDI / DS:ESI implicitly, so they carry no
  * prefix to trap on -- they simply fault against a flat selector when the
  * game meant a segmented one (the PSP command tail, for instance). Emulate
@@ -1063,6 +1121,9 @@ static LONG emu_veh_inner(EXCEPTION_POINTERS *ep)
                 (in.op >= 0xAA && in.op <= 0xAF)) {
                 g_dbg_stage = 7;
                 n = emulate_string(c, &in, pfx);
+            } else if (in.op >= 0xD8 && in.op <= 0xDF) {
+                g_dbg_stage = 10;
+                n = emulate_fpu_mem(c, &in, pfx);
             } else {
                 g_dbg_stage = 8;
                 n = emulate_seg_mov(c, &in, pfx);
@@ -1658,6 +1719,12 @@ int emu_install(void)
                                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!g_dosmem) { LOGE("dosmem alloc failed"); return 0; }
     memset(g_dosmem, 0, DOSMEM_SIZE);
+
+    /* One instruction (opcode + modrm + disp32) plus a ret, executable: see
+     * emulate_fpu_mem's comment for what this is for. */
+    g_fpu_tramp = (uint8_t *)VirtualAlloc(NULL, 16, MEM_RESERVE | MEM_COMMIT,
+                                          PAGE_EXECUTE_READWRITE);
+    if (!g_fpu_tramp) { LOGE("fpu trampoline alloc failed"); return 0; }
 
     /* A minimal PSP at linear 0, which is where a zero-based selector points.
      * The startup reads the environment segment at +0x2C and parses the
