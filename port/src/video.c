@@ -732,6 +732,12 @@ int vbe_dispatch(CONTEXT *c)
 
         default:
             todo_hit("rmint", vec, c->Eip);
+            /* todo_hit's own WARN flags the gap once; the register state is a
+             * --trace-level detail for digging into a specific one further. */
+            LOGT("real-mode int %02Xh: ax=%04X bx=%04X cx=%04X dx=%04X "
+                 "si=%04X di=%04X",
+                 vec, (uint16_t)eax, (uint16_t)r->ebx, (uint16_t)r->ecx,
+                 (uint16_t)r->edx, (uint16_t)r->esi, (uint16_t)r->edi);
             break;
         }
 

@@ -292,6 +292,7 @@ static void __cdecl h_uninstall_DIG_driver(void *dig)
 {
     int v;
     (void)dig;
+    LOGI("audio: AIL_uninstall_DIG_driver -- stopping all voices");
     if (g_dev) SDL_LockAudioDevice(g_dev);
     for (v = 0; v < MAX_VOICES; v++) g_voice[v].playing = 0;
     if (g_dev) SDL_UnlockAudioDevice(g_dev);
@@ -385,6 +386,7 @@ static int32_t __cdecl h_set_sample_address(void *h, const void *data, int32_t l
     s->loops = 1;
     s->wraps = 0;
     if (g_dev) SDL_UnlockAudioDevice(g_dev);
+    LOGT("audio: set_sample_address voice %d len=%d", (int)(s - g_voice), len);
     return 1;                        /* Miles returns 1 on success */
 }
 
@@ -404,6 +406,7 @@ static void __cdecl h_release_sample_handle(void *h)
 {
     voice *s = as_voice(h);
     if (!s) return;
+    LOGT("audio: release_sample_handle voice %d", (int)(s - g_voice));
     if (g_dev) SDL_LockAudioDevice(g_dev);
     s->playing = 0;
     s->used = 0;
