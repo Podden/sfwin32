@@ -12,7 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-const char *g_cmdline = "solo";
+/* NULL until resolved: FIGHT.EXE and DESKTOP.EXE require different argv[1]
+ * values (see the mode-aware default below), so there is no single constant
+ * that is right unconditionally -- only "solo" happened to look like one
+ * because FIGHT was the first and, for a while, only mode this port ran. */
+const char *g_cmdline;
 
 /* Schleichfahrt ships as two DOS/4GW binaries that SF.EXE chains between:
  * FIGHT.EXE is the combat module, DESKTOP.EXE the station -- story, dialogue
@@ -30,13 +34,19 @@ static const char *mode_name(void)
 static void usage(const char *argv0)
 {
     printf("usage: %s [--mode fight|desktop] [--exe IMAGE] [--assets DIR]\n"
-           "          [--args \"solo\"] [--patch ADDR=HEXBYTES] [--watch ADDR]\n"
+           "          [--args ARGV1] [--patch ADDR=HEXBYTES] [--watch ADDR]\n"
            "          [--dumpkeys] [--trace]\n"
            "\n"
            "  --mode   which of the game's two DOS/4GW binaries to run.\n"
            "           fight = the combat module (default, FIGHT.EXE),\n"
            "           desktop = the station (DESKTOP.EXE). Selects the\n"
            "           automatic patch set, which is per-image.\n"
+           "\n"
+           "  --args   the command tail passed through the PSP. Defaults to\n"
+           "           \"solo\" for fight, \"cold\" for desktop -- each\n"
+           "           image checks argv[1] against its own fixed set and\n"
+           "           refuses to run otherwise (desktop also accepts warm,\n"
+           "           ice, autosave).\n"
            "\n"
            "  --patch  overwrite bytes at an original (link-time) address,\n"
            "           e.g. --patch 1021F=EB23 . This is the hook point for\n"
@@ -265,6 +275,15 @@ int main(int argc, char **argv)
     /* The mode picks the binary unless one was named explicitly. */
     if (!exe) exe = (g_mode == MODE_DESKTOP) ? "DESKTOP.EXE" : "FIGHT.EXE";
 
+    /* Same for the command tail, unless --args overrode it. FIGHT.EXE wants
+     * "solo" (that is how SF.EXE launches it); DESKTOP.EXE checks argv[1]
+     * against "cold"/"warm"/"ice"/"autosave" and recognises none of those --
+     * "solo" included -- printing "FEHLER: Bitte starten Sie SF.EXE" and
+     * exiting. Before this had a mode-aware default, --mode desktop without
+     * also remembering --args cold hit that error every time. */
+    if (!g_cmdline)
+        g_cmdline = (g_mode == MODE_DESKTOP) ? "cold" : "solo";
+
     /* One log per mode: running both binaries in turn into a single file
      * makes the two runs indistinguishable after the fact. */
     log_init(g_mode == MODE_DESKTOP ? "desktop.log" : "fight.log");
@@ -297,8 +316,9 @@ int main(int argc, char **argv)
     /* Per-image: the game's own shadow copy of the PIT divisor it last
      * programmed, at a different address in each binary. Must be set before
      * timer_start(). */
-    g_pit_divisor_addr = (g_mode == MODE_DESKTOP) ? GAME_PIT_DIVISOR_ADDR_DESKTOP
-                                                   : GAME_PIT_DIVISOR_ADDR_FIGHT;
+    g_desktop_mode = (g_mode == MODE_DESKTOP);
+    g_pit_divisor_addr = g_desktop_mode ? GAME_PIT_DIVISOR_ADDR_DESKTOP
+                                        : GAME_PIT_DIVISOR_ADDR_FIGHT;
 
     /* Replaces the Miles driver stack with our own mixer. Must come after
      * relocation, since the hooks are written into the loaded image. */

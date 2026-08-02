@@ -323,6 +323,53 @@ timer and keyboard — one mouse event competing against a queued tick costs at
 most a few microseconds of IRQ0 latency, which is never visible, whereas
 starving the mouse behind a healthy timer was.
 
+**Auditing for the same mistake elsewhere.** The PIT divisor was one specific
+instance of a general failure mode — a constant derived from FIGHT.EXE, used
+unconditionally for both images — so once it was found the rest of the
+codebase was checked for the same pattern. Two more turned up:
+
+- **The default command tail.** `g_cmdline` defaulted to the string `"solo"`
+  at file scope, with no mode awareness at all. FIGHT wants exactly `"solo"`
+  (that is how `SF.EXE` launches it); DESKTOP checks `argv[1]` against
+  `"cold"`/`"warm"`/`"ice"`/`"autosave"` and recognises none of those —
+  `"solo"` included — printing `FEHLER: Bitte starten Sie SF.EXE` and exiting.
+  `--mode desktop` without also remembering `--args cold` hit that error
+  every time; this is the exact failure this project diagnosed and worked
+  around by hand earlier, without ever closing the root cause. `g_cmdline`
+  is now `NULL` until resolved, defaulting to `"solo"` or `"cold"` alongside
+  the executable name and log file, from the same per-mode block.
+
+- **The ISR re-entrancy spans.** `eip_in_isr()` uses `ISR8_SPAN`/`ISR9_SPAN` —
+  byte widths, not addresses — to keep an injected interrupt from landing
+  mid-handler, inside the stack-switch window where re-entry would corrupt
+  saved registers. These were FIGHT-only measurements (0x1B0, 0x170) applied
+  to whichever handler `dos_get_ivec()` reports, DESKTOP's included. Unlike
+  the PIT divisor this one had not yet misbehaved: disassembling DESKTOP's
+  own int8 and int9 handlers end-to-end measured them at 0x1A3 and 0x167
+  bytes, both under FIGHT's spans, so nothing had actually landed
+  mid-handler — but by a margin of only 13 and 9 bytes, on constants nothing
+  connected to DESKTOP's actual code. A handful more bytes in a future
+  rebuild of either binary would have turned this into the same class of
+  silent failure, just harder to diagnose (occasional stack corruption
+  instead of a wrong-but-consistent timer rate). Split into
+  `ISR8_SPAN_FIGHT`/`_DESKTOP` and `ISR9_SPAN_FIGHT`/`_DESKTOP`, selected by
+  a new general-purpose `g_desktop_mode` flag set alongside the PIT divisor.
+
+`g_desktop_mode` also gates `--dumpkeys`, which read FIGHT's key-state array
+address unconditionally and would have logged whatever unrelated data sits at
+that numeric address in DESKTOP as if it were key state. Lower stakes than
+the other two — it is an opt-in diagnostic, not something the game's own
+correctness depends on — but the same mistake, so fixed the same way.
+
+Everything else that is per-image already was: the Miles address table
+(`g_ail_fight`/`g_ail_desktop` in `audio.c`), the voice-pool patch (skipped
+outright for DESKTOP, which never needed it), and the four ISR/stack-probe
+patch addresses in `main.c` (each checked against the bytes it expects before
+applying). `video.c`, `mouse.c` and `leimage.c` hold no FIGHT-specific
+addresses at all — they work through APIs (VBE, int 33h, the LE fixup table)
+that are inherently image-agnostic, which is why DESKTOP's video, mouse and
+loading worked correctly from the first attempt.
+
 Getting there meant finding why it exited 102. `main` is a chain of init steps,
 each `call <init>; test eax,eax; jne <next>` with its own exit code; the one
 returning 0 was `0x17910`, which succeeds only if the object at `0x1060E8` is

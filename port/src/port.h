@@ -186,6 +186,11 @@ uint32_t dos_get_ivec(int vec);
 #define GAME_PIT_DIVISOR_ADDR_DESKTOP 0x000F9CE6u
 extern uint32_t g_pit_divisor_addr;
 
+/* Set from the resolved --mode in main(), before emu_install()/timer_start().
+ * A general per-mode signal for anything else in the emulator that turns out
+ * to need one -- the ISR-span constants below were the next thing that did. */
+extern int g_desktop_mode;
+
 int  dos_int21(CONTEXT *c);
 int  dpmi_int31(CONTEXT *c);
 int  dpmi_int2f(CONTEXT *c);

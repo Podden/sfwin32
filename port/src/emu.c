@@ -1184,6 +1184,7 @@ int g_dump_keys;                 /* --dumpkeys: log what the game thinks is held
 int g_extern_irq = 1;             /* --no-extern-irq disables the fallback path  */
 uint32_t g_vram_faults;
 uint32_t g_pit_divisor_addr = GAME_PIT_DIVISOR_ADDR_FIGHT;
+int      g_desktop_mode;
 
 uint32_t g_watch_addr;
 int      g_watch_dwords = 1;     /* --watch ADDR:N covers a whole struct */
@@ -1380,10 +1381,23 @@ static LONG WINAPI emu_crash_filter(EXCEPTION_POINTERS *ep)
  * user mode, so nothing needs emulating on the way back.
  */
 
-/* Byte spans of the two handlers we drive, used to avoid re-entering either:
- * vector 8 covers 0xA8ED2..0xA9075, vector 9 covers 0x2BC22..0x2BD8A. */
-#define ISR8_SPAN 0x1B0u
-#define ISR9_SPAN 0x170u
+/* Byte spans of the two handlers we drive, used to avoid re-entering either.
+ * FIGHT.EXE: vector 8 covers 0xA8ED2..0xA9075, vector 9 covers 0x2BC22..0x2BD8A.
+ *
+ * These used to be a single shared pair of constants applied regardless of
+ * which image was running -- the same mistake GAME_PIT_DIVISOR_ADDR made,
+ * just one that happened not to bite: DESKTOP.EXE's own int8/int9 handlers
+ * (installed at their own addresses, read correctly via dos_get_ivec, so
+ * nothing was *wrong* there) measure 0x1A3 and 0x167 bytes, both under
+ * FIGHT's spans but by only 13 and 9 bytes. Under-covering either would let
+ * an injected interrupt land mid-ISR, inside the stack-switch window the
+ * comment above warns about, and corrupt it -- so a future rebuild of either
+ * binary with a handful more bytes in its ISR would have turned this into a
+ * real, silent bug. Made per-mode rather than left as a coincidence. */
+#define ISR8_SPAN_FIGHT   0x1B0u
+#define ISR9_SPAN_FIGHT   0x170u
+#define ISR8_SPAN_DESKTOP 0x1A3u
+#define ISR9_SPAN_DESKTOP 0x167u
 
 static HANDLE g_game_thread;
 static HANDLE g_timer_thread;
@@ -1409,10 +1423,12 @@ static int stack_writable(uintptr_t addr, SIZE_T n)
 static int eip_in_isr(uint32_t eip)
 {
     uint32_t h8 = dos_get_ivec(8), h9 = dos_get_ivec(9);
-    if (h8 && eip >= h8 && eip < h8 + ISR8_SPAN) return 1;
+    uint32_t span8 = g_desktop_mode ? ISR8_SPAN_DESKTOP : ISR8_SPAN_FIGHT;
+    uint32_t span9 = g_desktop_mode ? ISR9_SPAN_DESKTOP : ISR9_SPAN_FIGHT;
+    if (h8 && eip >= h8 && eip < h8 + span8) return 1;
     /* The int 9 handler runs on the interrupted stack rather than its own, so
      * re-entering it would also corrupt its saved registers. */
-    if (h9 && eip >= h9 && eip < h9 + ISR9_SPAN) return 1;
+    if (h9 && eip >= h9 && eip < h9 + span9) return 1;
     return 0;
 }
 
@@ -1627,9 +1643,18 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 
         {   /* Debug aid: what does the game currently believe is held down?
              * Its int 9 ISR keeps a key-state array at 0x15DFCF indexed by
-             * scancode (extended keys at 0x57 + table index), bit 0 = down. */
+             * scancode (extended keys at 0x57 + table index), bit 0 = down.
+             *
+             * FIGHT-only: this is the address of FIGHT's own key-state array,
+             * and DESKTOP's int9 handler (a real scancode-to-ASCII keyboard
+             * driver, not FIGHT's raw bitmap) uses a completely different
+             * layout at a different address. Without this guard, --dumpkeys
+             * under --mode desktop would read whatever unrelated data happens
+             * to sit at that numeric address in DESKTOP's memory and report
+             * it as key state -- the same class of mistake the PIT-divisor
+             * address was, just in a diagnostic rather than the timer. */
             static LARGE_INTEGER t_keys;
-            if (g_dump_keys && g_img.mem) {
+            if (g_dump_keys && g_img.mem && !g_desktop_mode) {
                 if (!t_keys.QuadPart) t_keys = now;
                 if (now.QuadPart - t_keys.QuadPart > freq.QuadPart * 2) {
                     const uint8_t *ks = (const uint8_t *)gp(0x0015DFCFu);
