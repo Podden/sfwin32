@@ -33,9 +33,15 @@ static const char *mode_name(void)
 
 static void usage(const char *argv0)
 {
-    printf("usage: %s [--mode fight|desktop] [--exe IMAGE] [--assets DIR]\n"
-           "          [--args ARGV1] [--patch ADDR=HEXBYTES] [--watch ADDR]\n"
-           "          [--dumpkeys] [--trace]\n"
+    printf("usage: %s [--chain] [--mode fight|desktop] [--exe IMAGE]\n"
+           "          [--assets DIR] [--args ARGV1] [--patch ADDR=HEXBYTES]\n"
+           "          [--watch ADDR] [--dumpkeys] [--trace]\n"
+           "\n"
+           "  --chain  play through both halves the way SF.EXE originally\n"
+           "           did: run desktop, and when it exits with the code\n"
+           "           that means a mission was chosen, run fight; when\n"
+           "           fight exits, go back to desktop. All other options\n"
+           "           are passed through to each child (--mode is ours).\n"
            "\n"
            "  --mode   which of the game's two DOS/4GW binaries to run.\n"
            "           fight = the combat module (default, FIGHT.EXE),\n"
@@ -233,12 +239,128 @@ static void apply_patches(void)
     }
 }
 
+/* ---------------------------------------------------------- chain mode */
+
+/* Runs in place of the game: launches this same executable as a child
+ * process for each half in turn, watching exit codes the way SF.EXE
+ * originally did.
+ *
+ * SF.EXE itself is not decompiled or reverse engineered for this --
+ * DESKTOP.EXE never calls int21 AH=4B (EXEC). Instead it writes the
+ * player's mission/loadout selection to dat\save\FIGHTIN.DES and exits with
+ * a specific code, and FIGHT.EXE reads that same file at startup regardless
+ * of its command line (confirmed by tracing both: DESKTOP writes 772+24
+ * bytes to FIGHTIN.DES then calls `int21 AH=4C AL=02`, and a fresh FIGHT.EXE
+ * run with nothing but `--args solo` opens that same file immediately).
+ * FIGHTOUT.DES is the reverse handoff, written by FIGHT.EXE for DESKTOP to
+ * read back.
+ *
+ * So all real state crosses the process boundary through those files, and
+ * the supervisor's own job is small and entirely observable from outside:
+ * run desktop, and if it exits with the code that means "a mission was
+ * chosen" (2, confirmed), run fight next; when fight exits, go back to
+ * desktop. Any other desktop exit code is treated as the player quitting
+ * from the menu, ending the chain. FIGHT.EXE's own exit codes have not been
+ * catalogued yet, so nothing is gated on them -- the return trip always
+ * happens, per the one thing that was asked of this mode explicitly.
+ *
+ * fightport.exe's own state -- SDL's window/renderer, the audio device, the
+ * vectored exception handler, the timer thread -- is not designed to be torn
+ * down and rebuilt for a different image within one process, so each half
+ * runs as a separate OS process, exactly as the original two binaries did. */
+
+#define CHAIN_MISSION_EXIT_CODE 2
+
+static void append_arg(char *cmd, size_t cap, const char *arg)
+{
+    size_t len = strlen(cmd);
+    int quote = strchr(arg, ' ') != NULL;
+    if (len) { strncat(cmd, " ", cap - len - 1); len++; }
+    if (quote) strncat(cmd, "\"", cap - strlen(cmd) - 1);
+    strncat(cmd, arg, cap - strlen(cmd) - 1);
+    if (quote) strncat(cmd, "\"", cap - strlen(cmd) - 1);
+}
+
+/* Builds "<self.exe> <passthrough args, minus --chain/--mode> --mode X",
+ * runs it to completion, and returns its exit code (-1 on launch failure).
+ * Passing through whatever the user gave (assets dir, --trace, and so on)
+ * means the chain does not need its own copy of every option main() already
+ * understands -- only --chain and --mode are ours to decide here. */
+static int run_child(const char *self_path, int argc, char **argv,
+                      const char *mode)
+{
+    char cmd[4096];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD code = (DWORD)-1;
+    int i;
+
+    cmd[0] = '\0';
+    append_arg(cmd, sizeof cmd, self_path);
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--chain")) continue;
+        if (!strcmp(argv[i], "--mode")) { i++; continue; }  /* ours to set */
+        append_arg(cmd, sizeof cmd, argv[i]);
+    }
+    append_arg(cmd, sizeof cmd, "--mode");
+    append_arg(cmd, sizeof cmd, mode);
+
+    printf("[chain] %s\n", cmd);
+
+    memset(&si, 0, sizeof si); si.cb = sizeof si;
+    memset(&pi, 0, sizeof pi);
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        printf("[chain] failed to launch '%s' (%lu)\n", cmd, GetLastError());
+        return -1;
+    }
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    printf("[chain] mode %s exited with code %lu\n", mode, code);
+    return (int)code;
+}
+
+static int chain_supervisor(int argc, char **argv)
+{
+    char self_path[MAX_PATH];
+    int code;
+
+    /* Each child runs for minutes at a time, and stdio fully buffers stdout
+     * when it is not a console (redirected to a file, piped) -- unbuffered
+     * here means the [chain] lines land as they happen instead of appearing
+     * all at once whenever a buffer happens to fill or the process exits. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    if (!GetModuleFileNameA(NULL, self_path, sizeof self_path)) {
+        printf("[chain] GetModuleFileNameA failed (%lu)\n", GetLastError());
+        return 1;
+    }
+
+    for (;;) {
+        code = run_child(self_path, argc, argv, "desktop");
+        if (code != CHAIN_MISSION_EXIT_CODE) {
+            printf("[chain] desktop exit code %d is not the mission-selected "
+                   "code (%d); treating as quit\n",
+                   code, CHAIN_MISSION_EXIT_CODE);
+            return 0;
+        }
+        run_child(self_path, argc, argv, "fight");
+        printf("[chain] back to desktop\n");
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *exe = NULL;
     const char *assets = NULL;
     DWORD old;
     int i;
+
+    /* Checked before anything else: chain mode doesn't load an image or open
+     * a window itself, it only spawns children that do. */
+    for (i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--chain")) return chain_supervisor(argc, argv);
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--mode") && i + 1 < argc) {

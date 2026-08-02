@@ -26,10 +26,11 @@ port\build\Release\fightport.exe --assets D:\Schleichfahrt\Schleichfahrt\SF
 
 | option | meaning |
 |---|---|
+| `--chain` | play through both halves the way `SF.EXE` originally did: run desktop, and when it exits with the code that means a mission was chosen, run fight; when fight exits, go back to desktop. See below |
 | `--exe FILE` | the LE executable (default `FIGHT.EXE`, resolved after `--assets`) |
-| `--mode fight\|desktop` | which of the game's two DOS/4GW binaries to run. Selects the automatic patch set and the Miles address table, both of which are per-image. Also picks the default `--exe` and the log name |
+| `--mode fight\|desktop` | which of the game's two DOS/4GW binaries to run. Selects the automatic patch set and the Miles address table, both of which are per-image. Also picks the default `--exe`, `--args` and the log name |
 | `--assets DIR` | asset directory; becomes the working directory |
-| `--args "solo"` | PSP command tail. `FIGHT.EXE` refuses to run unless `argv[1]` is `solo` — that is how `SF.EXE` launches it |
+| `--args ARGV1` | PSP command tail. Defaults to `solo` for fight, `cold` for desktop — each image checks `argv[1]` against its own fixed set and refuses to run otherwise |
 | `--patch A=HEX` | overwrite bytes at an original link-time address, e.g. `--patch A8F1B=EB37`; repeatable. Nothing beyond the automatic patches below is needed to run |
 | `--voices N` | sound polyphony, 1–16 (default 16; the game itself asks for 8) |
 | `--watch A` | poll a global at an original address and log every change |
@@ -382,6 +383,38 @@ now takes `ADDR:NDWORDS`. Watching `0x1060E8` alone said "never written";
 watching `0x1060E8:16` showed fields `+0C/+10/+14` being set — turning "never
 initialised" into "initialised but one field left zero", which is what pointed
 at a missing *installed* flag rather than a missing init step.
+
+**Going between the two (`--chain`).** `SF.EXE` — a 15 KB `MZ` launcher —
+originally supervised both binaries, but it is not decompiled or reverse
+engineered for this: tracing `DESKTOP.EXE` shows it never calls `int21h
+AH=4Bh` (EXEC) anywhere. What it does instead is write the player's
+mission/loadout selection to `dat\save\FIGHTIN.DES` (772+24 bytes, observed
+directly) and exit with a specific code, and a plain `FIGHT.EXE --args solo`
+opens that same file at startup regardless of its command line. `FIGHTOUT.DES`
+is the reverse handoff, written by `FIGHT.EXE` for `DESKTOP.EXE` to read back.
+All real state crosses the process boundary through those two files, not
+through anything SF.EXE itself would need to understand or carry.
+
+So the supervisor's own job is small and entirely observable from outside:
+`--chain` runs desktop, and when it exits with the code that means a mission
+was chosen, runs fight; when fight exits, goes back to desktop. Confirmed
+empirically end to end: a fresh desktop run picked up an existing save, wrote
+`FIGHTIN.DES`, and exited with code `2`; `--chain` launched fight on exactly
+that code and it opened the same cockpit view FIGHT.EXE always has; quitting
+fight (`F12`) took it back to a fresh desktop, which was then closed, and
+`--chain` correctly ended the loop on that non-`2` exit rather than looping
+forever. Any desktop exit code other than `2` is treated as the player
+quitting from the menu. FIGHT.EXE's own exit codes have not been catalogued
+yet, so the return trip is unconditional — the one thing asked of this mode
+explicitly — rather than gated on a code nobody has identified.
+
+Each half still runs as its own OS process, exactly as the original two
+binaries did: `fightport.exe`'s state — SDL's window and renderer, the audio
+device, the vectored exception handler, the timer thread — is not designed to
+be torn down and rebuilt for a different image inside one process. `--chain`
+re-invokes itself (`GetModuleFileNameA`) as a child for each half, passing
+through whatever else was on the command line (`--assets`, `--trace`, and so
+on) and setting only `--mode` itself.
 
 **Sound.** The game drives a Sound Blaster through Miles Sound System 3.50F
 and an `AIL3DIG` driver — 16-bit real-mode code that would need an 8086
