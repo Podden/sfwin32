@@ -1170,6 +1170,32 @@ static LONG emu_veh_inner(EXCEPTION_POINTERS *ep)
  * exit paths. */
 static void irq_deliver_pending(CONTEXT *c);   /* defined with the timer code */
 
+/* Milliseconds from QueryPerformanceCounter, not GetTickCount.
+ *
+ * g_fault_tick gates the external interrupt path on "the game has not faulted
+ * for more than a few milliseconds", and GetTickCount cannot measure that: its
+ * resolution is about 15.6 ms, so a 3 ms window is below its granularity
+ * entirely. Measured, the game faults roughly every 6.7 ms, which GetTickCount
+ * reports as a difference of 0 nearly every time -- so the gate only opened on
+ * a system-tick boundary and rejected 86% of attempts (72 injects/s against
+ * 436 blocked/s), holding IRQ0 delivery to ~71 Hz of the 200 Hz the game asked
+ * for. Since the movie's loader is driven by that tick, the whole cutscene ran
+ * at about a third speed and its audio starved. QPC gives real millisecond
+ * resolution, so the window now means what it says. */
+static LONGLONG g_qpc_hz;
+
+static LONG now_ms(void)
+{
+    LARGE_INTEGER c;
+    if (!g_qpc_hz) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_qpc_hz = f.QuadPart ? f.QuadPart : 1;
+    }
+    QueryPerformanceCounter(&c);
+    return (LONG)((c.QuadPart * 1000) / g_qpc_hz);
+}
+
 /* Last time the game took an exception. Drives the choice between in-handler
  * and external interrupt delivery. */
 static volatile LONG g_fault_tick;
@@ -1307,7 +1333,7 @@ static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
          * to hand back, rather than by rewriting a running thread from
          * outside. */
         irq_deliver_pending(c);
-        g_fault_tick = (LONG)GetTickCount();   /* the game is still faulting */
+        g_fault_tick = now_ms();               /* the game is still faulting */
         g_last_ok_eip = c->Eip;
         watch_poll(c);
         /* Once the game is painting straight into the linear framebuffer it
@@ -1612,7 +1638,7 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
         /* If the game has not faulted recently it is inside a loop the
          * in-handler path cannot reach, so go in from outside. */
         if (g_extern_irq && (g_pend_irq0 || g_pend_irq1) &&
-            (LONG)(GetTickCount() - (DWORD)g_fault_tick) > 3)
+            now_ms() - g_fault_tick > 3)
             irq_inject_external();
 
         QueryPerformanceCounter(&now);
