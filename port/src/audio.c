@@ -28,6 +28,7 @@
 #include "port.h"
 #include <SDL.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* ---- AIL entry points (original link-time addresses) -------------------
  *
@@ -139,33 +140,146 @@ static double           g_gain = 1.0;     /* limiter, see mix_cb */
  * range regardless of source width -- 8-bit samples are widened by the shift
  * that always applied here; 16-bit samples are simply signed PCM already in
  * that range, read as little-endian regardless of host alignment. */
-static void fetch_frame(const voice *s, uint32_t idx, int *l, int *r)
+static void fetch_pcm(const uint8_t *data, int fmt, uint32_t idx,
+                       int *l, int *r)
 {
-    switch (s->fmt) {
+    switch (fmt) {
     case 1: {                                    /* 8-bit stereo */
-        const int8_t *p = (const int8_t *)s->data + (size_t)idx * 2;
+        const int8_t *p = (const int8_t *)data + (size_t)idx * 2;
         *l = (int)p[0] << 8; *r = (int)p[1] << 8;
         break;
     }
     case 2: {                                    /* 16-bit mono */
         int16_t v;
-        memcpy(&v, s->data + (size_t)idx * 2, 2);
+        memcpy(&v, data + (size_t)idx * 2, 2);
         *l = *r = v;
         break;
     }
     case 3: {                                    /* 16-bit stereo */
         int16_t lv, rv;
-        const uint8_t *p = s->data + (size_t)idx * 4;
+        const uint8_t *p = data + (size_t)idx * 4;
         memcpy(&lv, p, 2);
         memcpy(&rv, p + 2, 2);
         *l = lv; *r = rv;
         break;
     }
     default:                                      /* 8-bit mono */
-        *l = *r = (int)(int8_t)s->data[idx] << 8;
+        *l = *r = (int)(int8_t)data[idx] << 8;
         break;
     }
 }
+
+/* The streaming path (see g_stream below) reads the same formats out of its
+ * own buffers rather than a voice's, so the decode above is shared. */
+static void fetch_frame(const voice *s, uint32_t idx, int *l, int *r)
+{
+    fetch_pcm(s->data, s->fmt, idx, l, r);
+}
+
+/* ---- Desktop-only: cinematic streaming state ----------------------------
+ *
+ * DESKTOP.EXE's movie soundtrack goes through AIL_load_sample_buffer/
+ * AIL_sample_buffer_ready, not the sample-handle API above. Their own bodies
+ * (orig 0x450C0/0x451B0) turned out to do almost nothing themselves -- both
+ * just forward to internal helpers (0x92F40/0x92EE0) that implement a
+ * classic two-slot double buffer keyed off a producer index the real
+ * low-level driver's hardware-completion interrupt is supposed to advance.
+ * This port never answers that interrupt meaningfully (see video.c's int
+ * 66h handler), so that producer index never moves and the real state
+ * machine gets stuck reporting "not ready" forever after its one-time
+ * initial seed -- confirmed by testing: forcing "always ready" just pinned
+ * playback at a single slot with the same data pointer resubmitted forever.
+ *
+ * The fourth argument is the buffer LENGTH IN BYTES, not a sample rate --
+ * the mistake that cost the most time here, since the one call site pushes
+ * the literal 0xAC44 = 44100, which reads convincingly like a rate. The
+ * disassembly settles it three ways:
+ *
+ *   - 0x92F40 stores that argument into the sample's own len[] array
+ *     (`mov [eax + ebx*4 + 0x14], ecx`, ebx being the slot index), right
+ *     beside where it stores the data pointer into start[] at +0xC and
+ *     zeroes pos[] at +0x1C. That is the documented Miles HSAMPLE layout:
+ *     +4 driver, +8 status (it sets 4 = SMP_PLAYING), +0xC/+0x10 start[2],
+ *     +0x14/+0x18 len[2], +0x1C/+0x20 pos[2], +0x24/+0x28 done[2],
+ *     +0x2C producer index, +0x30 last-reported index.
+ *   - A zero there is the end-of-stream marker, not a rate of zero:
+ *     `test ecx,ecx / sete bl` sets done[slot] from it, and the function
+ *     then skips starting playback entirely.
+ *   - The game allocates each of its two buffers at exactly that size
+ *     (orig 0xC3593/0xC35B2, `mov edx, 0xAC44` into the allocator) and
+ *     stores them at ctx+0x310/+0x314 -- the same pointers it later hands
+ *     back in. A rate argument would not match an allocation size.
+ *
+ * The real rate comes from AIL_set_sample_playback_rate on the same handle
+ * during setup (orig 0xC3621, `push 0x5622` = 22050 Hz), and the format
+ * from AIL_set_sample_type (orig 0xC3619, `push 1 / push 2` = format 2,
+ * 16-bit mono). So each buffer is 44100 bytes / 2 = 22050 frames at
+ * 22050 Hz -- exactly one second of audio, which is what makes the numbers
+ * finally hang together.
+ *
+ * That resolves the earlier cinematic stall. A previous version guessed a
+ * fixed 100 ms chunk and mixed at a hardcoded 44100 Hz, so it consumed one
+ * fifth of each buffer at twice the intended speed and asked for refills
+ * roughly ten times too often -- draining the movie's decoded-audio queue
+ * far faster than the movie produced it, after which the game's own track
+ * pointers went null and it stopped calling in at all. Nothing here is
+ * guessed any more: the length arrives with the buffer, and the rate,
+ * format, volume and pan are read from the HSAMPLE the game configured,
+ * since it is one of the voices handed out by h_allocate_sample_handle
+ * (orig 0xC35F7 allocates it and 0xC3600 stores it at ctx+0x30C -- the same
+ * field the load/ready calls pass back).
+ *
+ * The buffer is copied on arrival rather than played in place, and the queue
+ * that holds those copies is exactly two deep. Both halves of that matter,
+ * and the depth is the part that is easy to get wrong.
+ *
+ * Playing in place is what the real driver does: it DMAs straight out of the
+ * game's own two buffers, which is why the API hands over a pointer and only
+ * reports a slot free once playback of it completes. Copying instead removes
+ * a real hazard -- the game owns those buffers and may rewrite one whenever
+ * it likes -- and lets AIL_sample_buffer_ready answer without touching the
+ * mixer lock, which matters because the game spins on it.
+ *
+ * What copying must NOT do is let the game run ahead. The two-buffer depth is
+ * not an implementation detail of the driver, it is the movie player's
+ * pacing mechanism. Each chunk descriptor carries a presentation timestamp
+ * (entry+0x24), and the read-ahead scheduler at orig 0xC27EA only fetches a
+ * chunk once it is within ctx+0x104 seconds of the clock -- hardcoded to 1 at
+ * orig 0xC3516. A deeper queue lets the game submit buffers as fast as it can
+ * decode them, so its chunk cursor runs past that one-second window, and once
+ * past it the chunk can never be loaded: the fetch fails, and the failure
+ * paths (0xC2774 for the low plane, 0xC293C for the high one) each discard
+ * the other plane's chunk, pushing the cursor further ahead still. It never
+ * recovers.
+ *
+ * That was not theoretical. With an eight-deep queue this fed exactly four
+ * buffers and then went silent for good, every run, while the type-4 cursor
+ * ran to 227 against type-3 stuck at 58 and the loader spun some 700 million
+ * times. At two, the cursor stays inside the window, the scheduler's "too
+ * early" branch is never taken, and playback is continuous.
+ *
+ * Backpressure is therefore the point, not a side effect: while the queue is
+ * full AIL_sample_buffer_ready answers -1, the same "nothing free" the real
+ * function returns when both buffers are busy. */
+#define STREAM_QUEUE 2      /* the game's own buffer count -- see above */
+
+typedef struct {
+    uint8_t *data;      /* our own copy, not the game's buffer */
+    uint32_t cap;       /* bytes allocated                     */
+    uint32_t frames;    /* valid frames in it                  */
+} stream_chunk;
+
+static stream_chunk  g_sq[STREAM_QUEUE];
+static volatile LONG g_sq_count;       /* filled entries; both threads touch it */
+static int           g_sq_read, g_sq_write;
+static double        g_sq_pos;         /* fractional frame position in g_sq_read */
+static int           g_sq_next_slot;   /* which slot index to offer the game next */
+static voice        *g_stream_voice;   /* the HSAMPLE the game streams through   */
+
+/* Diagnostic only: how many stream frames the mixer has actually consumed,
+ * and how many carried real signal rather than near-silence. */
+static uint32_t g_dbg_mixed, g_dbg_nonsilent;
+
 
 /* ------------------------------------------------------------- the mixer */
 
@@ -187,6 +301,10 @@ static void SDLCALL mix_cb(void *ud, Uint8 *stream, int len)
         int lvol, rvol;
 
         if (!s->playing || !s->data || !s->len) continue;
+        /* The streaming HSAMPLE is marked playing (as Miles does) but carries
+         * no set_sample_address buffer of its own -- it is mixed below, from
+         * its own double-buffered slots, not from here. */
+        if (s == g_stream_voice) continue;
 
         step = (double)s->rate / (double)MIX_RATE;
         /* Miles pan: 0 hard left, 64 centre, 127 hard right. */
@@ -215,6 +333,48 @@ static void SDLCALL mix_cb(void *ud, Uint8 *stream, int len)
             g_mixbuf[i * 2 + 0] += (int32_t)((int64_t)sl * lvol / (127 * 127 * 127));
             g_mixbuf[i * 2 + 1] += (int32_t)((int64_t)sr * rvol / (127 * 127 * 127));
             s->pos += step;
+        }
+    }
+
+    /* Cinematic stream: a second, independent source, mixed in on top of the
+     * voice pool, drained from the copy queue. Rate, format, volume and pan
+     * all come from the HSAMPLE the game configured (22050 Hz 16-bit mono in
+     * practice) and each chunk's length arrived with its buffer, so nothing
+     * here is estimated. Running dry is simply silence until the game queues
+     * more -- there is no stale data to replay, since a chunk is dropped the
+     * moment it is finished. */
+    if (g_sq_count > 0 && g_stream_voice) {
+        const voice *sv = g_stream_voice;
+        double step = (double)sv->rate / (double)MIX_RATE;
+        int fmt  = sv->fmt;
+        int lvol = sv->volume * (127 - sv->pan) * g_master;
+        int rvol = sv->volume * sv->pan * g_master;
+
+        for (i = 0; i < frames; i++) {
+            stream_chunk *cur = &g_sq[g_sq_read];
+            uint32_t fi = (uint32_t)g_sq_pos;
+            int sl, sr;
+
+            while (fi >= cur->frames) {          /* finished this chunk */
+                g_sq_pos -= (double)cur->frames;         /* keep phase */
+                g_sq_read = (g_sq_read + 1) % STREAM_QUEUE;
+                if (InterlockedDecrement(&g_sq_count) <= 0) {
+                    LOGT("audio: stream queue empty after %u frames "
+                         "(%u nonsilent)", g_dbg_mixed, g_dbg_nonsilent);
+                    break;
+                }
+                cur = &g_sq[g_sq_read];
+                if (g_sq_pos < 0) g_sq_pos = 0;
+                fi = (uint32_t)g_sq_pos;
+            }
+            if (g_sq_count <= 0) break;
+
+            fetch_pcm(cur->data, fmt, fi, &sl, &sr);
+            g_dbg_mixed++;
+            if (sl > 256 || sl < -256) g_dbg_nonsilent++;
+            g_mixbuf[i * 2 + 0] += (int32_t)((int64_t)sl * lvol / (127 * 127 * 127));
+            g_mixbuf[i * 2 + 1] += (int32_t)((int64_t)sr * rvol / (127 * 127 * 127));
+            g_sq_pos += step;
         }
     }
 
@@ -284,6 +444,14 @@ static voice *as_voice(void *h)
 static int32_t __cdecl h_install_DIG_INI(void **dig)
 {
     if (dig) *dig = &g_driver_token;
+    /* Fresh cinematic-audio session: drop anything still queued from a
+     * previous movie. The chunk allocations themselves are kept and reused --
+     * they are the right size already. */
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    g_sq_count = 0;
+    g_sq_read = g_sq_write = g_sq_next_slot = 0;
+    g_sq_pos = 0;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
     LOGI("audio: AIL_install_DIG_INI -> emulated driver");
     return 0;                       /* 0 = success; the caller tests for it */
 }
@@ -541,6 +709,10 @@ static int32_t __cdecl h_sample_status(void *h)
 #define VOICE_POOL_FN  0x00023DE0u
 #define VOICE_MAX      MAX_VOICES
 
+/* Desktop-only streaming entry points -- see the hooks below for why. */
+#define AIL_LOAD_SAMPLE_BUFFER_DESKTOP  0x000450C0u
+#define AIL_SAMPLE_BUFFER_READY_DESKTOP 0x000451B0u
+
 static int32_t  g_want_voices = VOICE_MAX;
 static uint32_t g_pool_resume;          /* VOICE_POOL_FN + 5, rebased */
 
@@ -565,6 +737,117 @@ void audio_set_voice_count(int n)
     if (n < 1) n = 1;
     if (n > VOICE_MAX) n = VOICE_MAX;
     g_want_voices = n;
+}
+
+/* ---- Desktop-only: streaming digital audio for cinematics ---------------
+ *
+ * DESKTOP.EXE's cutscenes call these two directly -- not FIGHT.EXE, which
+ * has no cutscenes and never calls either (absent from its own AIL_ symbol
+ * scan), so unlike the 16 above these are hooked only in desktop mode.
+ *
+ * Neither name turned up in any public Miles documentation (checked before
+ * writing this): they are private, internal entry points, not part of the
+ * documented game-developer API. Their own bodies (orig 0x450C0/0x451B0)
+ * are almost entirely a debug-logging gate; the real logic lives one level
+ * down (0x92F40/0x92EE0), implementing a two-slot double buffer whose
+ * "ready" signal is meant to come from the real low-level driver's
+ * hardware-completion interrupt on `int 66h` -- which this port cannot
+ * usefully answer, so that producer index never advances and the real state
+ * machine sticks at "not ready" forever after its one-time initial seed
+ * (confirmed: forcing the real function's own "ready" path to always fire
+ * pinned playback at one slot, same data pointer, forever). See the
+ * g_stream comment above mix_cb for the full writeup and the from-scratch
+ * replacement implemented here.
+ *
+ * Recovered from the one call site in game code (orig 0xC26DC), cdecl,
+ * right-to-left: AIL_load_sample_buffer(handle, buffer_index, data, len).
+ * buffer_index alternates 0/1 and len is a byte count (0xAC44 = 44100 at
+ * that site, which is one second of the 22050 Hz 16-bit mono stream the
+ * setup code configures) -- see the g_stream comment above mix_cb for the
+ * evidence that this argument is a length and not the sample rate it looks
+ * like. A len of zero is Miles' end-of-stream marker, not a zero-length
+ * buffer. */
+static void __cdecl h_load_sample_buffer(void *handle, int32_t idx,
+                                          const void *data, int32_t len)
+{
+    voice   *sv = as_voice(handle);
+    uint32_t need, frames;
+    (void)idx;               /* the slot is the game's bookkeeping, not ours */
+
+    if (sv) g_stream_voice = sv;
+
+    if (len <= 0) {           /* Miles' end-of-stream marker */
+        LOGI("audio: load_sample_buffer -- end of stream");
+        return;
+    }
+
+    /* Streaming auto-starts the sample -- there is no AIL_start_sample call
+     * for it anywhere in the movie code. The original does this itself at
+     * orig 0x92F8F (`mov dword ptr [eax+8], 4`, status = SMP_PLAYING), so
+     * anything asking AIL_sample_status about this handle sees a playing
+     * sample rather than the SMP_DONE a never-started voice would report. */
+    if (sv) sv->playing = 1;
+
+    need   = (uint32_t)len;
+    frames = need / (uint32_t)fmt_frame_bytes(sv ? sv->fmt
+                                              : (g_stream_voice ? g_stream_voice->fmt : 2));
+
+    if (g_sq_count >= STREAM_QUEUE) {          /* ready() should have said -1 */
+        LOGW("audio: stream queue full, dropping a buffer");
+        return;
+    }
+
+    {   /* Grow this entry's copy only when a longer chunk turns up; in
+         * practice every chunk is the same 44100 bytes, so this allocates
+         * once per entry for the whole cutscene. */
+        stream_chunk *e = &g_sq[g_sq_write];
+        if (e->cap < need) {
+            uint8_t *p = (uint8_t *)realloc(e->data, need);
+            if (!p) { LOGE("audio: stream chunk alloc (%u bytes) failed", need);
+                      return; }
+            e->data = p;
+            e->cap  = need;
+        }
+        memcpy(e->data, data, need);
+        e->frames = frames;
+    }
+
+    /* Publish only after the copy is complete: the mixer reads the count
+     * without the lock, so the entry must be whole before it is visible. */
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    g_sq_write = (g_sq_write + 1) % STREAM_QUEUE;
+    InterlockedIncrement(&g_sq_count);
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+
+    LOGT("audio: queued %u frames (len=%d), queue depth %ld/%d",
+         frames, len, g_sq_count, STREAM_QUEUE);
+}
+
+/* Deliberately lock-free, and that is not a micro-optimisation.
+ *
+ * The game spins on this between movie frames -- over 22 million calls in one
+ * 35-second run -- so anything done here is done tens of millions of times a
+ * second. An earlier version took SDL_LockAudioDevice on every call, a mutex
+ * round-trip contending with the audio callback thread, which burned the CPU
+ * the movie decode needed. The original is a two-integer read (orig 0x92EE0:
+ * producer index at +0x2C against consumer index at +0x30) and takes no lock
+ * at all, so neither does this: one volatile read of the queue depth.
+ *
+ * Which slot index is handed back does not matter to us any more, since the
+ * buffer is copied out on arrival and the game's two buffers are never read
+ * after that -- but alternating keeps the game's own bookkeeping looking
+ * exactly as it would with a real driver. */
+static int32_t __cdecl h_sample_buffer_ready(void *handle)
+{
+    int32_t slot;
+    (void)handle;
+
+    /* Full queue is the real function's "both buffers busy" answer. */
+    if (g_sq_count >= STREAM_QUEUE) return -1;
+
+    slot = g_sq_next_slot;
+    g_sq_next_slot ^= 1;
+    return slot;
 }
 
 /* ------------------------------------------------------------- hooking */
@@ -655,6 +938,11 @@ void audio_install_hooks(void)
         hook(VOICE_POOL_FN, voice_pool_thunk, "voice pool setup");
         LOGI("audio: voice pool raised to %d (game asks for %s)",
              g_want_voices, "NumOfVoices from CONFIG.DES");
+    } else {
+        hook(AIL_LOAD_SAMPLE_BUFFER_DESKTOP, h_load_sample_buffer,
+             "AIL_load_sample_buffer");
+        hook(AIL_SAMPLE_BUFFER_READY_DESKTOP, h_sample_buffer_ready,
+             "AIL_sample_buffer_ready");
     }
 }
 
