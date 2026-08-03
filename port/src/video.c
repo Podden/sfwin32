@@ -313,6 +313,19 @@ static void render_frame(void)
             LOGI("dumped %dx%d %dbpp pitch=%d framebuffer to vram.bin",
                  g_vid_w, g_vid_h, g_vid_bpp, g_vid_pitch);
         }
+        /* The palette and the converted output go with it: raw pixels alone
+         * cannot distinguish "the game drew the wrong thing" from "we
+         * converted the right thing wrongly", and in a paletted mode the
+         * palette is half the picture. */
+        if ((f = fopen("pal.bin", "wb")) != NULL) {
+            fwrite(g_pal, 4, 256, f);
+            fclose(f);
+        }
+        if ((f = fopen("conv.bin", "wb")) != NULL) {
+            fwrite(g_conv, 4, (size_t)g_vid_w * g_vid_h, f);
+            fclose(f);
+            LOGI("dumped palette to pal.bin and converted output to conv.bin");
+        }
     }
 
     SDL_UpdateTexture(g_tex, NULL, g_conv, g_vid_w * 4);

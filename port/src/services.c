@@ -91,6 +91,23 @@ static int ok16(CONTEXT *c, uint16_t v)
     return 1;
 }
 
+/* Read and write return a byte count, and under a 32-bit extender that count
+ * is EAX, not AX: DOS/4GW lets a single call move far more than 64 KB and the
+ * game does exactly that. Returning it through ok16 truncated the result --
+ * a 0x10000-byte read reported zero, which reads as end-of-file.
+ *
+ * On its own this changes nothing visible, and it was briefly dismissed on
+ * that evidence. It is the second half of the lseek fix below: once the game
+ * could size a file correctly it asked for the whole 285696-byte remainder of
+ * title.pcx in one call, and ok16 would have answered 23552 -- the same wrong
+ * number, arrived at a different way. Neither fix works without the other. */
+static int ok32(CONTEXT *c, uint32_t v)
+{
+    c->Eax = v;
+    set_cf(c, 0);
+    return 1;
+}
+
 /* Interrupt vector table the game installs handlers into. */
 static uint32_t g_ivec[256];
 
@@ -215,7 +232,7 @@ int dos_int21(CONTEXT *c)
             LOGW("ReadFile on handle %u failed: %lu", fd, GetLastError());
             return fail(c, 5);
         }
-        return ok16(c, (uint16_t)n);
+        return ok32(c, (uint32_t)n);
     }
 
     case 0x40: {    /* write */
@@ -230,7 +247,7 @@ int dos_int21(CONTEXT *c)
         mem_ensure_committed((void *)(uintptr_t)c->Edx, c->Ecx);
         if (!WriteFile(g_fh[fd], (void *)(uintptr_t)c->Edx, c->Ecx, &n, NULL))
             return fail(c, 5);
-        return ok16(c, (uint16_t)n);
+        return ok32(c, (uint32_t)n);
     }
 
     case 0x41:      /* unlink */
@@ -240,14 +257,25 @@ int dos_int21(CONTEXT *c)
         uint16_t fd = (uint16_t)(c->Ebx & 0xFFFF);
         LONG hi = 0;
         DWORD pos;
+        /* The offset arrives as CX:DX, high word in CX -- not as a flat EDX.
+         * Seeks inside the first 64 KB of a file work either way, which is
+         * why this went unnoticed. */
+        LONG off = (LONG)(((c->Ecx & 0xFFFFu) << 16) | (c->Edx & 0xFFFFu));
         DWORD method = (c->Eax & 0xFF) == 1 ? FILE_CURRENT
                      : (c->Eax & 0xFF) == 2 ? FILE_END : FILE_BEGIN;
         if (fd >= MAX_FH || !g_fh[fd]) return fail(c, 6);
-        pos = SetFilePointer(g_fh[fd], (LONG)c->Edx, &hi, method);
+        pos = SetFilePointer(g_fh[fd], off, &hi, method);
         if (pos == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR)
             return fail(c, 5);
-        c->Eax = pos;
-        c->Edx = (uint32_t)hi;
+        /* And the result goes back the same way: DX:AX, high word in DX.
+         * Returning the flat value in EAX with EDX left as the 64-bit high
+         * half (always 0 here) meant a caller assembling DX:AX saw only the
+         * low 16 bits. Seeking to the end to size a file therefore reported
+         * 290231 as 28087, and the desktop's 290 KB title.pcx backdrop was
+         * read to 28 KB and decoded to a band across the top of the screen
+         * over a flat fill. */
+        c->Eax = (c->Eax & 0xFFFF0000u) | (pos & 0xFFFFu);
+        c->Edx = (c->Edx & 0xFFFF0000u) | ((pos >> 16) & 0xFFFFu);
         set_cf(c, 0);
         return 1;
     }
