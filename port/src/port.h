@@ -169,6 +169,12 @@ void audio_shutdown(void);
  * raises the request. 16 is the most its own per-voice arrays can hold. */
 void audio_set_voice_count(int n);
 
+/* --calltrace: detour-log every call into every identified Miles entry point
+ * (not just the 16 audio.c replaces) to calltrace.csv, without altering
+ * behaviour. Install after the image is relocated; dump at either exit path. */
+void calltrace_install(void);
+void calltrace_dump(void);
+
 /* ------------------------------------------------------------------- host */
 
 uint32_t dos_get_ivec(int vec);

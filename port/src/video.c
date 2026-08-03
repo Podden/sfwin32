@@ -146,6 +146,7 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
         if (g_quit) {
             LOGI("window closed; shutting down");
             todo_dump();
+            calltrace_dump();
             log_shutdown();
             ExitProcess(0);
         }

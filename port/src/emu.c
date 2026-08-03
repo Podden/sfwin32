@@ -1733,6 +1733,7 @@ void emu_request_exit(int code)
     g_exit_code = code;
     LOGI("game requested exit with code %d", code);
     todo_dump();
+    calltrace_dump();
     log_shutdown();
     video_shutdown();
     ExitProcess((UINT)code);

@@ -35,7 +35,7 @@ static void usage(const char *argv0)
 {
     printf("usage: %s [--chain] [--mode fight|desktop] [--exe IMAGE]\n"
            "          [--assets DIR] [--args ARGV1] [--patch ADDR=HEXBYTES]\n"
-           "          [--watch ADDR] [--dumpkeys] [--trace]\n"
+           "          [--watch ADDR] [--dumpkeys] [--calltrace] [--trace]\n"
            "\n"
            "  --chain  play through both halves the way SF.EXE originally\n"
            "           did: run desktop, and when it exits with the code\n"
@@ -47,6 +47,11 @@ static void usage(const char *argv0)
            "           fight = the combat module (default, FIGHT.EXE),\n"
            "           desktop = the station (DESKTOP.EXE). Selects the\n"
            "           automatic patch set, which is per-image.\n"
+           "\n"
+           "  --calltrace  log every call into every identified Miles AIL_*\n"
+           "           entry point (not just the 16 audio.c replaces) to\n"
+           "           calltrace.csv, without changing behaviour. For\n"
+           "           finding which Miles function a given code path uses.\n"
            "\n"
            "  --args   the command tail passed through the PSP. Defaults to\n"
            "           \"solo\" for fight, \"cold\" for desktop -- each\n"
@@ -354,6 +359,7 @@ int main(int argc, char **argv)
 {
     const char *exe = NULL;
     const char *assets = NULL;
+    int want_calltrace = 0;
     DWORD old;
     int i;
 
@@ -389,6 +395,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dumpvram") && i + 1 < argc)
             g_dumpvram_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dumpkeys")) g_dump_keys = 1;
+        else if (!strcmp(argv[i], "--calltrace")) want_calltrace = 1;
         else if (!strcmp(argv[i], "--no-extern-irq")) g_extern_irq = 0;
         else if (!strcmp(argv[i], "--trace"))  g_log_level = LOG_TRACE;
         else { usage(argv[0]); return 2; }
@@ -441,6 +448,11 @@ int main(int argc, char **argv)
     g_desktop_mode = (g_mode == MODE_DESKTOP);
     g_pit_divisor_addr = g_desktop_mode ? GAME_PIT_DIVISOR_ADDR_DESKTOP
                                         : GAME_PIT_DIVISOR_ADDR_FIGHT;
+
+    /* Ahead of audio_install_hooks() on purpose: for the 16 functions both
+     * touch, audio's real replacement should win over calltrace's
+     * logging-only detour, which only needs to run second to overwrite it. */
+    if (want_calltrace) calltrace_install();
 
     /* Replaces the Miles driver stack with our own mixer. Must come after
      * relocation, since the hooks are written into the loaded image. */
