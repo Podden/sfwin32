@@ -22,6 +22,7 @@ add_executable(fightport
   src/audio.c
   src/mouse.c
   src/calltrace.c
+  src/cblit.c
 )
 
 target_include_directories(fightport PRIVATE src "${SDL2_ROOT}/include")

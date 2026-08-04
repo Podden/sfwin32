@@ -395,6 +395,28 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dumpvram") && i + 1 < argc)
             g_dumpvram_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dumpkeys")) g_dump_keys = 1;
+        else if (!strcmp(argv[i], "--autokeys") && i + 1 < argc)
+            g_autokeys = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cblit") && i + 1 < argc)
+            g_cblit = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cflush") && i + 1 < argc)
+            g_cflush = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--csurf") && i + 1 < argc)
+            g_csurf = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cdraw") && i + 1 < argc)
+            g_cdraw = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cdrawscan")) g_cdrawscan = 1;
+        else if (!strcmp(argv[i], "--srcwatch")) g_srcwatch = 1;
+        else if (!strcmp(argv[i], "--rasterscan")) g_rasterscan = 1;
+        else if (!strcmp(argv[i], "--craster") && i + 1 < argc)
+            g_craster = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fbwatch") && i + 1 < argc)
+            g_fbwatch = (int)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--listwatch") && i + 1 < argc) {
+            extern void *g_listwatch_page;
+            g_listwatch_page = (void *)(uintptr_t)
+                (strtoul(argv[++i], NULL, 16) & ~0xFFFu);
+        }
         else if (!strcmp(argv[i], "--calltrace")) want_calltrace = 1;
         else if (!strcmp(argv[i], "--no-extern-irq")) g_extern_irq = 0;
         else if (!strcmp(argv[i], "--trace"))  g_log_level = LOG_TRACE;
@@ -453,6 +475,7 @@ int main(int argc, char **argv)
      * touch, audio's real replacement should win over calltrace's
      * logging-only detour, which only needs to run second to overwrite it. */
     if (want_calltrace) calltrace_install();
+    cblit_install();
 
     /* Replaces the Miles driver stack with our own mixer. Must come after
      * relocation, since the hooks are written into the loaded image. */

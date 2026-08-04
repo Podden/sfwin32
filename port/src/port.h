@@ -69,6 +69,11 @@ extern int      g_watch_dwords;   /* --watch ADDR:N -- watch a whole struct */
 /* --dumpkeys: periodically log which scancodes the game believes are held. */
 extern int g_dump_keys;
 
+/* --fbwatch OFF: guard-page one page of the framebuffer and log which
+ * game instruction writes it. Finds the owner of a stride that static
+ * reading cannot locate because the value is computed. */
+extern int g_fbwatch;
+
 /* --no-extern-irq: deliver interrupts only from inside the fault handler,
  * never via SuspendThread/SetThreadContext. */
 extern int g_extern_irq;
@@ -135,6 +140,10 @@ int  vbe_dispatch(CONTEXT *c);
 
 /* --pixfmt 555: interpret a 16bpp framebuffer as 5:5:5 instead of 5:6:5. */
 extern int g_pixfmt_555;
+
+/* --autokeys N: synthesise a keypress every N ms so runs need no operator.
+ * Zero (the default) leaves input entirely to the user. */
+extern int g_autokeys;
 extern int g_dumpvram_frames;
 
 /* DPMI "map physical address to linear" lands here. Returns NULL if the
@@ -172,6 +181,21 @@ void audio_set_voice_count(int n);
 /* --calltrace: detour-log every call into every identified Miles entry point
  * (not just the 16 audio.c replaces) to calltrace.csv, without altering
  * behaviour. Install after the image is relocated; dump at either exit path. */
+/* --cblit N: replace FIGHT's span blitter (orig 0x394EB) with the C
+ * version in cblit.c. 1 = faithful, 2 = also recompute destinations from
+ * the real screen pitch, 3 = faithful plus byte-for-byte verification
+ * against the original on every call. */
+extern int g_cblit;
+extern int g_cflush;
+extern int g_csurf;
+extern int g_cdraw;
+extern int g_cdrawscan;
+extern int g_srcwatch;
+extern int g_rasterscan;
+extern int g_craster;
+void cdrawscan_report(void);
+void cblit_install(void);
+
 void calltrace_install(void);
 void calltrace_dump(void);
 

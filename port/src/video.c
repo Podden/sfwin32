@@ -71,6 +71,7 @@ static const vbe_mode *find_mode(uint16_t m)
  * thread: it owns the window, renderer and event queue, while the game thread
  * only ever writes pixels into g_vram. */
 int g_pixfmt_555;
+int g_autokeys;                             /* --autokeys N: ms between synthetic keys */
 int g_dumpvram_frames;                      /* --pixfmt 555: read 16bpp as 5:5:5 */
 
 static HANDLE        g_vid_thread;
@@ -147,6 +148,7 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
             LOGI("window closed; shutting down");
             todo_dump();
             calltrace_dump();
+            cdrawscan_report();
             log_shutdown();
             ExitProcess(0);
         }
@@ -157,6 +159,29 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                                       g_vid_w, g_vid_h);
             SDL_RenderSetLogicalSize(g_ren, g_vid_w, g_vid_h);
             SDL_SetWindowSize(g_win, g_vid_w * 2, g_vid_h * 2);
+        }
+        /* --autokeys N: press something every N milliseconds so a run can be
+         * driven unattended. The desktop sits on its main menu until a key
+         * arrives, and fight waits at its briefing, so an automated run
+         * otherwise only ever exercises one screen. RETURN advances menus and
+         * dismisses briefings, which is enough to walk into the game; SPACE
+         * alternates with it because some screens take one and not the other.
+         *
+         * Sent as a make/break pair: the game's int 9 handler tracks key
+         * state, and a make with no break leaves the key stuck down. */
+        if (g_autokeys > 0) {
+            static Uint32 t_key;
+            Uint32 now = SDL_GetTicks();
+            if (!t_key) t_key = now;
+            if (now - t_key >= (Uint32)g_autokeys) {
+                static int alt;
+                uint8_t sc = alt ? 0x39 : 0x1C;    /* SPACE : RETURN */
+                alt = !alt;
+                kbd_push_scancode(sc);
+                kbd_push_scancode((uint8_t)(sc | 0x80));
+                LOGI("autokeys: pressed scancode 0x%02X", sc);
+                t_key = now;
+            }
         }
         render_frame();
         SDL_Delay(16);

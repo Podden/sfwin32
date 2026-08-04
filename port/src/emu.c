@@ -1253,9 +1253,156 @@ static void watch_poll(CONTEXT *c)
  * because the SDL and timer threads run through here too. */
 static __declspec(thread) int g_veh_depth;
 
+/* ---- --fbwatch: who writes the framebuffer, and with what stride? -------
+ *
+ * The 2D blit library reads the real pitch, but at 800x600 the 3D viewport
+ * lands at a 640-pixel stride, so the renderer carries its own idea of the
+ * row length. Static reading did not find it: there is no hardcoded 640 or
+ * 1280 anywhere on those paths, so the value is computed.
+ *
+ * So catch it in the act. A guard page is armed inside the viewport region of
+ * g_vram; the first access faults here and the faulting EIP is the
+ * instruction writing framebuffer rows. Windows clears the guard bit when it
+ * fires, so the access then completes normally and the timer thread re-arms
+ * -- sampling rather than tracing, which is enough to name the routine and
+ * watch the addresses it touches.
+ *
+ * Our own SDL thread reads the whole buffer every frame and trips this too,
+ * so faults from outside the loaded image are passed over without logging. */
+int                  g_fbwatch = -1;     /* byte offset into g_vram, -1 = off */
+static volatile LONG g_fbwatch_armed;
+static void         *g_fbwatch_page;
+
+/* Second stage: once the span list has been located, guard *it* to catch
+ * whoever builds it -- that is where the row stride is computed. The blitter
+ * reads the same memory, so its own accesses are filtered out by EIP. */
+void                *g_listwatch_page;   /* --listwatch: pre-arm before the
+                                          * list is built, since it is built
+                                          * once at init and never again */
+static volatile LONG g_listwatch_armed;
+
+void fbwatch_rearm(void)
+{
+    DWORD old;
+    if ((g_fbwatch < 0 && !g_listwatch_page) || !g_vram) return;
+
+    /* Read-only, not a guard page: see fbwatch_hit. Reads pass through, so
+     * only writers fault and the blitter's constant reading cannot starve the
+     * arm. */
+    if (g_listwatch_page &&
+        InterlockedCompareExchange(&g_listwatch_armed, 1, 0) == 0) {
+        if (!VirtualProtect(g_listwatch_page, 0x1000, PAGE_READONLY, &old))
+            InterlockedExchange(&g_listwatch_armed, 0);
+    }
+
+    if (InterlockedCompareExchange(&g_fbwatch_armed, 1, 0) != 0) return;
+    g_fbwatch_page = (void *)((uintptr_t)(g_vram + g_fbwatch) & ~(uintptr_t)0xFFF);
+    if (!VirtualProtect(g_fbwatch_page, 0x1000,
+                        PAGE_READWRITE | PAGE_GUARD, &old))
+        InterlockedExchange(&g_fbwatch_armed, 0);
+}
+
+static int fbwatch_hit(EXCEPTION_POINTERS *ep)
+{
+    static uint32_t n;
+    uintptr_t addr, lo, hi;
+    uint32_t eip;
+
+    if (g_fbwatch < 0 && !g_listwatch_page) return 0;
+    if (ep->ExceptionRecord->NumberParameters < 2) return 0;
+
+    /* A write to a page mapped read-only arrives as an access violation, not
+     * a guard violation. Read-only is used instead of a guard page when the
+     * question is "who *writes* this", because a guard fires on reads too and
+     * the blitter reads these buffers continuously -- it would consume every
+     * arm before a writer could trip one. */
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        g_listwatch_page &&
+        ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t wa = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        if ((wa & ~(uintptr_t)0xFFF) == (uintptr_t)g_listwatch_page) {
+            static uint32_t wn;
+            DWORD old;
+            uint32_t weip = (uint32_t)ep->ContextRecord->Eip;
+            uintptr_t wlo = (uintptr_t)g_img.mem;
+            uintptr_t whi = wlo + g_img.obj1_size;
+            VirtualProtect(g_listwatch_page, 0x1000, PAGE_READWRITE, &old);
+            InterlockedExchange(&g_listwatch_armed, 0);
+            if (weip >= wlo && weip < whi && ++wn <= 80)
+                LOGI("memwrite: %08X written by orig 0x%08X",
+                     (uint32_t)wa, weip - g_img.delta);
+            return 1;
+        }
+    }
+
+    if (ep->ExceptionRecord->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION)
+        return 0;
+
+    addr = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+    eip  = (uint32_t)ep->ContextRecord->Eip;
+    lo   = (uintptr_t)g_img.mem;
+    hi   = lo + g_img.obj1_size;
+
+    /* Span-list page: report only writers that are not the blitter itself,
+     * which reads this memory constantly. */
+    if (g_listwatch_page &&
+        (addr & ~(uintptr_t)0xFFF) == (uintptr_t)g_listwatch_page) {
+        static uint32_t ln;
+        uint32_t o = eip - g_img.delta;
+        InterlockedExchange(&g_listwatch_armed, 0);
+        if (eip >= lo && eip < hi && !(o >= 0x394EB && o <= 0x39543) &&
+            ++ln <= 60)
+            LOGI("spanlist: %08X touched by orig 0x%08X", (uint32_t)addr, o);
+        return 1;
+    }
+
+    InterlockedExchange(&g_fbwatch_armed, 0);   /* Windows cleared the bit */
+    if (eip >= lo && eip < hi && ++n <= 400) {
+        /* The writer turned out to be a `rep movsd`, so the live registers
+         * are the span itself: ESI source, EDI destination, ECX dwords left.
+         * Pairs of samples give the ratio of destination stride to source
+         * stride, which is the number actually wanted. */
+        CONTEXT *c = ep->ContextRecord;
+        LOGI("fbwatch: +0x%06X by orig 0x%08X  esi=%08X edi=%08X ecx=%u",
+             (uint32_t)(addr - (uintptr_t)g_vram), eip - g_img.delta,
+             (uint32_t)c->Esi, (uint32_t)c->Edi, (unsigned)c->Ecx);
+        /* The blitter advances EAX past the record only after the copy, so at
+         * the fault EAX still points at the span being drawn. Walking a few
+         * records forward gives the destination addresses directly, and the
+         * difference between consecutive ones is the row stride that no
+         * static search could find. Records are 20 bytes:
+         * +0 src, +4 dst, +8 alt-dst, +0xC count, +0xE count2; a count word
+         * of 0x8000 terminates the list. */
+        static int dumped;
+        if (!dumped && (eip - g_img.delta) == 0x00039521) {
+            const uint8_t *rec = (const uint8_t *)(uintptr_t)c->Eax;
+            dumped = 1;
+            /* Hand the list's page to the second stage above. */
+            g_listwatch_page = (void *)((uintptr_t)c->Eax & ~(uintptr_t)0xFFF);
+            LOGI("spanlist lives at %08X (page %p)", (uint32_t)c->Eax,
+                 g_listwatch_page);
+            int k;
+            for (k = 0; k < 10; k++, rec += 0x14) {
+                uint32_t src, dst; int16_t cnt;
+                if (IsBadReadPtr(rec, 0x14)) break;
+                memcpy(&src, rec + 0, 4);
+                memcpy(&dst, rec + 4, 4);
+                memcpy(&cnt, rec + 0xC, 2);
+                if ((uint16_t)cnt == 0x8000) { LOGI("  span[%d] end", k); break; }
+                LOGI("  span[%2d] src=%08X dst=%08X (fb+0x%06X) cnt=%d", k,
+                     src, dst, (uint32_t)(dst - (uint32_t)(uintptr_t)g_vram),
+                     (int)cnt);
+            }
+        }
+    }
+    return 1;
+}
+
 static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
 {
     LONG r;
+
+    if (fbwatch_hit(ep)) return EXCEPTION_CONTINUE_EXECUTION;
 
     /* Clear the trap flag for *this handler's own* execution.
      *
@@ -1628,6 +1775,7 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
         LONGLONG period;
 
         Sleep(1);
+        fbwatch_rearm();          /* --fbwatch only; no-op otherwise */
 
         /* Keyboard is raised on every pass, not just on a timer deadline, so
          * input latency is the ~1 ms sleep rather than one PIT period. Both
