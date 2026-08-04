@@ -406,8 +406,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cdraw") && i + 1 < argc)
             g_cdraw = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cdrawscan")) g_cdrawscan = 1;
+        else if (!strcmp(argv[i], "--ctex") && i + 1 < argc)
+            g_ctex = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--srcwatch")) g_srcwatch = 1;
         else if (!strcmp(argv[i], "--rasterscan")) g_rasterscan = 1;
+        else if (!strcmp(argv[i], "--spanprobe")) g_spanprobe = 1;
         else if (!strcmp(argv[i], "--craster") && i + 1 < argc)
             g_craster = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fbwatch") && i + 1 < argc)

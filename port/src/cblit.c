@@ -39,6 +39,7 @@
 #include "port.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #define BLIT_FIGHT   0x000394EBu
 /* The next level up: walks the same list, switching the VBE bank window
@@ -1048,6 +1049,356 @@ static __declspec(naked) void craster_thunk(void)
     }
 }
 
+/* --spanprobe: read the texture mapper's inner-loop state from the running
+ * game instead of inferring it.
+ *
+ * The unrolled body at orig 0x18020 is entered with every value it needs
+ * already in registers, and its texture base, palette base, shade step and
+ * end pointer patched into the instruction stream. Reading the disassembly
+ * left a genuine ambiguity -- `mov ax, [edx*2+PAL]` writes the fetched colour
+ * into the low half of EAX, which the next `add eax, ebx` then accumulates,
+ * so either EAX is not the u accumulator or its low half is deliberately
+ * scratch. One frame of real values settles it. */
+#define SPAN_FIGHT 0x00018020u
+#define SPAN_LEN   6
+
+int g_spanprobe;
+
+static uint32_t rd32a(uint32_t orig) { return rd32((const uint8_t *)gp(orig)); }
+
+/* A jump detour cannot be used here. orig 0x18289 patches the live texture
+ * base into 0x18022, which falls inside a five-byte JMP's rel32 field at
+ * 0x18020 -- the game overwrites the jump target itself, and control lands
+ * somewhere arbitrary. Moving the hook earlier is no good either, because
+ * 0x18020 is the loop-back target of `jne` at 0x180A8.
+ *
+ * A breakpoint touches one byte. 0x18020 is an opcode the game never patches
+ * (it patches displacements at +2 and beyond), so INT3 there is safe where a
+ * JMP is not. This is the general answer for hooking self-modifying code. */
+static uint8_t g_span_orig_byte;
+static int g_bp_stray;
+
+int cblit_bp_hit(EXCEPTION_POINTERS *ep)
+{
+    static int n;
+    CONTEXT *c;
+    uint32_t eip;
+
+    if (!g_spanprobe) return 0;
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) return 0;
+    c = ep->ContextRecord;
+    /* Windows reports Eip pointing at the 0xCC, having already backed it up
+     * past the trap; accept the raw and advanced forms so this does not depend
+     * on that detail. */
+    eip = (uint32_t)(uintptr_t)gp(SPAN_FIGHT);
+    if ((uint32_t)c->Eip != eip && (uint32_t)c->Eip != eip + 1) return 0;
+
+    /* One kernel round-trip per span is orders of magnitude slower than the
+     * loop it traps, and this game is timing-sensitive -- left armed, it ends
+     * up executing a pointer table at orig 0xA8ED1. Six entry snapshots are
+     * all the register contract requires, so disarm after that and let the
+     * original run at full speed. */
+    if (n >= 6) {
+        *(uint8_t *)gp(SPAN_FIGHT) = g_span_orig_byte;
+        LOGI("spanprobe: %d samples taken; trap removed", n);
+        return 1;                    /* re-execute the restored instruction */
+    }
+    if (n++ < 6) {
+        LOGI("span#%d eax=%08X ebx=%08X ecx=%08X edx=%08X ebp=%08X esi=%08X "
+             "edi=%08X", n, (uint32_t)c->Eax, (uint32_t)c->Ebx,
+             (uint32_t)c->Ecx, (uint32_t)c->Edx, (uint32_t)c->Ebp,
+             (uint32_t)c->Esi, (uint32_t)c->Edi);
+        LOGI("      TEX=%08X PAL=%08X step=%02X end=%08X count=%u",
+             rd32a(0x18022), rd32a(0x1802E),
+             *(const uint8_t *)gp(0x1803B), rd32a(0x180A4),
+             *(const uint32_t *)(uintptr_t)((uint32_t)c->Esp + 0x68));
+    }
+
+    /* Emulate the displaced fetch against the *live* displacement, then
+     * resume after it. */
+    {
+        int32_t  disp  = (int32_t)rd32a(0x18022);
+        uint8_t  texel = *(const uint8_t *)(uintptr_t)
+                             ((uint32_t)c->Ecx + (uint32_t)disp);
+        c->Edx = (c->Edx & 0xFFFFFF00u) | texel;
+    }
+    c->Eip = (DWORD)(uintptr_t)gp(SPAN_FIGHT + SPAN_LEN);
+    return 1;
+}
+
+static void spanprobe_install(void)
+{
+    uint8_t *p = (uint8_t *)gp(SPAN_FIGHT);
+    g_span_orig_byte = p[0];
+    p[0] = 0xCC;
+    LOGI("spanprobe: INT3 at orig 0x%08X (one byte; 0x%08X stays patchable)",
+         SPAN_FIGHT, SPAN_FIGHT + 2);
+}
+
+/* The opaque affine texture mapper's inner span loop, reimplemented in C.
+ *
+ * orig 0x17DF0 draws one textured span per call: a shared FPU routine at
+ * 0x18322 computes the interpolants, and the integer loop from 0x18002 to
+ * 0x1813E walks the pixels. Only the integer half is ported here. The FPU
+ * half is 300 instructions sharing thirteen slots of 0x17DF0's frame and
+ * ends in fistp, so a last-ulp difference between x87 80-bit intermediates
+ * and MSVC's 64-bit long double would flip texel coordinates outright -- it
+ * is left running as the original, which also keeps the two halves' contract
+ * exactly as the game defines it.
+ *
+ * The register contract was measured, not inferred (see --spanprobe):
+ *
+ *     edi        destination, 16 bits per pixel, contiguous
+ *     ecx        0x0000<v><u>, byte each, into a 256-wide texture
+ *     eax:ebx    v accumulator and step, fraction in the HIGH half
+ *     ebp:esi    u accumulator and step
+ *     edx        dh = shade, dl = texel; indexes a 64K-entry shade table
+ *     [esp+0x68] pixel count      [esp+0x74] saved ebx
+ *
+ * The odd part is eax's low half: mov ax,[edx*2+PAL] overwrites it with the
+ * fetched colour every pixel, and the next add eax,ebx accumulates it anyway.
+ * That is deliberate -- only bits 16..31 carry the fraction, and the junk in
+ * the low half can only ever push one extra ulp through the carry. Reading
+ * the disassembly alone left it genuinely ambiguous whether eax was the
+ * accumulator at all; six live entry snapshots settled it.
+ *
+ * Two more things must be reproduced or the port is merely close. The tail
+ * dispatcher at 0x180AE does mov al,[esp+0x68] / and al,3 / dec al, which
+ * clobbers eax's low BYTE -- and the tail's add eax,ebx then carries that
+ * into the fraction. And the shade advances by adc dh,STEP off the carry of
+ * cmp bp,si, which is the 16-bit carry out of the u accumulator's low half,
+ * not a second copy of the 32-bit one.
+ *
+ * TEX, PAL and STEP are 0xAFFEAFFE-style sentinels patched into seven copies
+ * of the body by orig 0x18289, so they are read live from the instruction
+ * stream rather than passed in.
+ *
+ * --ctex 1 replaces the loop; --ctex 3 runs the C version into a shadow
+ * buffer, lets the original draw for real, and compares pixels and final
+ * registers at the 0x1813E exit -- both within one frame, since two runs of
+ * a moving scene cannot be compared.
+ */
+#define TEX_ENTRY     0x00018002u  /* the call 0x18322 return address */
+#define TEX_ENTRY_LEN 8            /* mov [esp+0x74],ebx / mov ebx,[esp+0x68] */
+#define TEX_EXIT      0x0001813Eu
+#define TEX_EXIT_LEN  6            /* shl edx,8 / mov dx,bp */
+#define TEX_MAX       4096u
+
+int g_ctex;                        /* 0 off, 1 C, 3 C+verify */
+
+typedef struct { uint32_t eax, ebx, ecx, edx, ebp, esi, edi; } texst;
+
+static uint8_t  *g_ttramp, *g_xtramp;
+static void     *g_ctex_resume, *g_ctexend_resume;
+static texst     g_tx_c;
+static uint16_t *g_tx_shadow;
+static uint32_t  g_tx_count, g_tx_dst, g_tx_bad;
+static int       g_tx_pending;
+
+#define LO8(x)      ((uint8_t)(x))
+#define HI8(x)      ((uint8_t)((x) >> 8))
+#define SETLO8(x,v) ((x) = ((x) & 0xFFFFFF00u) | (uint8_t)(v))
+#define SETHI8(x,v) ((x) = ((x) & 0xFFFF00FFu) | ((uint32_t)(uint8_t)(v) << 8))
+
+/* One pixel, in the original's order. The store trails adc dh in the main
+ * body and leads it in the tails; ax is untouched by either, so one form
+ * covers both. */
+#define TEXPIXEL()                                                            \
+    do {                                                                      \
+        uint64_t t; uint32_t cf; uint16_t px;                                 \
+        SETLO8(edx, *(const uint8_t *)(uintptr_t)(ecx + (uint32_t)tex));      \
+        t = (uint64_t)eax + ebx; cf = (uint32_t)(t >> 32); eax = (uint32_t)t; \
+        SETHI8(ecx, HI8(ecx) + HI8(ebx) + cf);                                \
+        px = *(const uint16_t *)(uintptr_t)(edx * 2 + (uint32_t)pal);         \
+        eax = (eax & 0xFFFF0000u) | px;                                       \
+        t = (uint64_t)ebp + esi; cf = (uint32_t)(t >> 32); ebp = (uint32_t)t; \
+        SETLO8(ecx, LO8(ecx) + LO8(ebx) + cf);                                \
+        cf = ((uint16_t)ebp < (uint16_t)esi);                                 \
+        SETHI8(edx, HI8(edx) + step + cf);                                    \
+        dst[o++] = px; edi += 2;                                              \
+    } while (0)
+
+static void ctex_run(texst *s, uint32_t count, uint16_t *dst)
+{
+    const int32_t tex  = (int32_t)rd32a(0x18022);
+    const int32_t pal  = (int32_t)rd32a(0x1802E);
+    const uint8_t step = *(const uint8_t *)gp(0x1803B);
+    uint32_t eax = s->eax, ebx = s->ebx, ecx = s->ecx, edx = s->edx;
+    uint32_t ebp = s->ebp, esi = s->esi, edi = s->edi;
+    uint32_t blocks = count >> 2, rem = count & 3, i, o = 0;
+
+    for (i = 0; i < blocks; i++) {
+        TEXPIXEL(); TEXPIXEL(); TEXPIXEL(); TEXPIXEL();
+    }
+
+    /* mov al,[esp+0x68] / and al,3 -- eax's low byte really is overwritten */
+    SETLO8(eax, rem);
+    if (rem) {
+        SETLO8(eax, rem - 1);                     /* dec al */
+        if (rem == 1) { TEXPIXEL(); }
+        else {
+            SETLO8(eax, rem - 2);                 /* dec al */
+            if (rem == 2) { TEXPIXEL(); TEXPIXEL(); }
+            else          { TEXPIXEL(); TEXPIXEL(); TEXPIXEL(); }
+        }
+    }
+
+    s->eax = eax; s->ebx = ebx; s->ecx = ecx; s->edx = edx;
+    s->ebp = ebp; s->esi = esi; s->edi = edi;
+}
+
+/* r is the pushad block: edi,esi,ebp,esp,ebx,edx,ecx,eax, with eflags above
+ * it, so the hooked site's own ESP is 36 bytes further up. */
+void __cdecl ctex_entry(uint32_t *r)
+{
+    uint32_t esp0  = (uint32_t)(uintptr_t)r + 36;
+    uint32_t count = *(const uint32_t *)(uintptr_t)(esp0 + 0x68);
+    texst s;
+
+    s.eax = r[7]; s.ebx = r[4]; s.ecx = r[6]; s.edx = r[5];
+    s.ebp = r[2]; s.esi = r[1]; s.edi = r[0];
+
+    /* the first instruction the detour displaced */
+    *(uint32_t *)(uintptr_t)(esp0 + 0x74) = s.ebx;
+
+    if (count > TEX_MAX) {             /* nothing sane draws this wide */
+        g_ctex_resume = g_ttramp;
+        return;
+    }
+    if (g_ctex == 3) {
+        g_tx_c = s; g_tx_count = count; g_tx_dst = s.edi;
+        ctex_run(&g_tx_c, count, g_tx_shadow);
+        g_tx_pending  = 1;
+        g_ctex_resume = g_ttramp;      /* let the original draw for real */
+        return;
+    }
+
+    if (count >> 2)                    /* what 0x18016 writes */
+        *(uint32_t *)gp(0x180A4) = s.edi + (count >> 2) * 8;
+    ctex_run(&s, count, (uint16_t *)(uintptr_t)s.edi);
+    r[7] = s.eax; r[4] = s.ebx; r[6] = s.ecx; r[5] = s.edx;
+    r[2] = s.ebp; r[1] = s.esi; r[0] = s.edi;
+    g_ctex_resume = gp(TEX_EXIT);
+}
+
+void __cdecl ctex_exit(uint32_t *r)
+{
+    static uint32_t ok;
+    texst g;
+    uint32_t i;
+
+    if (!g_tx_pending) return;
+    g_tx_pending = 0;
+
+    g.eax = r[7]; g.ebx = r[4]; g.ecx = r[6]; g.edx = r[5];
+    g.ebp = r[2]; g.esi = r[1]; g.edi = r[0];
+
+    if (memcmp((const void *)(uintptr_t)g_tx_dst, g_tx_shadow, g_tx_count * 2)) {
+        const uint16_t *a = (const uint16_t *)(uintptr_t)g_tx_dst;
+        for (i = 0; i < g_tx_count && a[i] == g_tx_shadow[i]; i++) {}
+        if (g_tx_bad++ < 4)
+            LOGE("ctex: pixel %u of %u differs: orig %04X, C %04X",
+                 i, g_tx_count, a[i], g_tx_shadow[i]);
+        return;
+    }
+    if (g.eax != g_tx_c.eax || g.ebx != g_tx_c.ebx || g.ecx != g_tx_c.ecx ||
+        g.edx != g_tx_c.edx || g.ebp != g_tx_c.ebp || g.esi != g_tx_c.esi ||
+        g.edi != g_tx_c.edi) {
+        if (g_tx_bad++ < 4)
+            LOGE("ctex: %u px, pixels match but registers differ; "
+                 "orig eax=%08X ecx=%08X edx=%08X ebp=%08X edi=%08X, "
+                 "C eax=%08X ecx=%08X edx=%08X ebp=%08X edi=%08X",
+                 g_tx_count, g.eax, g.ecx, g.edx, g.ebp, g.edi,
+                 g_tx_c.eax, g_tx_c.ecx, g_tx_c.edx, g_tx_c.ebp, g_tx_c.edi);
+        return;
+    }
+    ok++;
+    if (ok == 1 || ok == 100 || ok == 1000 || ok % 20000 == 0)
+        LOGI("ctex: %u span(s) verified byte-identical to the original", ok);
+}
+
+static __declspec(naked) void ctex_thunk(void)
+{
+    __asm {
+        pushfd
+        pushad
+        mov  eax, esp
+        push eax
+        call ctex_entry
+        add  esp, 4
+        popad
+        popfd
+        jmp  dword ptr [g_ctex_resume]
+    }
+}
+
+static __declspec(naked) void ctexend_thunk(void)
+{
+    __asm {
+        pushfd
+        pushad
+        mov  eax, esp
+        push eax
+        call ctex_exit
+        add  esp, 4
+        popad
+        popfd
+        jmp  dword ptr [g_ctexend_resume]
+    }
+}
+
+static void ctex_install(void)
+{
+    uint8_t *p, *w;
+    int32_t  rel;
+
+    g_ttramp = (uint8_t *)VirtualAlloc(NULL, 64, MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+    g_xtramp = (uint8_t *)VirtualAlloc(NULL, 64, MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+    if (!g_ttramp || !g_xtramp) { LOGE("ctex: trampoline alloc failed"); return; }
+
+    if (g_ctex == 3) {
+        g_tx_shadow = (uint16_t *)malloc(TEX_MAX * 2);
+        if (!g_tx_shadow) { LOGE("ctex: shadow alloc failed"); g_ctex = 1; }
+    }
+
+    p = (uint8_t *)gp(TEX_ENTRY);
+    w = g_ttramp;
+    memcpy(w, p, TEX_ENTRY_LEN); w += TEX_ENTRY_LEN;
+    *w++ = 0xE9;
+    rel = (int32_t)((p + TEX_ENTRY_LEN) - (w + 4));
+    memcpy(w, &rel, 4);
+    g_ctexend_resume = g_xtramp;
+
+    p = (uint8_t *)gp(TEX_EXIT);
+    w = g_xtramp;
+    memcpy(w, p, TEX_EXIT_LEN); w += TEX_EXIT_LEN;
+    *w++ = 0xE9;
+    rel = (int32_t)((p + TEX_EXIT_LEN) - (w + 4));
+    memcpy(w, &rel, 4);
+
+    /* Entry: five bytes of jump, three of padding, all clear of the sentinel
+     * sites -- the nearest is 0x18022, inside the loop body. A jump AT the
+     * loop head would not survive, since 0x18289 patches the texture base
+     * into 0x18022, which is where a five-byte jump keeps its target. */
+    p = (uint8_t *)gp(TEX_ENTRY);
+    p[0] = 0xE9;
+    rel = (int32_t)((uint8_t *)ctex_thunk - (p + 5));
+    memcpy(p + 1, &rel, 4);
+    memset(p + 5, 0x90, TEX_ENTRY_LEN - 5);
+
+    if (g_ctex == 3) {
+        p = (uint8_t *)gp(TEX_EXIT);
+        p[0] = 0xE9;
+        rel = (int32_t)((uint8_t *)ctexend_thunk - (p + 5));
+        memcpy(p + 1, &rel, 4);
+        memset(p + 5, 0x90, TEX_EXIT_LEN - 5);
+    }
+    LOGI("ctex: textured span loop at orig 0x%08X replaced (mode %d)",
+         TEX_ENTRY, g_ctex);
+}
+
 void cblit_install(void)
 {
     uint8_t *p, *w;
@@ -1055,6 +1406,8 @@ void cblit_install(void)
 
     if (g_cdrawscan && !g_desktop_mode) cdrawscan_install();
     if (g_rasterscan && !g_desktop_mode) rasterscan_install();
+    if (g_spanprobe && !g_desktop_mode) spanprobe_install();
+    if (g_ctex && !g_desktop_mode) ctex_install();
     if (!g_cblit && !g_cflush && !g_csurf && !g_cdraw && !g_craster) return;
     if (g_desktop_mode) {
         LOGW("cblit: 0x%08X is a FIGHT.EXE address; not installing in desktop",

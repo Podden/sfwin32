@@ -193,6 +193,9 @@ extern int g_cdrawscan;
 extern int g_srcwatch;
 extern int g_rasterscan;
 extern int g_craster;
+extern int g_spanprobe;
+extern int g_ctex;
+int  cblit_bp_hit(EXCEPTION_POINTERS *ep);
 void cdrawscan_report(void);
 void cblit_install(void);
 

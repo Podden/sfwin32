@@ -1403,6 +1403,7 @@ static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
     LONG r;
 
     if (fbwatch_hit(ep)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (cblit_bp_hit(ep)) return EXCEPTION_CONTINUE_EXECUTION;
 
     /* Clear the trap flag for *this handler's own* execution.
      *
