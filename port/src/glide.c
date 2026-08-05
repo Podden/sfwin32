@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include <SDL.h>
 #include <GL/gl.h>
@@ -197,6 +198,12 @@ static uint32_t gl_glide_get_version(uint32_t *a)
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
+#ifndef GL_FOG_COORD_SRC
+#define GL_FOG_COORD_SRC 0x8450
+#endif
+#ifndef GL_FOG_COORD
+#define GL_FOG_COORD 0x8451
+#endif
 #ifndef GL_UNSIGNED_SHORT_5_6_5
 #define GL_UNSIGNED_SHORT_5_6_5 0x8363
 #endif
@@ -218,17 +225,46 @@ static int      g_pal_valid;
 static const uint8_t *g_tex_data;   /* expanded lazily, at draw time */
 static int      g_tex_size = 256;
 static int      g_tex_bound;
+static int      g_clamp_s, g_clamp_t;      /* grTexClampMode  */
+static int      g_filter_min = 1, g_filter_mag = 1;  /* grTexFilterMode */
 static int      g_chroma_on;
+static uint32_t g_chroma_rgb;   /* chroma key, unpacked to match g_pal_argb */
 static uint32_t g_chroma_val;
 static int      g_cc_other = 1, g_cc_factor = 8, g_cc_local;
 static uint32_t g_const_color = 0xFFFFFFFF;
 static int      g_depth_mode, g_depth_mask = 1, g_depth_func = 7;
 static uint32_t g_depth_bias;       /* grDepthBiasLevel, a 16-bit depth value */
+
+/* Fog. GR_FOG_TABLE_SIZE is 64: the index-to-w mapping the reference gives,
+ * pow(2, 3 + (i >> 2)) / (8 - (i & 3)), spans w = 1 .. 52429 over 64 entries,
+ * which is the Voodoo's whole w range. Entries are 8-bit opacities, 0x00 no
+ * fog and 0xFF full fog, and the blend is
+ *
+ *     C_out = f * C_fog + (1 - f) * C_in
+ *
+ * which is GL's own fog equation with the factor inverted. Feeding f in as a
+ * fog coordinate under GL_LINEAR with start 0 and end 1 gives GL's factor as
+ * 1 - f, so the two agree exactly and the game's table is honoured rather
+ * than approximated by an exponential curve. */
+#define GR_FOG_TABLE_SIZE 64
+/* w at the far plane. The fog table only spans w = 1..52429, but the game
+ * emits geometry well past that -- measured 483..85166, with 67035 vertices
+ * beyond 65536 -- and everything past the far plane clamps to the same depth
+ * and stops sorting against itself. 2^17 covers the observed range with room
+ * to spare; the mapping is linear in w, which is what a w-buffer is. */
+#define G_WFAR 131072.0f
+
+static int      g_fog_mode, g_fog_valid;
+static uint32_t g_fog_color;
+static uint8_t  g_fog_table[GR_FOG_TABLE_SIZE];
+static float    g_fog_w[GR_FOG_TABLE_SIZE];
+static void (APIENTRY *p_glFogCoordf)(GLfloat);
 static int      g_lfb_synced, g_lfb_dirty, g_frame_seeded;
 /* GR_BUFFER_AUXBUFFER: the depth buffer, which this game writes through
  * the LFB to stamp its cockpit mask. */
 static uint16_t g_auxbuf[GLIDE_W * GLIDE_H];
 static int      g_aux_locked;
+static int      g_mask_ready;
 static int      g_clip_x0, g_clip_y0, g_clip_x1 = GLIDE_W, g_clip_y1 = GLIDE_H;
 static uint32_t g_tex_hit, g_tex_miss, g_tris, g_texsrc_ok, g_texsrc_bad;
 
@@ -254,6 +290,25 @@ static void glide_unpack(uint32_t c, float *r, float *g, float *b)
              bb = c & 0xFF;         break;
     }
     *r = rr / 255.0f; *g = gg / 255.0f; *b = bb / 255.0f;
+}
+
+/* Interpolate the game's fog table at a given w. The table is indexed by w
+ * rather than by depth, and the entry spacing is geometric, so the bracketing
+ * pair is found by binary search over the precomputed w values. */
+static float fog_factor(float w)
+{
+    int lo = 0, hi = GR_FOG_TABLE_SIZE - 1, mid;
+    float t;
+
+    if (w <= g_fog_w[0])  return g_fog_table[0] * (1.0f / 255.0f);
+    if (w >= g_fog_w[hi]) return g_fog_table[hi] * (1.0f / 255.0f);
+    while (hi - lo > 1) {
+        mid = (lo + hi) / 2;
+        if (w < g_fog_w[mid]) hi = mid; else lo = mid;
+    }
+    t = (w - g_fog_w[lo]) / (g_fog_w[hi] - g_fog_w[lo]);
+    return (g_fog_table[lo] + t * (g_fog_table[hi] - g_fog_table[lo]))
+           * (1.0f / 255.0f);
 }
 
 static GLenum depth_func_gl(int f)
@@ -321,6 +376,21 @@ static int gl_ensure_context(void)
     glAlphaFunc(GL_GREATER, 0.5f);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glGenTextures(1, &g_blit_tex);
+
+    /* Fog: GL's own equation with the factor inverted, so the game's table is
+     * fed in per vertex as a fog coordinate rather than approximated by one
+     * of GL's built-in curves. glFogCoordf is GL 1.4, hence the lookup. */
+    p_glFogCoordf = (void (APIENTRY *)(GLfloat))
+                        SDL_GL_GetProcAddress("glFogCoordf");
+    if (!p_glFogCoordf)
+        LOGW("glide: no glFogCoordf; fog will not be applied");
+    else {
+        glFogi(GL_FOG_MODE, GL_LINEAR);
+        glFogf(GL_FOG_START, 0.0f);
+        glFogf(GL_FOG_END,   1.0f);
+        glFogi(GL_FOG_COORD_SRC, GL_FOG_COORD);
+    }
+
     g_gl_ready = 1;
     return 1;
 }
@@ -381,6 +451,8 @@ static void gl_seed_color_from_vram(void)
     g_frame_seeded = 1;
 
     glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);        /* the seed covers the whole screen */
+    glDisable(GL_FOG);                 /* ...and is not part of the scene   */
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
     glDisable(GL_BLEND);
@@ -448,21 +520,23 @@ static uint32_t gl_draw_triangle(uint32_t *a)
                         glDepthFunc(depth_func_gl(g_depth_func)); }
     else glDisable(GL_DEPTH_TEST);
 
-    /* GR_DEPTHBUFFER_*_COMPARE_TO_BIAS (3 and 4) compare the *stored* depth
-     * against the bias register rather than against the incoming value. That
-     * is the cockpit mask: the game stamps depth 0 over the whole screen
-     * through the aux buffer, then "clears" each frame with a full-viewport
-     * quad set to GR_CMP_NOTEQUAL, so the quad is rejected wherever the depth
-     * is still 0 -- the cockpit -- and passes only where the 3D has written
-     * real depths. GL compares incoming against stored, but NOTEQUAL is
-     * symmetric, so feeding the bias in as the incoming depth expresses the
-     * same test. */
-    /* GR_DEPTHBUFFER_*_COMPARE_TO_BIAS (3 and 4) test the *stored* depth
-     * against the bias register rather than the incoming value, which
-     * fixed-function GL cannot express while still writing the fragment's own
-     * depth. The game uses it only for the quad it clears the viewport with,
-     * and with depth cleared per frame that test would reject the quad
-     * everywhere and leave the background unpainted, so it passes instead. */
+    /* The cockpit mask applies to every triangle. Those pixels hold depth 0,
+     * which rejects the clear quad (bias 0, GR_CMP_NOTEQUAL) and the scene
+     * alike (GR_CMP_LESS against 0 never passes), so nothing 3D reaches them. */
+    if (g_mask_ready) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_EQUAL, 0, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    }
+
+    /* GR_DEPTHBUFFER_*_COMPARE_TO_BIAS (3 and 4): per the Glide reference the
+     * bias "is used as a pixel's depth value for comparison purposes only...
+     * and is not added to the source depth value when writing to the depth
+     * buffer" -- so the test is bias-vs-stored while the fragment still
+     * writes its own depth. GL has no single-pass equivalent, but the only
+     * thing that test decides here is staying off the cockpit, which the
+     * stencil now carries; with depth cleared to far each frame the remaining
+     * comparison passes everywhere in the viewport. */
     bias_mode = (g_depth_mode == 3 || g_depth_mode == 4);
     if (bias_mode) glDepthFunc(GL_ALWAYS);
 
@@ -472,7 +546,7 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         uint32_t key = hash32(hash32(hash32(2166136261u,
                                             (uint32_t)(uintptr_t)g_tex_data),
                                      g_pal_hash),
-                              g_chroma_on ? g_chroma_val | 1u : 0u);
+                              g_chroma_on ? g_chroma_rgb | 0x1000000u : 0u);
         if (!key) key = 1;
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, tex_upload(g_tex_data, g_tex_size, key));
@@ -484,14 +558,29 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         glDisable(GL_ALPHA_TEST);
     }
 
+    /* Fog is applied after colour combining and before alpha blending, so it
+     * rides along with the geometry rather than being a separate pass. */
+    if (g_fog_mode == 2 && g_fog_valid && p_glFogCoordf) {
+        float fr, fg, fb;
+        GLfloat c[4];
+        glide_unpack(g_fog_color, &fr, &fg, &fb);
+        c[0] = fr; c[1] = fg; c[2] = fb; c[3] = 1.0f;
+        glFogfv(GL_FOG_COLOR, c);
+        glEnable(GL_FOG);
+    } else {
+        glDisable(GL_FOG);
+    }
+
     glBegin(GL_TRIANGLES);
     for (i = 0; i < 3; i++) {
         const float *p = v[i];
         float oow = p[VOOW];
-        float w   = oow > 0.0f ? 1.0f / oow : 65536.0f;
-        float z   = w * (1.0f / 65536.0f);
+        float w   = oow > 0.0f ? 1.0f / oow : G_WFAR;
+        float z   = w * (1.0f / G_WFAR);
         if (z > 1.0f) z = 1.0f;
         if (z < 0.0f) z = 0.0f;
+        if (g_fog_mode == 2 && g_fog_valid && p_glFogCoordf)
+            p_glFogCoordf(fog_factor(w));
         /* Vertex alpha is deliberately NOT fed to GL. Glide only iterates
          * alpha when grAlphaCombine selects it, and this game leaves a=0 in
          * every vertex while still expecting opaque surfaces -- feeding that
@@ -614,8 +703,48 @@ static uint32_t gl_depth_mode(uint32_t *a)  { g_depth_mode = (int)a[0]; return 0
 static uint32_t gl_depth_func(uint32_t *a)  { g_depth_func = (int)a[0]; return 0; }
 static uint32_t gl_depth_mask(uint32_t *a)  { g_depth_mask = (int)a[0]; return 0; }
 static uint32_t gl_depth_bias(uint32_t *a)  { g_depth_bias = a[0] & 0xFFFF; return 0; }
+static uint32_t gl_fog_mode(uint32_t *a)    { g_fog_mode = (int)(a[0] & 0xFF); return 0; }
+static uint32_t gl_fog_color(uint32_t *a)   { g_fog_color = a[0]; return 0; }
+
+static uint32_t gl_fog_table(uint32_t *a)
+{
+    const uint8_t *t = (const uint8_t *)(uintptr_t)a[0];
+    if (!t) return 0;
+    memcpy(g_fog_table, t, GR_FOG_TABLE_SIZE);
+    g_fog_valid = 1;
+    LOGI("glide: fog table loaded (%u..%u over w %.0f..%.0f)",
+         g_fog_table[0], g_fog_table[GR_FOG_TABLE_SIZE - 1],
+         g_fog_w[0], g_fog_w[GR_FOG_TABLE_SIZE - 1]);
+    return 0;
+}
 static uint32_t gl_chroma_mode(uint32_t *a) { g_chroma_on  = (int)a[0]; return 0; }
-static uint32_t gl_chroma_value(uint32_t *a){ g_chroma_val = a[0];      return 0; }
+
+/* grTexClampMode(tmu, s_clampmode, t_clampmode) */
+static uint32_t gl_tex_clamp(uint32_t *a)
+{
+    g_clamp_s = (int)a[1]; g_clamp_t = (int)a[2];
+    return 0;
+}
+
+/* grTexFilterMode(tmu, minfilter, magfilter) */
+static uint32_t gl_tex_filter(uint32_t *a)
+{
+    g_filter_min = (int)a[1]; g_filter_mag = (int)a[2];
+    return 0;
+}
+/* grChromakeyValue takes a GrColor_t, so it is in the colour format
+ * grSstWinOpen selected -- the same unpacking every other colour needs.
+ * Comparing the raw dword against palette entries matches nothing. */
+static uint32_t gl_chroma_value(uint32_t *a)
+{
+    float r, g, b;
+    g_chroma_val = a[0];
+    glide_unpack(a[0], &r, &g, &b);
+    g_chroma_rgb = ((uint32_t)(r * 255.0f + 0.5f))
+                 | ((uint32_t)(g * 255.0f + 0.5f) << 8)
+                 | ((uint32_t)(b * 255.0f + 0.5f) << 16);
+    return 0;
+}
 /* grColorCombine(function, factor, local, other, invert).
  *
  * These enumerants are easy to get backwards and doing so is invisible until
@@ -698,43 +827,54 @@ static void lfb_sync_from_gl(void)
                band + (size_t)(h - 1 - y) * w, (size_t)w * 2);
 }
 
-/* Push the aux (depth) surface into GL's depth buffer.
+/* Turn the aux buffer the game wrote into a stencil mask.
  *
- * This is what makes the cockpit survive. The game "clears" each frame by
- * drawing a quad over the whole clip window with GR_CMP_NOTEQUAL, and relies
- * on the depth buffer to reject it wherever the cockpit is -- a mask it
- * stamps once at startup by locking the aux buffer and writing depth values
- * directly. Ignoring the buffer argument sent those writes into the colour
- * frame buffer, the mask never existed, and the clear quad wiped the cockpit
- * every frame. */
-static void aux_upload_to_gl(void)
+ * This is the cockpit mask, and the Glide reference spells out how it works.
+ * grDepthBufferMode(GR_DEPTHBUFFER_WBUFFER_COMPARE_TO_BIAS): "the bias
+ * specified with grDepthBiasLevel is used as a pixel's depth value for
+ * comparison purposes only... and is not added to the source depth value when
+ * writing to the depth buffer." So the quad the game clears the viewport with
+ * is tested as bias-vs-stored (NOTEQUAL against bias 0) while still writing
+ * its own depth.
+ *
+ * The game sets that up by locking GR_BUFFER_AUXBUFFER once and writing 0
+ * over the cockpit -- measured: 172172 pixels zeroed, the rest left at the
+ * far value, nothing in between. Depth 0 rejects the clear quad (0 != 0 is
+ * false) and equally rejects the scene, which tests GR_CMP_LESS against it.
+ * So those pixels take no 3D at all, which is precisely a stencil mask.
+ *
+ * Expressing it as one is what makes it work here: GL tests incoming against
+ * stored, so "test against a constant while writing the fragment's depth"
+ * has no single-pass equivalent, whereas a stencil does exactly the right
+ * thing and leaves depth free to be cleared per frame -- which double
+ * buffering requires anyway. */
+static void aux_upload_mask(void)
 {
-    static GLfloat depth[GLIDE_W * GLIDE_H];
+    static GLubyte sten[GLIDE_W * GLIDE_H];
+    uint32_t zero = 0;
     int x, y;
 
     if (!g_gl_ready) return;
 
-    /* Glide's aux buffer is 16-bit and top-down; GL wants normalised floats
-     * bottom-up. 0xFFFF is the far plane, which is also where the clear
-     * quad's own w lands, so the compare matches and the quad is rejected. */
+    /* GL is bottom-up, the game's buffer top-down. */
     for (y = 0; y < GLIDE_H; y++) {
         const uint16_t *src = g_auxbuf + (size_t)(GLIDE_H - 1 - y) * GLIDE_W;
-        GLfloat        *dst = depth + (size_t)y * GLIDE_W;
-        for (x = 0; x < GLIDE_W; x++) dst[x] = src[x] * (1.0f / 65535.0f);
+        GLubyte        *dst = sten + (size_t)y * GLIDE_W;
+        for (x = 0; x < GLIDE_W; x++) {
+            dst[x] = src[x] == 0 ? 1 : 0;      /* 1 = masked off */
+            zero += src[x] == 0;
+        }
     }
 
     glDisable(GL_SCISSOR_TEST);
-    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_ALWAYS);
-    glDepthMask(GL_TRUE);
-    /* Ortho has y growing downwards, so y=GLIDE_H is the bottom of the
-     * window, which is where glDrawPixels starts filling upwards from. */
+    glDisable(GL_STENCIL_TEST);
+    glStencilMask(0xFF);
     glRasterPos2i(0, GLIDE_H);
-    glDrawPixels(GLIDE_W, GLIDE_H, GL_DEPTH_COMPONENT, GL_FLOAT, depth);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDrawPixels(GLIDE_W, GLIDE_H, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, sten);
     glEnable(GL_SCISSOR_TEST);
-    LOGI("glide: aux buffer uploaded to the GL depth buffer");
+    g_mask_ready = 1;
+    LOGI("glide: cockpit mask from aux buffer: %u of %u pixels masked off",
+         zero, (uint32_t)(GLIDE_W * GLIDE_H));
 }
 
 /* GrLfbInfo_t: size, lfbPtr, strideInBytes, writeMode, origin.
@@ -778,7 +918,7 @@ static uint32_t gl_lfb_unlock(uint32_t *a)
 {
     if (a[1] == 2 && g_aux_locked) {
         g_aux_locked = 0;
-        aux_upload_to_gl();
+        aux_upload_mask();
     }
     return 1;
 }
@@ -804,6 +944,8 @@ static uint32_t gl_buffer_swap(uint32_t *a)
         glViewport(0, 0, dw, dh);
 
         glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_STENCIL_TEST);    /* the present covers the whole window */
+        glDisable(GL_FOG);             /* the composited frame is not fogged */
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
         glDisable(GL_ALPHA_TEST);
@@ -924,8 +1066,13 @@ static const struct { const char *name; glide_fn fn; } g_impl[] = {
     { "_GRDEPTHBUFFERFUNCTION@4",  gl_depth_func           },
     { "_GRDEPTHMASK@4",            gl_depth_mask           },
     { "_GRDEPTHBIASLEVEL@4",       gl_depth_bias           },
+    { "_GRFOGMODE@4",              gl_fog_mode             },
+    { "_GRFOGCOLORVALUE@4",        gl_fog_color            },
+    { "_GRFOGTABLE@4",             gl_fog_table            },
     { "_GRCHROMAKEYMODE@4",        gl_chroma_mode          },
     { "_GRCHROMAKEYVALUE@4",       gl_chroma_value         },
+    { "_GRTEXCLAMPMODE@12",        gl_tex_clamp            },
+    { "_GRTEXFILTERMODE@12",       gl_tex_filter           },
     { "_GRCOLORCOMBINE@20",        gl_color_combine        },
     { "_GRCONSTANTCOLORVALUE@4",   gl_constant_color       },
     { "_GRALPHABLENDFUNCTION@16",  gl_alpha_blend          },
@@ -996,6 +1143,13 @@ void glide_install(void)
     uint32_t  i, k, impl = 0;
 
     if (!g_glide_mode || !g_glide) return;
+
+    /* Fog table index -> w, per the Glide reference. Computed here rather
+     * than alongside the GL context, because grFogTable arrives during the
+     * game's own init -- long before the first triangle brings the context
+     * up -- and an empty w table makes every lookup collapse to one entry. */
+    for (i = 0; i < GR_FOG_TABLE_SIZE; i++)
+        g_fog_w[i] = (float)(pow(2.0, 3.0 + (i >> 2)) / (8 - (i & 3)));
 
     /* Walk the name table until it stops looking like exports. */
     for (i = 0; i < MAX_IMPORTS; i++) {
