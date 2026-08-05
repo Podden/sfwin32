@@ -52,6 +52,8 @@
 int g_glide = 1;                /* --glide 0 off, 1 intercept (default)     */
 uint32_t g_glide_frame;         /* grBufferSwap count, for frame tracing    */
 int g_glidedebug;
+static uint32_t g_ps_in, g_ps_out, g_ps_zfail, g_ps_chroma;
+int g_dumpsec;                  /* --dumpsec N: grab both buffers N s in */
 int g_glidetrace;               /* --glidetrace N: trace frame N only       */
 
 /* Glide's own 16-bit format is 5:6:5, which is also what this port's
@@ -138,6 +140,29 @@ static uint32_t gl_win_open(uint32_t *a)
 static uint32_t gl_screen_width(uint32_t *a)  { (void)a; return GLIDE_W; }
 static uint32_t gl_screen_height(uint32_t *a) { (void)a; return GLIDE_H; }
 static uint32_t gl_zero(uint32_t *a)          { (void)a; return 0; }
+
+/* grSstPerfStats(GrSstPerfStats_t *) -- pixelsIn, chromaFail, zFuncFail,
+ * aFuncFail, pixelsOut. The game samples these about once a second, and the
+ * stub never wrote to the caller's struct at all, so it was reading whatever
+ * happened to be on its stack. Report what the renderer actually did. */
+static uint32_t gl_perf_stats(uint32_t *a)
+{
+    uint32_t *st = (uint32_t *)(uintptr_t)a[0];
+    if (!st) return 0;
+    st[0] = g_ps_in;
+    st[1] = g_ps_chroma;
+    st[2] = g_ps_zfail;
+    st[3] = 0;
+    st[4] = g_ps_out;
+    return 0;
+}
+
+static uint32_t gl_reset_perf_stats(uint32_t *a)
+{
+    (void)a;
+    g_ps_in = g_ps_out = g_ps_zfail = g_ps_chroma = 0;
+    return 0;
+}
 
 static uint32_t gl_tex_min_addr(uint32_t *a)  { (void)a; return 0; }
 static uint32_t gl_tex_max_addr(uint32_t *a)  { (void)a; return 0x1FFFFFu; }
@@ -264,7 +289,11 @@ static uint32_t g_depth_bias;       /* grDepthBiasLevel, a 16-bit depth value */
  * and therefore interpolates exactly under screen-space interpolation, and it
  * is monotonic in w, which is all the depth test needs. */
 #define G_WNEAR  32.0f
-#define G_WFAR   131072.0f
+/* The game's own far plane, measured: oow bottoms out at exactly 1/65536
+ * across every vertex it submits, and the quad it clears the viewport with
+ * sits precisely there. Mapping depth over that range rather than double it
+ * spends no precision on distances the game never uses. */
+#define G_WFAR   65536.0f
 #define G_DEPTH_A (G_WFAR / (G_WFAR - G_WNEAR))
 #define G_DEPTH_B (-G_WNEAR * G_WFAR / (G_WFAR - G_WNEAR))
 
@@ -680,6 +709,16 @@ static uint32_t gl_draw_triangle(uint32_t *a)
     int i, bias_mode;
 
     g_tris++;
+    {   /* Rough area, which is all a fill-rate sample needs. */
+        const float *q0 = (const float *)(uintptr_t)a[0];
+        const float *q1 = (const float *)(uintptr_t)a[1];
+        const float *q2 = (const float *)(uintptr_t)a[2];
+        float ar = (q1[VX] - q0[VX]) * (q2[VY] - q0[VY])
+                 - (q2[VX] - q0[VX]) * (q1[VY] - q0[VY]);
+        if (ar < 0.0f) ar = -ar;
+        g_ps_in  += (uint32_t)(ar * 0.5f);
+        g_ps_out += (uint32_t)(ar * 0.5f);
+    }
     if (!gl_ensure_context()) return 0;
     gl_seed_color_from_vram();
 
@@ -1185,6 +1224,75 @@ static uint32_t gl_buffer_swap(uint32_t *a)
         glEnable(GL_SCISSOR_TEST);
     }
 
+    /* --dumpsec N: capture colour and depth N seconds in, so a human can fly
+     * to the thing that looks wrong first. Frame counts are no use for that
+     * at ~1500 fps. Both buffers come from the same frame, and the depth goes
+     * out as raw floats as well as an image so it can be measured rather than
+     * eyeballed. */
+    if (g_dumpsec > 0) {
+        static Uint32 t0;
+        static int done;
+        Uint32 now = SDL_GetTicks();
+        if (!t0) t0 = now;
+        if (!done && now - t0 >= (Uint32)g_dumpsec * 1000) {
+            static GLfloat  d[GLIDE_W * GLIDE_H];
+            static uint16_t g[GLIDE_W * GLIDE_H];
+            const char *dir = "C:/Users/martin/AppData/Local/Temp/claude/"
+                              "D--Schleichfahrt-Schleichfahrt-ASMPort/"
+                              "1d71cff4-70be-4860-a570-9e715e79da0a/scratchpad/";
+            char path[512];
+            FILE *f;
+            int x, y, dw = GLIDE_W, dh = GLIDE_H;
+            uint16_t *shot;
+            float lo = 1.0f, hi = 0.0f;
+
+            done = 1;
+            glDisable(GL_SCISSOR_TEST);
+
+            /* depth, straight off the buffer this frame */
+            glReadPixels(0, 0, GLIDE_W, GLIDE_H, GL_DEPTH_COMPONENT, GL_FLOAT, d);
+            sprintf(path, "%sgrab_depth.raw", dir);
+            if ((f = fopen(path, "wb")) != NULL) {
+                fwrite(d, sizeof(GLfloat), GLIDE_W * GLIDE_H, f); fclose(f);
+            }
+            for (x = 0; x < GLIDE_W * GLIDE_H; x++) {
+                if (d[x] < lo) lo = d[x];
+                if (d[x] > hi && d[x] < 1.0f) hi = d[x];
+            }
+            for (y = 0; y < GLIDE_H; y++)
+                for (x = 0; x < GLIDE_W; x++) {
+                    float v = d[y * GLIDE_W + x];
+                    int   n = (int)(255.0f * (hi > lo ? (v - lo) / (hi - lo) : 0));
+                    if (n < 0) n = 0;
+                    if (n > 255) n = 255;
+                    g[(GLIDE_H - 1 - y) * GLIDE_W + x] =
+                        (uint16_t)(((n & 0xF8) << 8) | ((n & 0xFC) << 3) | (n >> 3));
+                }
+            sprintf(path, "%sgrab_depth.bin", dir);
+            if ((f = fopen(path, "wb")) != NULL) {
+                fwrite(g, 2, GLIDE_W * GLIDE_H, f); fclose(f);
+            }
+
+            /* colour, the whole window as presented */
+            SDL_GL_GetDrawableSize(video_window(), &dw, &dh);
+            shot = (uint16_t *)malloc((size_t)dw * dh * 2);
+            if (shot) {
+                glReadPixels(0, 0, dw, dh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, shot);
+                sprintf(path, "%sgrab_color.bin", dir);
+                if ((f = fopen(path, "wb")) != NULL) {
+                    for (y = dh - 1; y >= 0; y--)
+                        fwrite(shot + (size_t)y * dw, 2, dw, f);
+                    fclose(f);
+                }
+                free(shot);
+            }
+            glEnable(GL_SCISSOR_TEST);
+            LOGI("glide: captured colour %dx%d and depth %dx%d at %u s "
+                 "(depth range %.6f..%.6f)", dw, dh, GLIDE_W, GLIDE_H,
+                 g_dumpsec, lo, hi);
+        }
+    }
+
     /* --dumpvram N: the normal path lives in render_frame, which glide mode
      * never runs. Read the whole drawable after the present, so what lands in
      * the file is exactly what the window shows -- reading a 640x480 corner
@@ -1323,6 +1431,8 @@ static const struct { const char *name; glide_fn fn; } g_impl[] = {
     { "_GRCOLORCOMBINE@20",        gl_color_combine        },
     { "_GRCONSTANTCOLORVALUE@4",   gl_constant_color       },
     { "_GRALPHABLENDFUNCTION@16",  gl_alpha_blend          },
+    { "_GRSSTPERFSTATS@4",         gl_perf_stats           },
+    { "_GRSSTRESETPERFSTATS@0",    gl_reset_perf_stats     },
     { "_GRSSTISBUSY@0",            gl_zero                 },
     { "_GRBUFFERNUMPENDING@0",     gl_zero                 },
 };
