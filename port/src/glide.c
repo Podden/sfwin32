@@ -247,12 +247,26 @@ static uint32_t g_depth_bias;       /* grDepthBiasLevel, a 16-bit depth value */
  * 1 - f, so the two agree exactly and the game's table is honoured rather
  * than approximated by an exponential curve. */
 #define GR_FOG_TABLE_SIZE 64
-/* w at the far plane. The fog table only spans w = 1..52429, but the game
- * emits geometry well past that -- measured 483..85166, with 67035 vertices
- * beyond 65536 -- and everything past the far plane clamps to the same depth
- * and stops sorting against itself. 2^17 covers the observed range with room
- * to spare; the mapping is linear in w, which is what a w-buffer is. */
-#define G_WFAR 131072.0f
+/* Depth range. The fog table spans w = 1..52429, but the game emits geometry
+ * well past that -- measured 40..85188 -- so the far plane sits at 2^17 to
+ * cover it with room to spare.
+ *
+ * Depth is NOT linear in w, even though Glide calls this a w buffer. A
+ * triangle's w does not vary linearly across it in screen space; 1/w does.
+ * Handing GL a per-vertex depth of w/far therefore interpolates along the
+ * wrong curve: a triangle spanning w = 1000..50000 lands at 25500 half way
+ * across where the true value is 1960. Terrain triangles cover exactly that
+ * kind of range, so their interiors read as far more distant than they are
+ * and lose the depth test to nearer geometry -- pipes drawing over the
+ * terrain that should occlude them.
+ *
+ * So depth is the standard hyperbolic mapping, A + B/w. It is linear in 1/w
+ * and therefore interpolates exactly under screen-space interpolation, and it
+ * is monotonic in w, which is all the depth test needs. */
+#define G_WNEAR  32.0f
+#define G_WFAR   131072.0f
+#define G_DEPTH_A (G_WFAR / (G_WFAR - G_WNEAR))
+#define G_DEPTH_B (-G_WNEAR * G_WFAR / (G_WFAR - G_WNEAR))
 
 static int      g_fog_mode, g_fog_valid;
 static uint32_t g_fog_color;
@@ -290,6 +304,176 @@ static void glide_unpack(uint32_t c, float *r, float *g, float *b)
              bb = c & 0xFF;         break;
     }
     *r = rr / 255.0f; *g = gg / 255.0f; *b = bb / 255.0f;
+}
+
+/* ------------------------------------------------------------ w buffering
+ *
+ * Glide w-buffers: the depth value is w itself, spread uniformly, and the
+ * Voodoo interpolates it per pixel. Neither half of that is expressible in
+ * fixed-function GL.
+ *
+ * Depth linear in w cannot be interpolated by the rasteriser, because w does
+ * not vary linearly across a triangle in screen space -- 1/w does. Handing GL
+ * a per-vertex depth of w/far therefore follows the wrong curve entirely: a
+ * triangle spanning w = 1000..50000 lands at 25500 half way across where the
+ * true value is 1960, an error of +1200%. The usual answer is the hyperbolic
+ * mapping A + B/w, which is linear in 1/w and so interpolates exactly -- but
+ * it buys that by crushing everything distant into the last fraction of the
+ * depth range. Measured here: the whole scene occupied 0.9978..0.9998, with
+ * almost all the range spent on empty space in front of it.
+ *
+ * A fragment shader gives both properties at once. Under this ortho setup
+ * gl_TexCoord[0].q carries oow and interpolates linearly in screen space,
+ * which is exactly right for 1/w, so reconstructing w = 1/oow per fragment
+ * and writing gl_FragDepth = w/far reproduces the Voodoo's w buffer: linear
+ * in w, uniform precision at every distance, and correct across the whole
+ * triangle. Writing gl_FragDepth also makes the depth test use that value.
+ *
+ * The rest of the shader is the fixed-function state it replaces -- the two
+ * texture environments the game uses, the chroma-key alpha test, and Glide's
+ * fog blend, which is mix(colour, fogColour, f) for the f the fog table
+ * gives. If any of it fails to build the fixed-function path is kept.
+ */
+
+static const char *g_vs_src =
+    "void main()\n"
+    "{\n"
+    "    gl_Position     = ftransform();\n"
+    "    gl_TexCoord[0]  = gl_MultiTexCoord0;\n"
+    "    gl_FrontColor   = gl_Color;\n"
+    "    gl_FogFragCoord = gl_FogCoord;\n"
+    "}\n";
+
+static const char *g_fs_src =
+    "uniform sampler2D uTex;\n"
+    "uniform int   uTexMode;      /* 0 none, 1 modulate, 2 replace */\n"
+    "uniform int   uAlphaTest;\n"
+    "uniform int   uFog;\n"
+    "uniform vec3  uFogColor;\n"
+    "uniform float uWFar;\n"
+    "void main()\n"
+    "{\n"
+    "    float oow = gl_TexCoord[0].q;\n"
+    "    float w   = oow > 0.0 ? 1.0 / oow : uWFar;\n"
+    "    gl_FragDepth = clamp(w / uWFar, 0.0, 1.0);\n"
+    "    vec4 c;\n"
+    "    if (uTexMode == 0) {\n"
+    "        c = gl_Color;\n"
+    "    } else {\n"
+    "        vec4 t = texture2DProj(uTex, gl_TexCoord[0]);\n"
+    "        if (uAlphaTest != 0 && t.a < 0.5) discard;\n"
+    "        c = uTexMode == 2 ? t : t * gl_Color;\n"
+    "    }\n"
+    "    if (uFog != 0) c.rgb = mix(c.rgb, uFogColor, gl_FogFragCoord);\n"
+    "    gl_FragColor = c;\n"
+    "}\n";
+
+#ifndef GL_FRAGMENT_SHADER
+#define GL_FRAGMENT_SHADER 0x8B30
+#define GL_VERTEX_SHADER   0x8B31
+#define GL_COMPILE_STATUS  0x8B81
+#define GL_LINK_STATUS     0x8B82
+#endif
+typedef char GLchar_;
+
+static GLuint (APIENTRY *p_glCreateShader)(GLenum);
+static void   (APIENTRY *p_glShaderSource)(GLuint, GLsizei, const GLchar_ **,
+                                           const GLint *);
+static void   (APIENTRY *p_glCompileShader)(GLuint);
+static void   (APIENTRY *p_glGetShaderiv)(GLuint, GLenum, GLint *);
+static void   (APIENTRY *p_glGetShaderInfoLog)(GLuint, GLsizei, GLsizei *,
+                                               GLchar_ *);
+static GLuint (APIENTRY *p_glCreateProgram)(void);
+static void   (APIENTRY *p_glAttachShader)(GLuint, GLuint);
+static void   (APIENTRY *p_glLinkProgram)(GLuint);
+static void   (APIENTRY *p_glGetProgramiv)(GLuint, GLenum, GLint *);
+static void   (APIENTRY *p_glUseProgram)(GLuint);
+static GLint  (APIENTRY *p_glGetUniformLocation)(GLuint, const GLchar_ *);
+static void   (APIENTRY *p_glUniform1i)(GLint, GLint);
+static void   (APIENTRY *p_glUniform1f)(GLint, GLfloat);
+static void   (APIENTRY *p_glUniform3f)(GLint, GLfloat, GLfloat, GLfloat);
+
+static GLuint g_prog;
+static GLint  g_u_texmode, g_u_alphatest, g_u_fog, g_u_fogcolor, g_u_wfar;
+
+static GLuint shader_build(GLenum type, const char *src)
+{
+    GLuint sh = p_glCreateShader(type);
+    GLint  ok = 0;
+    p_glShaderSource(sh, 1, (const GLchar_ **)&src, NULL);
+    p_glCompileShader(sh);
+    p_glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        GLsizei n = 0;
+        p_glGetShaderInfoLog(sh, sizeof log, &n, log);
+        log[sizeof log - 1] = 0;
+        LOGE("glide: %s shader failed: %s",
+             type == GL_VERTEX_SHADER ? "vertex" : "fragment", log);
+        return 0;
+    }
+    return sh;
+}
+
+static void shader_init(void)
+{
+    GLuint vs, fs;
+    GLint  ok = 0;
+
+    p_glCreateShader  = (GLuint (APIENTRY *)(GLenum))
+                            SDL_GL_GetProcAddress("glCreateShader");
+    p_glShaderSource  = (void (APIENTRY *)(GLuint, GLsizei, const GLchar_ **,
+                                           const GLint *))
+                            SDL_GL_GetProcAddress("glShaderSource");
+    p_glCompileShader = (void (APIENTRY *)(GLuint))
+                            SDL_GL_GetProcAddress("glCompileShader");
+    p_glGetShaderiv   = (void (APIENTRY *)(GLuint, GLenum, GLint *))
+                            SDL_GL_GetProcAddress("glGetShaderiv");
+    p_glGetShaderInfoLog = (void (APIENTRY *)(GLuint, GLsizei, GLsizei *,
+                                              GLchar_ *))
+                            SDL_GL_GetProcAddress("glGetShaderInfoLog");
+    p_glCreateProgram = (GLuint (APIENTRY *)(void))
+                            SDL_GL_GetProcAddress("glCreateProgram");
+    p_glAttachShader  = (void (APIENTRY *)(GLuint, GLuint))
+                            SDL_GL_GetProcAddress("glAttachShader");
+    p_glLinkProgram   = (void (APIENTRY *)(GLuint))
+                            SDL_GL_GetProcAddress("glLinkProgram");
+    p_glGetProgramiv  = (void (APIENTRY *)(GLuint, GLenum, GLint *))
+                            SDL_GL_GetProcAddress("glGetProgramiv");
+    p_glUseProgram    = (void (APIENTRY *)(GLuint))
+                            SDL_GL_GetProcAddress("glUseProgram");
+    p_glGetUniformLocation = (GLint (APIENTRY *)(GLuint, const GLchar_ *))
+                            SDL_GL_GetProcAddress("glGetUniformLocation");
+    p_glUniform1i     = (void (APIENTRY *)(GLint, GLint))
+                            SDL_GL_GetProcAddress("glUniform1i");
+    p_glUniform1f     = (void (APIENTRY *)(GLint, GLfloat))
+                            SDL_GL_GetProcAddress("glUniform1f");
+    p_glUniform3f     = (void (APIENTRY *)(GLint, GLfloat, GLfloat, GLfloat))
+                            SDL_GL_GetProcAddress("glUniform3f");
+
+    if (!p_glCreateShader || !p_glUseProgram || !p_glGetUniformLocation) {
+        LOGW("glide: no GLSL; depth stays hyperbolic in the fixed pipeline");
+        return;
+    }
+
+    vs = shader_build(GL_VERTEX_SHADER, g_vs_src);
+    fs = shader_build(GL_FRAGMENT_SHADER, g_fs_src);
+    if (!vs || !fs) return;
+
+    g_prog = p_glCreateProgram();
+    p_glAttachShader(g_prog, vs);
+    p_glAttachShader(g_prog, fs);
+    p_glLinkProgram(g_prog);
+    p_glGetProgramiv(g_prog, GL_LINK_STATUS, &ok);
+    if (!ok) { LOGE("glide: shader link failed"); g_prog = 0; return; }
+
+    g_u_texmode   = p_glGetUniformLocation(g_prog, "uTexMode");
+    g_u_alphatest = p_glGetUniformLocation(g_prog, "uAlphaTest");
+    g_u_fog       = p_glGetUniformLocation(g_prog, "uFog");
+    g_u_fogcolor  = p_glGetUniformLocation(g_prog, "uFogColor");
+    g_u_wfar      = p_glGetUniformLocation(g_prog, "uWFar");
+    LOGI("glide: w-buffer shader active; depth is linear in w to %.0f",
+         (double)G_WFAR);
 }
 
 /* Interpolate the game's fog table at a given w. The table is indexed by w
@@ -362,6 +546,11 @@ static int gl_ensure_context(void)
         LOGI("glide: OpenGL %s / %s", (const char *)glGetString(GL_VERSION),
              (const char *)glGetString(GL_RENDERER));
         LOGI("glide: drawable %dx%d, double-buffered=%d", dw, dh, db);
+        {   GLint zb = 0, sb = 0;
+            glGetIntegerv(GL_DEPTH_BITS, &zb);
+            glGetIntegerv(GL_STENCIL_BITS, &sb);
+            LOGI("glide: depth bits=%d stencil bits=%d", (int)zb, (int)sb);
+        }
     }
 
     glViewport(0, 0, GLIDE_W, GLIDE_H);
@@ -390,6 +579,8 @@ static int gl_ensure_context(void)
         glFogf(GL_FOG_END,   1.0f);
         glFogi(GL_FOG_COORD_SRC, GL_FOG_COORD);
     }
+
+    shader_init();
 
     g_gl_ready = 1;
     return 1;
@@ -451,6 +642,7 @@ static void gl_seed_color_from_vram(void)
     g_frame_seeded = 1;
 
     glDisable(GL_SCISSOR_TEST);
+    if (g_prog) p_glUseProgram(0);   /* a plain blit, not scene geometry */
     glDisable(GL_STENCIL_TEST);        /* the seed covers the whole screen */
     glDisable(GL_FOG);                 /* ...and is not part of the scene   */
     glDisable(GL_DEPTH_TEST);
@@ -571,12 +763,36 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         glDisable(GL_FOG);
     }
 
+    /* With the shader active the fixed-function texture environment, alpha
+     * test and fog are all replaced by uniforms, so the same state is simply
+     * described differently. */
+    if (g_prog) {
+        int mode = 0;
+        if (g_cc_other == 1 && g_tex_bound && g_pal_valid)
+            mode = (g_cc_factor == 8) ? 2 : 1;
+        p_glUseProgram(g_prog);
+        p_glUniform1i(g_u_texmode, mode);
+        p_glUniform1i(g_u_alphatest, mode ? 1 : 0);
+        p_glUniform1f(g_u_wfar, G_WFAR);
+        if (g_fog_mode == 2 && g_fog_valid) {
+            float fr, fg, fb;
+            glide_unpack(g_fog_color, &fr, &fg, &fb);
+            p_glUniform1i(g_u_fog, 1);
+            p_glUniform3f(g_u_fogcolor, fr, fg, fb);
+        } else {
+            p_glUniform1i(g_u_fog, 0);
+        }
+    }
+
     glBegin(GL_TRIANGLES);
     for (i = 0; i < 3; i++) {
         const float *p = v[i];
         float oow = p[VOOW];
         float w   = oow > 0.0f ? 1.0f / oow : G_WFAR;
-        float z   = w * (1.0f / G_WFAR);
+        /* Hyperbolic in w, i.e. linear in oow -- see G_WNEAR/G_WFAR above.
+         * This is the term that has to interpolate correctly across the
+         * triangle, and oow is the quantity that does. */
+        float z   = G_DEPTH_A + G_DEPTH_B * (oow > 0.0f ? oow : 1.0f / G_WFAR);
         if (z > 1.0f) z = 1.0f;
         if (z < 0.0f) z = 0.0f;
         if (g_fog_mode == 2 && g_fog_valid && p_glFogCoordf)
@@ -944,6 +1160,7 @@ static uint32_t gl_buffer_swap(uint32_t *a)
         glViewport(0, 0, dw, dh);
 
         glDisable(GL_SCISSOR_TEST);
+        if (g_prog) p_glUseProgram(0);   /* a plain blit, not scene geometry */
         glDisable(GL_STENCIL_TEST);    /* the present covers the whole window */
         glDisable(GL_FOG);             /* the composited frame is not fogged */
         glDisable(GL_DEPTH_TEST);
@@ -972,6 +1189,36 @@ static uint32_t gl_buffer_swap(uint32_t *a)
      * never runs. Read the whole drawable after the present, so what lands in
      * the file is exactly what the window shows -- reading a 640x480 corner
      * of a 1280x960 window is how a blank window went unnoticed. */
+    if (g_glidedebug == 7 && g_dumpvram_frames == 1) {
+        static GLfloat d[GLIDE_W * GLIDE_H];
+        static uint16_t g[GLIDE_W * GLIDE_H];
+        FILE *f;
+        int x, y;
+        glDisable(GL_SCISSOR_TEST);
+        glReadPixels(0, 0, GLIDE_W, GLIDE_H, GL_DEPTH_COMPONENT, GL_FLOAT, d);
+        glEnable(GL_SCISSOR_TEST);
+        /* Stretch the used range so the gradient is actually visible. */
+        {   float lo = 1.0f, hi = 0.0f;
+            for (x = 0; x < GLIDE_W * GLIDE_H; x++) {
+                if (d[x] < lo) lo = d[x];
+                if (d[x] > hi && d[x] < 1.0f) hi = d[x];
+            }
+            LOGI("glide: depth buffer range %.6f .. %.6f", lo, hi);
+            for (y = 0; y < GLIDE_H; y++)
+                for (x = 0; x < GLIDE_W; x++) {
+                    float v = d[y * GLIDE_W + x];
+                    int   n = (int)(255.0f * (hi > lo ? (v - lo) / (hi - lo) : 0));
+                    if (n < 0) n = 0; if (n > 255) n = 255;
+                    g[(GLIDE_H - 1 - y) * GLIDE_W + x] =
+                        (uint16_t)(((n & 0xF8) << 8) | ((n & 0xFC) << 3) | (n >> 3));
+                }
+        }
+        if ((f = fopen("depth.bin", "wb")) != NULL) {
+            fwrite(g, 2, GLIDE_W * GLIDE_H, f); fclose(f);
+            LOGI("glide: dumped depth buffer to depth.bin");
+        }
+    }
+
     if (g_dumpvram_frames > 0 && --g_dumpvram_frames == 0) {
         int dw = GLIDE_W, dh = GLIDE_H;
         uint16_t *shot;
