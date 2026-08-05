@@ -430,7 +430,7 @@ static uint32_t gl_draw_triangle(uint32_t *a)
      * what erases the cockpit inside the clip window. */
     if (g_glidedebug == 2) {
         if (g_cc_other == 2 || g_cc_local == 1) return 0;
-    } else if (g_glidedebug) {
+    } else if (g_glidedebug == 1) {
         glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
         glDisable(GL_TEXTURE_2D); glDisable(GL_ALPHA_TEST);
         glDisable(GL_BLEND);
@@ -519,67 +519,41 @@ static uint32_t gl_draw_triangle(uint32_t *a)
     return 0;
 }
 
-/* Texture memory.
+/* grTexSource(tmu, startAddress, evenOdd, GrTexInfo*), where GrTexInfo is
+ * { smallLod, largeLod, aspectRatio, format, data }.
  *
- * On a Voodoo the texels live in the card's texture RAM: grTexDownloadMipmap
- * copies them there at a given startAddress, and grTexSource later selects a
- * texture by that address. The GrTexInfo handed to grTexSource is a scratch
- * struct whose data pointer is not the texture being selected -- keying off
- * it bound one single texture for the whole scene, which is why every surface
- * came out identically lit. So the downloads are recorded here and grTexSource
- * looks the address up, exactly as the hardware would. */
-#define TEXMEM 64
-
-static struct {
-    uint32_t        addr;
-    const uint8_t  *data;
-    int             size;
-    int             used;
-} g_texmem[TEXMEM];
-
-/* grTexDownloadMipmap(tmu, startAddress, evenOdd, GrTexInfo*) */
-static uint32_t gl_tex_download_mipmap(uint32_t *a)
-{
-    const uint32_t *ti = (const uint32_t *)(uintptr_t)a[3];
-    int i, free_slot = -1;
-
-    if (!ti || ti[3] != 5) return 0;            /* GR_TEXFMT_P_8 only */
-    for (i = 0; i < TEXMEM; i++) {
-        if (g_texmem[i].used && g_texmem[i].addr == a[1]) { free_slot = i; break; }
-        if (!g_texmem[i].used && free_slot < 0) free_slot = i;
-    }
-    if (free_slot < 0) { LOGW("glide: texture memory table full"); return 0; }
-
-    g_texmem[free_slot].used = 1;
-    g_texmem[free_slot].addr = a[1];
-    g_texmem[free_slot].data = (const uint8_t *)(uintptr_t)ti[4];
-    g_texmem[free_slot].size = 256 >> (ti[1] < 9 ? ti[1] : 8);
-    if (g_texmem[free_slot].size < 1) g_texmem[free_slot].size = 1;
-    LOGI("glide: texture at 0x%08X -> %dx%d from 0x%08X", a[1],
-         g_texmem[free_slot].size, g_texmem[free_slot].size, ti[4]);
-    return 0;
-}
-
-/* grTexSource(tmu, startAddress, evenOdd, GrTexInfo*). Records only: the
- * frame trace shows the order is grTexSource, then grTexDownloadTable, then
- * the triangles, so the palette for this object has not arrived yet.
- * Expanding the paletted texture here would bake in the previous object's
- * palette. The expansion is deferred to the first triangle that uses it. */
+ * The texture is identified by GrTexInfo->data. On a Voodoo the selector
+ * would be startAddress -- where grTexDownloadMipmap put the texels in
+ * texture RAM -- but this game passes 0 for every single download and every
+ * source, so that address distinguishes nothing. It keeps one persistent
+ * GrTexInfo per texture instead, and the data pointers handed to grTexSource
+ * are exactly the ones its downloads used. Keying off startAddress collapses
+ * all 32 textures onto one, which looks like the whole world wearing a single
+ * texture.
+ *
+ * Records only: the frame trace shows the order is grTexSource, then
+ * grTexDownloadTable, then the triangles, so this object's palette has not
+ * arrived yet. Expanding here would bake in the previous object's palette, so
+ * it is deferred to the first triangle that uses it. */
 static uint32_t gl_tex_source(uint32_t *a)
 {
-    int i;
+    const uint32_t *ti = (const uint32_t *)(uintptr_t)a[3];
+    static int warned_fmt = -1;
 
     g_tex_bound = 0;
-    for (i = 0; i < TEXMEM; i++)
-        if (g_texmem[i].used && g_texmem[i].addr == a[1]) {
-            g_tex_data  = g_texmem[i].data;
-            g_tex_size  = g_texmem[i].size;
-            g_tex_bound = g_tex_data != NULL;
-            g_texsrc_ok++;
-            return 0;
+    if (!ti) return 0;
+
+    if (ti[3] != 5) {                       /* GR_TEXFMT_P_8 */
+        if (warned_fmt != (int)ti[3]) {
+            warned_fmt = (int)ti[3];
+            LOGW("glide: texture format %u is not P_8; skipped", ti[3]);
         }
-    if (g_texsrc_bad++ < 4)
-        LOGW("glide: grTexSource address 0x%08X was never downloaded", a[1]);
+        return 0;
+    }
+    g_tex_size = 256 >> (ti[1] < 9 ? ti[1] : 8);
+    if (g_tex_size < 1) g_tex_size = 1;
+    g_tex_data = (const uint8_t *)(uintptr_t)ti[4];
+    g_tex_bound = g_tex_data != NULL;
     return 0;
 }
 
@@ -600,11 +574,21 @@ static uint32_t gl_tex_download_table(uint32_t *a)
     }
     g_pal_hash = h;
     g_pal_valid = 1;
-    {   static int n;
-        if (n++ < 2)
-            LOGI("glide: palette[0,1,64,128,176,208,224,225] = "
-                 "%06X %06X %06X %06X %06X %06X %06X %06X",
-                 p[0], p[1], p[64], p[128], p[176], p[208], p[224], p[225]);
+    if (g_glidedebug == 3) {           /* one-shot: dump palette + texels */
+        static int done;
+        if (!done && g_tex_data) {
+            FILE *f;
+            done = 1;
+            if ((f = fopen("pal.raw", "wb")) != NULL) {
+                fwrite(p, 4, 256, f); fclose(f);
+            }
+            if ((f = fopen("tex.raw", "wb")) != NULL) {
+                fwrite(g_tex_data, 1, (size_t)g_tex_size * g_tex_size, f);
+                fclose(f);
+            }
+            LOGI("glide: dumped pal.raw + tex.raw (%dx%d)", g_tex_size,
+                 g_tex_size);
+        }
     }
     return 0;
 }
@@ -934,7 +918,6 @@ static const struct { const char *name; glide_fn fn; } g_impl[] = {
     { "_GRBUFFERCLEAR@12",         gl_buffer_clear         },
     { "_GRDRAWTRIANGLE@12",        gl_draw_triangle        },
     { "_GRTEXSOURCE@16",           gl_tex_source           },
-    { "_GRTEXDOWNLOADMIPMAP@16",   gl_tex_download_mipmap  },
     { "_GRTEXDOWNLOADTABLE@12",    gl_tex_download_table   },
     { "_GRCLIPWINDOW@16",          gl_clip_window          },
     { "_GRDEPTHBUFFERMODE@4",      gl_depth_mode           },
