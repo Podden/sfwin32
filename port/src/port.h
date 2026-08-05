@@ -27,11 +27,11 @@ void todo_dump(void);
 /* --------------------------------------------------------------- LE image */
 
 typedef struct {
-    uint8_t  *mem;          /* one block holding both objects            */
+    uint8_t  *mem;          /* one block holding every object            */
     uint32_t  size;
     uint32_t  delta;        /* new_addr = old_addr + delta               */
-    uint32_t  obj1_base, obj1_size;   /* original (pre-rebase) values    */
-    uint32_t  obj2_base, obj2_size;
+    uint32_t  img_lo, img_hi;         /* original (pre-rebase) extent    */
+    uint32_t  code_size;              /* executable extent from mem      */
     uint32_t  entry;        /* already rebased                           */
     uint32_t  stack_top;    /* already rebased                           */
     uint32_t  heap_top;     /* the break we report to the C runtime       */
@@ -223,6 +223,21 @@ extern uint32_t g_pit_divisor_addr;
  * A general per-mode signal for anything else in the emulator that turns out
  * to need one -- the ISR-span constants below were the next thing that did. */
 extern int g_desktop_mode;
+/* Running FIGHT3.EXE/DESKTOP3.EXE, the 3dfx build: a different link that
+ * shares none of the software builds' hooked addresses, and that renders
+ * through Glide rather than VESA. */
+extern int g_glide_mode;
+
+/* ------------------------------------------------------------------ glide */
+/* Redirects the 3dfx build's 130 Glide imports into our own code instead
+ * of GLIDE2X.OVL. Must run after the image is loaded and relocated. */
+extern int g_glide;        /* --glide 0 off, 1 intercept (default) */
+extern int g_glidetrace;
+extern int g_glidedebug;   /* --glidetrace: log every call          */
+int  video_set_linear_mode(int w, int h, int bpp);
+struct SDL_Window *video_window(void);
+void glide_install(void);
+void glide_summary(void);
 
 int  dos_int21(CONTEXT *c);
 int  dpmi_int31(CONTEXT *c);

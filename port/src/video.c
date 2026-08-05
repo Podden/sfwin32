@@ -91,19 +91,37 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
         InterlockedExchange(&g_vid_ready, -1);
         return 1;
     }
+    /* The 3dfx build renders through OpenGL, so its window needs a GL-capable
+     * pixel format and no SDL_Renderer -- the two cannot own the same window.
+     * The context itself is created later, on the game thread, because that is
+     * where every Glide call arrives and a GL context is thread-affine. */
+    if (g_glide_mode) {
+        /* Double-buffered. A single-buffered GL window renders correctly --
+         * glReadPixels returns the right pixels -- but the desktop compositor
+         * never presents its front buffer, so the window itself stays blank.
+         * Nothing here depends on the back buffer persisting: glide.c reseeds
+         * the colour buffer from the frame buffer and clears depth every
+         * frame. */
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    }
     g_win = SDL_CreateWindow("Schleichfahrt (ASMPort)",
                              SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                             g_vid_w * 2, g_vid_h * 2, SDL_WINDOW_RESIZABLE);
-    g_ren = g_win ? SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED)
-                  : NULL;
-    if (g_win && !g_ren)
-        g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
-    if (!g_win || !g_ren) {
+                             g_vid_w * 2, g_vid_h * 2,
+                             SDL_WINDOW_RESIZABLE |
+                             (g_glide_mode ? SDL_WINDOW_OPENGL : 0));
+    if (!g_glide_mode) {
+        g_ren = g_win ? SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED)
+                      : NULL;
+        if (g_win && !g_ren)
+            g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
+    }
+    if (!g_win || (!g_ren && !g_glide_mode)) {
         LOGE("SDL window/renderer failed: %s", SDL_GetError());
         InterlockedExchange(&g_vid_ready, -1);
         return 1;
     }
-    SDL_RenderSetLogicalSize(g_ren, g_vid_w, g_vid_h);
+    if (g_ren) SDL_RenderSetLogicalSize(g_ren, g_vid_w, g_vid_h);
     InterlockedExchange(&g_vid_ready, 1);
     LOGI("SDL thread up");
 
@@ -146,13 +164,14 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
         }
         if (g_quit) {
             LOGI("window closed; shutting down");
+            glide_summary();
             todo_dump();
             calltrace_dump();
             cdrawscan_report();
             log_shutdown();
             ExitProcess(0);
         }
-        if (InterlockedExchange(&g_mode_dirty, 0)) {
+        if (InterlockedExchange(&g_mode_dirty, 0) && g_ren) {
             if (g_tex) SDL_DestroyTexture(g_tex);
             g_tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_ARGB8888,
                                       SDL_TEXTUREACCESS_STREAMING,
@@ -376,6 +395,9 @@ static void render_frame(void)
 /* Called from the game thread when it flips a page. The SDL thread presents
  * continuously anyway, so this only needs to exist, not to do anything. */
 void video_present(void) { }
+
+/* For glide.c, which creates the GL context on the game thread. */
+SDL_Window *video_window(void) { return g_win; }
 
 /* SDL scancode -> IBM PC set-1 scancode.
  *
@@ -641,6 +663,20 @@ static int do_4f02(uint16_t mode)
     InterlockedExchange(&g_mode_dirty, 1);   /* SDL thread rebuilds the texture */
     LOGI("VBE 4F02 set mode 0x%X -> %dx%dx%d (LFB bit %s)",
          mode, m->w, m->h, m->bpp, (mode & 0x4000) ? "set" : "clear");
+    return 1;
+}
+
+/* The 3dfx build never sets a VESA mode -- Glide owns the display -- so the
+ * mode comes from grSstWinOpen instead. Same globals, same dirty flag as
+ * do_4f02; only the trigger differs. */
+int video_set_linear_mode(int w, int h, int bpp)
+{
+    g_vid_w = w; g_vid_h = h; g_vid_bpp = bpp;
+    g_vid_pitch = w * ((bpp + 7) / 8);
+    g_window = g_vram;
+    g_vid_active = 1;
+    InterlockedExchange(&g_mode_dirty, 1);
+    LOGI("video: linear %dx%dx%d for Glide", w, h, bpp);
     return 1;
 }
 

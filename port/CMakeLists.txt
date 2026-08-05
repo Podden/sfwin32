@@ -23,12 +23,14 @@ add_executable(fightport
   src/mouse.c
   src/calltrace.c
   src/cblit.c
+  src/glide.c
 )
 
 target_include_directories(fightport PRIVATE src "${SDL2_ROOT}/include")
 target_link_libraries(fightport PRIVATE
   "${SDL2_ROOT}/lib/x86/SDL2.lib"
   "${SDL2_ROOT}/lib/x86/SDL2main.lib"
+  opengl32
   winmm                    # timeBeginPeriod, for a usable IRQ0 tick rate
 )
 

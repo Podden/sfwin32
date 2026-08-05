@@ -49,6 +49,9 @@ void todo_hit(const char *kind, uint32_t detail, uint32_t eip)
     }
 }
 
+/* Defined in glide.c; a no-op unless the 3dfx build is running. */
+void glide_summary(void);
+
 void todo_dump(void)
 {
     int i;
@@ -196,7 +199,7 @@ void mem_ensure_committed(void *p, uint32_t n)
 uint8_t *lin_to_ptr(uint32_t lin)
 {
     if (lin < DOSMEM_SIZE) return g_dosmem + lin;
-    if (lin >= g_img.obj1_base && lin < g_img.obj2_base + g_img.obj2_size)
+    if (lin >= g_img.img_lo && lin < g_img.img_hi)
         return (uint8_t *)gp(lin);
     return (uint8_t *)(uintptr_t)lin;          /* already one of our pointers */
 }
@@ -337,7 +340,7 @@ static void *xlat(int seg, uint32_t off, int *ok)
     }
 
     /* inside the loaded image -> rebase it */
-    if (off >= g_img.obj1_base && off < g_img.obj2_base + g_img.obj2_size)
+    if (off >= g_img.img_lo && off < g_img.img_hi)
         return gp(off);
 
     /* low memory: PSP, environment, BIOS data area */
@@ -883,7 +886,7 @@ static LONG emu_veh_inner(EXCEPTION_POINTERS *ep)
     {
         uintptr_t glo = (uintptr_t)g_img.mem;
         int in_game = g_img.mem && c->Eip >= glo &&
-                      c->Eip < glo + g_img.obj1_size;
+                      c->Eip < glo + g_img.code_size;
         /* One exception to "not ours, don't touch": a single step outside the
          * image is *always* ours, because we are the only thing in the process
          * that sets the trap flag.
@@ -1159,6 +1162,7 @@ static LONG emu_veh_inner(EXCEPTION_POINTERS *ep)
 
     LOGE("unhandled fault: code=0x%08lX eip=0x%08lX (orig 0x%08X) op=0x%02X",
          ep->ExceptionRecord->ExceptionCode, c->Eip, c->Eip - g_img.delta, in.op);
+    glide_summary();
     todo_dump();
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -1211,6 +1215,7 @@ int g_extern_irq = 1;             /* --no-extern-irq disables the fallback path 
 uint32_t g_vram_faults;
 uint32_t g_pit_divisor_addr = GAME_PIT_DIVISOR_ADDR_FIGHT;
 int      g_desktop_mode;
+int      g_glide_mode;
 
 uint32_t g_watch_addr;
 int      g_watch_dwords = 1;     /* --watch ADDR:N covers a whole struct */
@@ -1325,7 +1330,7 @@ static int fbwatch_hit(EXCEPTION_POINTERS *ep)
             DWORD old;
             uint32_t weip = (uint32_t)ep->ContextRecord->Eip;
             uintptr_t wlo = (uintptr_t)g_img.mem;
-            uintptr_t whi = wlo + g_img.obj1_size;
+            uintptr_t whi = wlo + g_img.code_size;
             VirtualProtect(g_listwatch_page, 0x1000, PAGE_READWRITE, &old);
             InterlockedExchange(&g_listwatch_armed, 0);
             if (weip >= wlo && weip < whi && ++wn <= 80)
@@ -1341,7 +1346,7 @@ static int fbwatch_hit(EXCEPTION_POINTERS *ep)
     addr = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
     eip  = (uint32_t)ep->ContextRecord->Eip;
     lo   = (uintptr_t)g_img.mem;
-    hi   = lo + g_img.obj1_size;
+    hi   = lo + g_img.code_size;
 
     /* Span-list page: report only writers that are not the blitter itself,
      * which reads this memory constantly. */
@@ -1451,7 +1456,8 @@ static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
              g_dbg_ea);
         LOGE("  shadow es=%04X ds=%04X | handled %u, last ok orig 0x%08X",
              g_seg.es, g_seg.ds, g_handled, g_last_ok_eip - g_img.delta);
-        todo_dump();
+        glide_summary();
+    todo_dump();
         g_map_low = 0;
         g_veh_depth--;
         return EXCEPTION_CONTINUE_SEARCH;
@@ -1462,7 +1468,7 @@ static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
         CONTEXT *c = ep->ContextRecord;
         uintptr_t glo = (uintptr_t)g_img.mem;
         int resuming_game = g_img.mem && c->Eip >= glo &&
-                            c->Eip < glo + g_img.obj1_size;
+                            c->Eip < glo + g_img.code_size;
 
         /* Only single-step the *game*. Re-arming TF for a resume into our own
          * code is what made DESKTOP.EXE unrunnable: an exception taken while
@@ -1535,6 +1541,7 @@ static LONG WINAPI emu_crash_filter(EXCEPTION_POINTERS *ep)
             }
         }
     }
+    glide_summary();
     todo_dump();
     log_shutdown();
     return EXCEPTION_EXECUTE_HANDLER;
@@ -1627,7 +1634,7 @@ static volatile LONG g_skip_eip, g_skip_isr, g_skip_shadow,
 
 static void irq_deliver_pending(CONTEXT *c)
 {
-    uintptr_t lo = (uintptr_t)g_img.mem, hi = lo + g_img.obj1_size;
+    uintptr_t lo = (uintptr_t)g_img.mem, hi = lo + g_img.code_size;
     uint32_t handler, *sp;
     int vec;
 
@@ -1717,7 +1724,7 @@ static void irq_deliver_pending(CONTEXT *c)
 static void irq_inject_external(void)
 {
     CONTEXT c;
-    uintptr_t lo = (uintptr_t)g_img.mem, hi = lo + g_img.obj1_size;
+    uintptr_t lo = (uintptr_t)g_img.mem, hi = lo + g_img.code_size;
     uint32_t handler, *sp;
     int vec;
 
@@ -1794,7 +1801,10 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
         if (now.QuadPart < next.QuadPart) continue;
 
         /* Honour whatever rate the game programmed into the PIT. */
-        div = *(volatile uint32_t *)gp(g_pit_divisor_addr) & 0xFFFF;
+        div = g_pit_divisor_addr
+            ? *(volatile uint32_t *)gp(g_pit_divisor_addr) & 0xFFFF
+            : 0x174Eu;              /* 200 Hz, the rate both software
+                                     * builds ask for */
         if (div == 0) div = 0x10000;
         if (div != last_div) {
             LOGI("timer rate: divisor %u -> %.2f Hz", div, 1193182.0 / div);
@@ -1907,6 +1917,7 @@ void emu_request_exit(int code)
     g_exit_requested = 1;
     g_exit_code = code;
     LOGI("game requested exit with code %d", code);
+    glide_summary();
     todo_dump();
     calltrace_dump();
     log_shutdown();

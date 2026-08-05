@@ -24,11 +24,12 @@ const char *g_cmdline;
  * loads both; what differs is the patch set, since every automatic patch is an
  * address in one specific image. The mode selects that set explicitly rather
  * than having the port guess. */
-typedef enum { MODE_FIGHT, MODE_DESKTOP } game_mode;
+typedef enum { MODE_FIGHT, MODE_DESKTOP, MODE_FIGHT3 } game_mode;
 static game_mode g_mode = MODE_FIGHT;
 static const char *mode_name(void)
 {
-    return g_mode == MODE_DESKTOP ? "desktop" : "fight";
+    return g_mode == MODE_DESKTOP ? "desktop"
+         : g_mode == MODE_FIGHT3  ? "fight3" : "fight";
 }
 
 static void usage(const char *argv0)
@@ -118,6 +119,21 @@ static int parse_patch_if(const char *s, const char *expect)
  * user --patch options so the reasoning stays visible. */
 static void add_default_patches(void)
 {
+    if (g_mode == MODE_FIGHT3) {
+        /* The 3dfx build is the same code through the same compiler, so
+         * it needs the same three fixes at its own addresses. The stack
+         * probe was located by the byte signature of FIGHT's -- `cmp
+         * eax,esp / jae / sub / neg / cmp` -- which reproduces both
+         * software builds' known sites exactly, so it is trusted here.
+         * The two ISR sites were read out of the int 8 handler the game
+         * actually installed (orig 0x9E382), which is where an unpatched
+         * run faults: the far call at 0x9E3E3. Both skip displacements
+         * come out at 0x37 and 0x47, the same as the software builds. */
+        parse_patch_if("FCAF3=C3", "39");
+        parse_patch_if("9E3CB=EB37", "833D");
+        parse_patch_if("9E4B8=EB47", "833D");
+        return;
+    }
     if (g_mode == MODE_DESKTOP) {
         /* The same four fixes, at DESKTOP.EXE's own addresses. Each was
          * located by isrfind.py (byte signature) or by the "Stack Overflow!"
@@ -195,9 +211,32 @@ static void relocate_isr_stack(void)
      * `mov ax,ds / mov ss,ax / mov esp,imm32`, which nothing else in either
      * image does. DESKTOP's obj2 ends at 0x11F110, which is also its LE stack
      * pointer -- confirming the tail really is the unused DOS/4GW stack. */
-    uint32_t site   = (g_mode == MODE_DESKTOP) ? 0x000914D6u : 0x000A8F16u;
-    uint32_t was    = (g_mode == MODE_DESKTOP) ? 0x000FA708u : 0x00158A60u;
-    uint32_t moveto = (g_mode == MODE_DESKTOP) ? 0x0011F000u : 0x00176400u;
+    uint32_t site, was, moveto;
+
+    if (g_mode == MODE_FIGHT3) {
+        /* Same instruction, found the same way, in the ISR at 0x9E382:
+         * `mov esp, imm32` at 0x9E3C6. The immediate is a relocated
+         * address whose link-time value this port never sees, so unlike
+         * the software builds it is checked for being inside the image
+         * rather than against a known constant. Object 5 ends at
+         * 0x177820, which is also the LE stack pointer -- the DOS/4GW
+         * stack this port never uses. */
+        uint8_t  *op3  = (uint8_t *)gp(0x0009E3C6u);
+        uint32_t *imm3 = (uint32_t *)gp(0x0009E3C7u);
+        uint32_t  lo   = (uint32_t)(uintptr_t)g_img.mem;
+        if (*op3 != 0xBC || *imm3 < lo || *imm3 >= lo + g_img.size) {
+            LOGW("fight3: ISR stack not relocated: 0x9E3C6 is %02X %08X",
+                 *op3, *imm3);
+            return;
+        }
+        LOGI("ISR stack relocated: 0x%08X -> 0x%08X (orig 0x%X -> 0x177720)",
+             *imm3, (uint32_t)(uintptr_t)gp(0x00177720u), *imm3 - g_img.delta);
+        *imm3 = (uint32_t)(uintptr_t)gp(0x00177720u);
+        return;
+    }
+    site   = (g_mode == MODE_DESKTOP) ? 0x000914D6u : 0x000A8F16u;
+    was    = (g_mode == MODE_DESKTOP) ? 0x000FA708u : 0x00158A60u;
+    moveto = (g_mode == MODE_DESKTOP) ? 0x0011F000u : 0x00176400u;
 
     uint8_t  *op  = (uint8_t *)gp(site);
     uint32_t *imm = (uint32_t *)gp(site + 1);        /* mov esp, imm32     */
@@ -373,6 +412,7 @@ int main(int argc, char **argv)
             const char *m = argv[++i];
             if (!strcmp(m, "fight"))        g_mode = MODE_FIGHT;
             else if (!strcmp(m, "desktop")) g_mode = MODE_DESKTOP;
+            else if (!strcmp(m, "fight3"))  g_mode = MODE_FIGHT3;
             else { printf("unknown mode '%s' (fight|desktop)\n", m); return 2; }
         }
         else if (!strcmp(argv[i], "--exe") && i + 1 < argc)    exe = argv[++i];
@@ -406,6 +446,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cdraw") && i + 1 < argc)
             g_cdraw = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cdrawscan")) g_cdrawscan = 1;
+        else if (!strcmp(argv[i], "--glidedebug") && i + 1 < argc)
+            g_glidedebug = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--glidetrace") && i + 1 < argc)
+            g_glidetrace = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--glide") && i + 1 < argc)
+            g_glide = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctex") && i + 1 < argc)
             g_ctex = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--srcwatch")) g_srcwatch = 1;
@@ -427,7 +473,8 @@ int main(int argc, char **argv)
     }
 
     /* The mode picks the binary unless one was named explicitly. */
-    if (!exe) exe = (g_mode == MODE_DESKTOP) ? "DESKTOP.EXE" : "FIGHT.EXE";
+    if (!exe) exe = g_mode == MODE_DESKTOP ? "DESKTOP.EXE"
+                  : g_mode == MODE_FIGHT3  ? "FIGHT3.EXE" : "FIGHT.EXE";
 
     /* Same for the command tail, unless --args overrode it. FIGHT.EXE wants
      * "solo" (that is how SF.EXE launches it); DESKTOP.EXE checks argv[1]
@@ -440,7 +487,8 @@ int main(int argc, char **argv)
 
     /* One log per mode: running both binaries in turn into a single file
      * makes the two runs indistinguishable after the fact. */
-    log_init(g_mode == MODE_DESKTOP ? "desktop.log" : "fight.log");
+    log_init(g_mode == MODE_DESKTOP ? "desktop.log"
+           : g_mode == MODE_FIGHT3  ? "fight3.log" : "fight.log");
     LOGI("Schleichfahrt static port starting: mode %s, image %s",
          mode_name(), exe);
 
@@ -454,6 +502,11 @@ int main(int argc, char **argv)
         }
         LOGI("assets: %s", assets);
     }
+
+    /* Before video_init: the SDL thread decides there whether the window
+     * gets an OpenGL pixel format, and the 3dfx build needs one. */
+    g_desktop_mode = (g_mode == MODE_DESKTOP);
+    g_glide_mode   = (g_mode == MODE_FIGHT3);
 
     if (!video_init()) { printf("video init failed; see fightport.log\n");
                          return 1; }
@@ -470,30 +523,37 @@ int main(int argc, char **argv)
     /* Per-image: the game's own shadow copy of the PIT divisor it last
      * programmed, at a different address in each binary. Must be set before
      * timer_start(). */
-    g_desktop_mode = (g_mode == MODE_DESKTOP);
-    g_pit_divisor_addr = g_desktop_mode ? GAME_PIT_DIVISOR_ADDR_DESKTOP
+    /* Every per-image address below belongs to one of the two software
+     * builds. The 3dfx build is a different link with none of them known
+     * yet, so it takes the generic path rather than a wrong constant: a
+     * zero divisor address means "read no shadow, assume the default". */
+    g_pit_divisor_addr = g_glide_mode   ? 0u
+                       : g_desktop_mode ? GAME_PIT_DIVISOR_ADDR_DESKTOP
                                         : GAME_PIT_DIVISOR_ADDR_FIGHT;
 
     /* Ahead of audio_install_hooks() on purpose: for the 16 functions both
      * touch, audio's real replacement should win over calltrace's
      * logging-only detour, which only needs to run second to overwrite it. */
-    if (want_calltrace) calltrace_install();
+    if (want_calltrace && !g_glide_mode) calltrace_install();
+    glide_install();
     cblit_install();
 
     /* Replaces the Miles driver stack with our own mixer. Must come after
      * relocation, since the hooks are written into the loaded image. */
     audio_init();
-    audio_select_image(g_mode == MODE_DESKTOP);
-    audio_install_hooks();
+    if (!g_glide_mode) {
+        audio_select_image(g_mode == MODE_DESKTOP);
+        audio_install_hooks();
+    }
 
     /* Object 1 is code. It needs to stay writable as well as executable: the
      * startup patches selector values into its own instruction stream. */
-    if (!VirtualProtect(g_img.mem, g_img.obj1_size,
+    if (!VirtualProtect(g_img.mem, g_img.code_size,
                         PAGE_EXECUTE_READWRITE, &old)) {
         LOGE("VirtualProtect(code) failed: %lu", GetLastError());
         return 1;
     }
-    FlushInstructionCache(GetCurrentProcess(), g_img.mem, g_img.obj1_size);
+    FlushInstructionCache(GetCurrentProcess(), g_img.mem, g_img.code_size);
 
     if (!emu_install()) { printf("emulator install failed\n"); return 1; }
 

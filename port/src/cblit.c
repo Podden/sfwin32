@@ -1404,10 +1404,12 @@ void cblit_install(void)
     uint8_t *p, *w;
     int32_t rel;
 
+    if (g_glide_mode) return;
     if (g_cdrawscan && !g_desktop_mode) cdrawscan_install();
     if (g_rasterscan && !g_desktop_mode) rasterscan_install();
     if (g_spanprobe && !g_desktop_mode) spanprobe_install();
     if (g_ctex && !g_desktop_mode) ctex_install();
+    if (g_glide_mode) return;      /* FIGHT.EXE addresses, all of them */
     if (!g_cblit && !g_cflush && !g_csurf && !g_cdraw && !g_craster) return;
     if (g_desktop_mode) {
         LOGW("cblit: 0x%08X is a FIGHT.EXE address; not installing in desktop",
