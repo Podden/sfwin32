@@ -233,7 +233,9 @@ extern int g_glide_mode;
  * of GLIDE2X.OVL. Must run after the image is loaded and relocated. */
 extern int g_glide;        /* --glide 0 off, 1 intercept (default) */
 extern int g_glidetrace;
-extern int g_glidedebug;   /* --glidetrace: log every call          */
+extern int g_glidedebug;
+extern int g_dumpsec;
+extern int g_probe_x, g_probe_y;   /* --glidetrace: log every call          */
 int  video_set_linear_mode(int w, int h, int bpp);
 struct SDL_Window *video_window(void);
 void glide_install(void);

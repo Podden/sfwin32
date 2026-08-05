@@ -52,6 +52,9 @@
 int g_glide = 1;                /* --glide 0 off, 1 intercept (default)     */
 uint32_t g_glide_frame;         /* grBufferSwap count, for frame tracing    */
 int g_glidedebug;
+int g_probe_x = -1, g_probe_y = -1;
+static int g_probe_now;
+static uint32_t g_probe_hits;
 static uint32_t g_ps_in, g_ps_out, g_ps_zfail, g_ps_chroma;
 int g_dumpsec;                  /* --dumpsec N: grab both buffers N s in */
 int g_glidetrace;               /* --glidetrace N: trace frame N only       */
@@ -746,6 +749,59 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         return 0;
     }
 
+    /* --probe X,Y: log every triangle that covers one pixel, in draw order,
+     * with the w it interpolates there. The depth buffer only ever shows the
+     * surface that won; this shows what else was submitted at that pixel and
+     * what depth each one claimed, which is the only way to tell "the
+     * occluder was never drawn" from "the occluder lost the test". */
+    if (g_probe_now) {
+        float x0 = v[0][VX], y0 = v[0][VY], x1 = v[1][VX], y1 = v[1][VY];
+        float x2 = v[2][VX], y2 = v[2][VY];
+        float area = (x1-x0)*(y2-y0) - (x2-x0)*(y1-y0);
+        int gx, gy;
+        /* A grid rather than one pixel: aiming a specific object onto one
+         * exact pixel is not something a human can be asked to do. The
+         * texture address identifies which object each surface belongs to,
+         * so terrain and models can be told apart in the output. */
+        if (area != 0.0f)
+        for (gy = 0; gy < 13; gy++) for (gx = 0; gx < 20; gx++) {
+            float px = (float)(gx * 32 + 16) + 0.5f;
+            float py = (float)(gy * 30 + 25) + 0.5f;
+            float l0 = ((x1-px)*(y2-py) - (x2-px)*(y1-py)) / area;
+            float l1 = ((x2-px)*(y0-py) - (x0-px)*(y2-py)) / area;
+            float l2 = 1.0f - l0 - l1;
+            if (l0 >= 0.0f && l1 >= 0.0f && l2 >= 0.0f) {
+                float oow = l0*v[0][VOOW] + l1*v[1][VOOW] + l2*v[2][VOOW];
+                LOGI("probe (%4d,%4d) w=%9.1f tex=%08X mode=%d func=%d "
+                     "mask=%d order=%u",
+                     (int)px, (int)py, oow > 0.0f ? 1.0 / oow : -1.0,
+                     (uint32_t)(uintptr_t)g_tex_data, g_depth_mode,
+                     g_depth_func, g_depth_mask, ++g_probe_hits);
+            }
+        }
+    }
+
+    /* Report each distinct depth state once.    /* Report each distinct depth state once. COMPARE_TO_BIAS is handled as
+     * GL_ALWAYS below, which is right for the full-viewport quad the game
+     * clears with but would make anything else draw unconditionally, so it
+     * matters which geometry actually asks for it. */
+    {
+        static uint32_t seen[64], nseen;
+        uint32_t key = (uint32_t)(g_depth_mode * 1000 + g_depth_func * 100
+                                  + (g_depth_mask ? 10 : 0))
+                     + (g_depth_bias ? 1u : 0u);
+        uint32_t k;
+        for (k = 0; k < nseen; k++) if (seen[k] == key) break;
+        if (k == nseen && nseen < 64) {
+            seen[nseen++] = key;
+            LOGI("glide: depth state #%u: mode=%d func=%d mask=%d bias=%u"
+                 "%s", nseen, g_depth_mode, g_depth_func, g_depth_mask,
+                 g_depth_bias,
+                 (g_depth_mode == 3 || g_depth_mode == 4)
+                     ? "   <-- COMPARE_TO_BIAS, drawn with GL_ALWAYS" : "");
+        }
+    }
+
     glDepthMask(g_depth_mask ? GL_TRUE : GL_FALSE);
     if (g_depth_mode) { glEnable(GL_DEPTH_TEST);
                         glDepthFunc(depth_func_gl(g_depth_func)); }
@@ -811,7 +867,12 @@ static uint32_t gl_draw_triangle(uint32_t *a)
             mode = (g_cc_factor == 8) ? 2 : 1;
         p_glUseProgram(g_prog);
         p_glUniform1i(g_u_texmode, mode);
-        p_glUniform1i(g_u_alphatest, mode ? 1 : 0);
+        /* --glidedebug 16: no alpha test. If the leak disappears, terrain
+         * fragments are being keyed away -- they then write neither colour
+         * nor depth, and whatever sits behind them shows through, which no
+         * amount of depth correctness can prevent. */
+        p_glUniform1i(g_u_alphatest,
+                      (mode && g_glidedebug != 16) ? 1 : 0);
         p_glUniform1f(g_u_wfar, G_WFAR);
         if (g_fog_mode == 2 && g_fog_valid) {
             float fr, fg, fb;
@@ -1234,7 +1295,13 @@ static uint32_t gl_buffer_swap(uint32_t *a)
         static int done;
         Uint32 now = SDL_GetTicks();
         if (!t0) t0 = now;
+        if (g_probe_now) {                 /* one frame only */
+            g_probe_now = 0;
+            LOGI("probe %d,%d: %u triangles covered this pixel",
+                 g_probe_x, g_probe_y, g_probe_hits);
+        }
         if (!done && now - t0 >= (Uint32)g_dumpsec * 1000) {
+            if (g_probe_x >= 0) { g_probe_now = 1; g_probe_hits = 0; }
             static GLfloat  d[GLIDE_W * GLIDE_H];
             static uint16_t g[GLIDE_W * GLIDE_H];
             const char *dir = "C:/Users/martin/AppData/Local/Temp/claude/"

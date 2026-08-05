@@ -446,6 +446,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cdraw") && i + 1 < argc)
             g_cdraw = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cdrawscan")) g_cdrawscan = 1;
+        else if (!strcmp(argv[i], "--probe") && i + 2 < argc) {
+            g_probe_x = atoi(argv[++i]); g_probe_y = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--dumpsec") && i + 1 < argc)
+            g_dumpsec = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--glidedebug") && i + 1 < argc)
             g_glidedebug = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--glidetrace") && i + 1 < argc)
