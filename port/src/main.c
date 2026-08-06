@@ -546,10 +546,10 @@ int main(int argc, char **argv)
     /* Replaces the Miles driver stack with our own mixer. Must come after
      * relocation, since the hooks are written into the loaded image. */
     audio_init();
-    if (!g_glide_mode) {
-        audio_select_image(g_mode == MODE_DESKTOP);
-        audio_install_hooks();
-    }
+    audio_select_image(g_mode == MODE_DESKTOP ? AUDIO_IMAGE_DESKTOP
+                     : g_mode == MODE_FIGHT3  ? AUDIO_IMAGE_FIGHT3
+                                              : AUDIO_IMAGE_FIGHT);
+    audio_install_hooks();
 
     /* Object 1 is code. It needs to stay writable as well as executable: the
      * startup patches selector values into its own instruction stream. */

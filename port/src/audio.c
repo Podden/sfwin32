@@ -71,8 +71,20 @@ static const uint32_t g_ail_desktop[A_COUNT] = {
     0x00045DE0u, 0x00045C10u, 0x00045750u, 0x000447A0u
 };
 
+/* The 3dfx build links the same Miles library at a different address. Derived
+ * the same way -- each function named by the AIL_ format string it pushes --
+ * and then cross-checked: all 15 gaps between consecutive entries match
+ * FIGHT.EXE's exactly, and the whole table is a constant 0x10920 above it. */
+static const uint32_t g_ail_fight3[A_COUNT] = {
+    0x000527E0u, 0x00052620u, 0x00052520u, 0x00052350u,
+    0x000522A0u, 0x000520B0u, 0x00051FE0u, 0x00051F30u,
+    0x00051D20u, 0x00051C60u, 0x00051BA0u, 0x00051AE0u,
+    0x00051A20u, 0x00051850u, 0x00051390u, 0x000503E0u
+};
+
 static const uint32_t *g_ail = g_ail_fight;
-static int             g_is_desktop;
+static const char     *g_ail_name = "fight";
+static int             g_image = AUDIO_IMAGE_FIGHT;
 
 /* Documented Miles status flags (MSS.H). SMP_DONE is "sample has finished
  * playing, or has never been started" -- the value the game tests for at
@@ -897,10 +909,14 @@ int audio_init(void)
     return 1;
 }
 
-void audio_select_image(int desktop)
+void audio_select_image(int image)
 {
-    g_ail = desktop ? g_ail_desktop : g_ail_fight;
-    g_is_desktop = desktop;
+    g_image = image;
+    switch (image) {
+    case AUDIO_IMAGE_DESKTOP: g_ail = g_ail_desktop; g_ail_name = "desktop"; break;
+    case AUDIO_IMAGE_FIGHT3:  g_ail = g_ail_fight3;  g_ail_name = "fight3";  break;
+    default:                  g_ail = g_ail_fight;   g_ail_name = "fight";   break;
+    }
 }
 
 void audio_install_hooks(void)
@@ -927,22 +943,29 @@ void audio_install_hooks(void)
     for (i = 0; i < (int)(sizeof tbl / sizeof tbl[0]); i++)
         hook(g_ail[tbl[i].e], tbl[i].fn, tbl[i].name);
     LOGI("audio: %d Miles entry points hooked (%s table)",
-         (int)(sizeof tbl / sizeof tbl[0]), g_is_desktop ? "desktop" : "fight");
+         (int)(sizeof tbl / sizeof tbl[0]), g_ail_name);
 
     /* The voice-pool detour is a game-code address, not a Miles one, and was
      * located in FIGHT.EXE specifically. DESKTOP.EXE plays speech and
      * interface sounds rather than a battle's worth of overlapping effects,
      * so it has no need of a raised pool and gets no unverified patch. */
-    if (!g_is_desktop) {
+    if (g_image == AUDIO_IMAGE_FIGHT) {
         g_pool_resume = (uint32_t)(uintptr_t)gp(VOICE_POOL_FN) + 5;
         hook(VOICE_POOL_FN, voice_pool_thunk, "voice pool setup");
         LOGI("audio: voice pool raised to %d (game asks for %s)",
              g_want_voices, "NumOfVoices from CONFIG.DES");
-    } else {
+    } else if (g_image == AUDIO_IMAGE_DESKTOP) {
         hook(AIL_LOAD_SAMPLE_BUFFER_DESKTOP, h_load_sample_buffer,
              "AIL_load_sample_buffer");
         hook(AIL_SAMPLE_BUFFER_READY_DESKTOP, h_sample_buffer_ready,
              "AIL_sample_buffer_ready");
+    } else {
+        /* Both of the above are game-code addresses found in one specific
+         * image, not Miles entry points, so neither is valid in the 3dfx
+         * link. Its Miles hooks stand on their own: the voice pool stays at
+         * whatever CONFIG.DES asks for, and streamed audio -- if this build
+         * streams at all -- would need its own two addresses derived. */
+        LOGI("audio: fight3 uses the Miles hooks only, no per-image patches");
     }
 }
 

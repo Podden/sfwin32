@@ -170,7 +170,10 @@ extern int      g_vid_active;
  * after the image is loaded and relocated. */
 int  audio_init(void);
 /* Picks the per-image AIL address table. Must precede audio_install_hooks. */
-void audio_select_image(int desktop);
+#define AUDIO_IMAGE_FIGHT   0
+#define AUDIO_IMAGE_DESKTOP 1
+#define AUDIO_IMAGE_FIGHT3  2
+void audio_select_image(int image);
 void audio_install_hooks(void);
 void audio_shutdown(void);
 
