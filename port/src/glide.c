@@ -56,6 +56,7 @@ int g_probe_x = -1, g_probe_y = -1;
 static int g_probe_now;
 static uint32_t g_probe_hits;
 static uint32_t g_ps_in, g_ps_out, g_ps_zfail, g_ps_chroma;
+static uint32_t g_tris_after_lfb;
 int g_dumpsec;                  /* --dumpsec N: grab both buffers N s in */
 int g_glidetrace;               /* --glidetrace N: trace frame N only       */
 
@@ -383,11 +384,18 @@ static const char *g_fs_src =
     "uniform int   uFog;\n"
     "uniform vec3  uFogColor;\n"
     "uniform float uWFar;\n"
+    "uniform int   uBackdrop;\n"
     "void main()\n"
     "{\n"
     "    float oow = gl_TexCoord[0].q;\n"
     "    float w   = oow > 0.0 ? 1.0 / oow : uWFar;\n"
-    "    gl_FragDepth = clamp(w / uWFar, 0.0, 1.0);\n"
+    /* The backdrop owns the far plane, so everything else must land in front
+     * of it. The game clamps w at 65536 but draws its backdrop quad at 65535,
+     * one unit nearer -- so clamped terrain sorts BEHIND the backdrop, fails
+     * GR_CMP_LESS and is discarded, holing the horizon. Anything drawn there
+     * earlier survives in the hole, which reads as an object the terrain
+     * failed to occlude, and only where terrain reaches the far plane. */
+    "    gl_FragDepth = uBackdrop != 0 ? 1.0 : min(w / uWFar, 0.99997);\n"
     "    vec4 c;\n"
     "    if (uTexMode == 0) {\n"
     "        c = gl_Color;\n"
@@ -427,6 +435,7 @@ static void   (APIENTRY *p_glUniform3f)(GLint, GLfloat, GLfloat, GLfloat);
 
 static GLuint g_prog;
 static GLint  g_u_texmode, g_u_alphatest, g_u_fog, g_u_fogcolor, g_u_wfar;
+static GLint  g_u_backdrop;
 
 static GLuint shader_build(GLenum type, const char *src)
 {
@@ -504,6 +513,7 @@ static void shader_init(void)
     g_u_fog       = p_glGetUniformLocation(g_prog, "uFog");
     g_u_fogcolor  = p_glGetUniformLocation(g_prog, "uFogColor");
     g_u_wfar      = p_glGetUniformLocation(g_prog, "uWFar");
+    g_u_backdrop  = p_glGetUniformLocation(g_prog, "uBackdrop");
     LOGI("glide: w-buffer shader active; depth is linear in w to %.0f",
          (double)G_WFAR);
 }
@@ -712,6 +722,17 @@ static uint32_t gl_draw_triangle(uint32_t *a)
     int i, bias_mode;
 
     g_tris++;
+    /* Does the game draw 3D *after* touching the frame buffer? If it does,
+     * the read-back/blit round trip loses it: the snapshot taken at the lock
+     * is blitted over everything at swap, so any later geometry vanishes from
+     * the image while the depth buffer still says it was drawn. */
+    if (g_lfb_dirty) {
+        g_tris_after_lfb++;
+        if (g_tris_after_lfb == 1 || (g_tris_after_lfb % 20000) == 0)
+            LOGW("glide: %u triangles drawn AFTER an LFB lock (frame %u) -- "
+                 "these are lost by the read-back blit",
+                 g_tris_after_lfb, g_glide_frame);
+    }
     {   /* Rough area, which is all a fill-rate sample needs. */
         const float *q0 = (const float *)(uintptr_t)a[0];
         const float *q1 = (const float *)(uintptr_t)a[1];
@@ -754,6 +775,20 @@ static uint32_t gl_draw_triangle(uint32_t *a)
      * surface that won; this shows what else was submitted at that pixel and
      * what depth each one claimed, which is the only way to tell "the
      * occluder was never drawn" from "the occluder lost the test". */
+    /* During a traced frame, report the depth span of every triangle: a
+     * change of near/far handling between terrain and objects would show up
+     * here as a discontinuity that no state call announces. */
+    if (g_glidetrace > 0 && (uint32_t)g_glidetrace == g_glide_frame) {
+        float w0 = v[0][VOOW] > 0.0f ? 1.0f / v[0][VOOW] : -1.0f;
+        float w1 = v[1][VOOW] > 0.0f ? 1.0f / v[1][VOOW] : -1.0f;
+        float w2 = v[2][VOOW] > 0.0f ? 1.0f / v[2][VOOW] : -1.0f;
+        LOGI("   tri w=%.1f/%.1f/%.1f  xy=(%.0f,%.0f)(%.0f,%.0f)(%.0f,%.0f)  "
+             "tex=%08X rgb=%.0f,%.0f,%.0f mode=%d func=%d",
+             w0, w1, w2, v[0][VX], v[0][VY], v[1][VX], v[1][VY],
+             v[2][VX], v[2][VY], (uint32_t)(uintptr_t)g_tex_data,
+             v[0][VR], v[0][VG], v[0][VB], g_depth_mode, g_depth_func);
+    }
+
     if (g_probe_now) {
         float x0 = v[0][VX], y0 = v[0][VY], x1 = v[1][VX], y1 = v[1][VY];
         float x2 = v[2][VX], y2 = v[2][VY];
@@ -874,6 +909,7 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         p_glUniform1i(g_u_alphatest,
                       (mode && g_glidedebug != 16) ? 1 : 0);
         p_glUniform1f(g_u_wfar, G_WFAR);
+        p_glUniform1i(g_u_backdrop, bias_mode ? 1 : 0);
         if (g_fog_mode == 2 && g_fog_valid) {
             float fr, fg, fb;
             glide_unpack(g_fog_color, &fr, &fg, &fb);
@@ -1518,10 +1554,10 @@ uint32_t __cdecl glide_call(uint32_t idx, uint32_t *args)
     want = g_glidetrace > 0 ? (uint32_t)g_glidetrace == g_glide_frame
                             : im->calls == 1;
     if (want) {
-        char buf[160];
+        char buf[512];
         uint32_t n = im->argbytes / 4, i;
         int off = _snprintf(buf, sizeof buf, "glide: %s(", im->name);
-        if (n > 6) n = 6;
+        if (n > 16) n = 16;                 /* all of them, not the first 6 */
         for (i = 0; i < n && off > 0 && off < (int)sizeof buf; i++)
             off += _snprintf(buf + off, sizeof buf - off, "%s0x%X",
                              i ? ", " : "", args[i]);
