@@ -301,19 +301,22 @@ static void apply_patches(void)
  *
  * So all real state crosses the process boundary through those files, and
  * the supervisor's own job is small and entirely observable from outside:
- * run desktop, and if it exits with the code that means "a mission was
- * chosen" (2, confirmed), run fight next; when fight exits, go back to
- * desktop. Any other desktop exit code is treated as the player quitting
- * from the menu, ending the chain. FIGHT.EXE's own exit codes have not been
- * catalogued yet, so nothing is gated on them -- the return trip always
- * happens, per the one thing that was asked of this mode explicitly.
+ * run whichever half the last child's exit code names. That table is not
+ * guessed: SF.EXE is a 16-bit DOS binary containing the strings cold, warm,
+ * ice, autosave, solo, desktop and fight, and its dispatch was read directly
+ * out of it -- see chain_supervisor. It also settles which argument follows
+ * a mission, which is the whole reason this matters: FIGHT.EXE chooses, and
+ * the supervisor's job is to pass that choice on rather than override it.
+ *
+ * One independent check on that reading: this port had already confirmed by
+ * observation that DESKTOP.EXE exits with 2 when a mission is chosen, and
+ * SF.EXE's table maps exactly 2 to `fight solo`.
  *
  * fightport.exe's own state -- SDL's window/renderer, the audio device, the
  * vectored exception handler, the timer thread -- is not designed to be torn
  * down and rebuilt for a different image within one process, so each half
  * runs as a separate OS process, exactly as the original two binaries did. */
 
-#define CHAIN_MISSION_EXIT_CODE 2
 
 static void append_arg(char *cmd, size_t cap, const char *arg)
 {
@@ -331,7 +334,7 @@ static void append_arg(char *cmd, size_t cap, const char *arg)
  * means the chain does not need its own copy of every option main() already
  * understands -- only --chain and --mode are ours to decide here. */
 static int run_child(const char *self_path, int argc, char **argv,
-                      const char *mode)
+                      const char *mode, const char *args)
 {
     char cmd[4096];
     STARTUPINFOA si;
@@ -344,10 +347,13 @@ static int run_child(const char *self_path, int argc, char **argv,
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--chain")) continue;
         if (!strcmp(argv[i], "--mode")) { i++; continue; }  /* ours to set */
+        if (!strcmp(argv[i], "--args")) { i++; continue; }  /* ...and this  */
         append_arg(cmd, sizeof cmd, argv[i]);
     }
     append_arg(cmd, sizeof cmd, "--mode");
     append_arg(cmd, sizeof cmd, mode);
+    append_arg(cmd, sizeof cmd, "--args");
+    append_arg(cmd, sizeof cmd, args);
 
     printf("[chain] %s\n", cmd);
 
@@ -361,13 +367,14 @@ static int run_child(const char *self_path, int argc, char **argv,
     WaitForSingleObject(pi.hProcess, INFINITE);
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess);
-    printf("[chain] mode %s exited with code %lu\n", mode, code);
+    printf("[chain] %s %s exited with code %lu\n", mode, args, code);
     return (int)code;
 }
 
 static int chain_supervisor(int argc, char **argv)
 {
     char self_path[MAX_PATH];
+    const char *mode, *args;
     int code;
 
     /* Each child runs for minutes at a time, and stdio fully buffers stdout
@@ -381,16 +388,42 @@ static int chain_supervisor(int argc, char **argv)
         return 1;
     }
 
+    /* SF.EXE's own handoff table, read out of its 16-bit code rather than
+     * guessed at. It is a single loop driven entirely by the child's exit
+     * code -- not an alternation between the two halves -- and the first
+     * launch is `desktop ice`, not `desktop cold`:
+     *
+     *     00B7  mov ax,"ice"   00BB  mov ax,"desktop"   00C3  call spawn
+     *     00CB  jle quit                      (code <= 0)
+     *     00D0  jge quit                      (code >= 100)
+     *     00DC  jmp cs:[bx*2+8]               table on code-1:
+     *              1 -> desktop warm     3 -> desktop cold
+     *              2 -> fight   solo     4 -> desktop autosave
+     *
+     * So which argument follows a mission is FIGHT.EXE's decision, carried
+     * in its exit code, and that is the whole point: 1 resumes the station
+     * warm and 4 restores the autosave, while 3 is the only one that goes
+     * back to the start menu. Passing "cold" unconditionally, as this did,
+     * discarded that choice and sent the player to the menu every time. */
+    mode = "desktop";
+    args = "ice";
     for (;;) {
-        code = run_child(self_path, argc, argv, "desktop");
-        if (code != CHAIN_MISSION_EXIT_CODE) {
-            printf("[chain] desktop exit code %d is not the mission-selected "
-                   "code (%d); treating as quit\n",
-                   code, CHAIN_MISSION_EXIT_CODE);
+        code = run_child(self_path, argc, argv, mode, args);
+        if (code <= 0 || code >= 100) {
+            printf("[chain] exit code %d ends the chain\n", code);
             return 0;
         }
-        run_child(self_path, argc, argv, "fight");
-        printf("[chain] back to desktop\n");
+        switch (code) {
+        case 1: mode = "desktop"; args = "warm";     break;
+        case 2: mode = "fight";   args = "solo";     break;
+        case 3: mode = "desktop"; args = "cold";     break;
+        case 4: mode = "desktop"; args = "autosave"; break;
+        default:
+            printf("[chain] exit code %d is not in the table; stopping\n",
+                   code);
+            return 0;
+        }
+        printf("[chain] -> %s %s\n", mode, args);
     }
 }
 
