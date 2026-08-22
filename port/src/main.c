@@ -37,6 +37,7 @@ static void usage(const char *argv0)
     printf("usage: %s [--chain] [--mode fight|desktop] [--exe IMAGE]\n"
            "          [--assets DIR] [--args ARGV1] [--patch ADDR=HEXBYTES]\n"
            "          [--watch ADDR] [--dumpkeys] [--calltrace] [--trace]\n"
+           "          [--nograb]\n"
            "\n"
            "  --chain  play through both halves the way SF.EXE originally\n"
            "           did: run desktop, and when it exits with the code\n"
@@ -467,6 +468,7 @@ int main(int argc, char **argv)
             g_pixfmt_555 = !strcmp(argv[++i], "555");
         else if (!strcmp(argv[i], "--dumpvram") && i + 1 < argc)
             g_dumpvram_frames = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--nograb")) g_mouse_grab = 0;
         else if (!strcmp(argv[i], "--dumpkeys")) g_dump_keys = 1;
         else if (!strcmp(argv[i], "--autokeys") && i + 1 < argc)
             g_autokeys = atoi(argv[++i]);

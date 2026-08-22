@@ -141,6 +141,11 @@ int  vbe_dispatch(CONTEXT *c);
 /* --pixfmt 555: interpret a 16bpp framebuffer as 5:5:5 instead of 5:6:5. */
 extern int g_pixfmt_555;
 
+/* --nograb: leave the host pointer alone. On by default -- the game steers
+ * its own cursor from relative motion, so without a capture the host pointer
+ * runs into the edge of the screen while the game's is still mid-travel. */
+extern int g_mouse_grab;
+
 /* --autokeys N: synthesise a keypress every N ms so runs need no operator.
  * Zero (the default) leaves input entirely to the user. */
 extern int g_autokeys;
@@ -254,6 +259,7 @@ void mouse_sdl_motion(int dx, int dy);      /* deltas in game pixels */
 void mouse_sdl_button(int button, int pressed);
 void mouse_sdl_release_all(void);
 int  mouse_cursor_visible(void);
+int  mouse_driver_installed(void);
 
 /* int 33h function 0x0C event handler. DESKTOP.EXE never polls for position,
  * so the pointer only moves if the driver calls back into the game. Delivered

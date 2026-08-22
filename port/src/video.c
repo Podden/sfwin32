@@ -82,6 +82,124 @@ static void render_frame(void);
 static void queue_key(SDL_Scancode sc, int pressed);
 static void release_all_keys(const char *why);
 
+/* ------------------------------------------------- window geometry state
+ *
+ * The two halves of the game are two processes, so a window opened by fight
+ * knows nothing about where desktop left its own. Switching between them
+ * threw the window back to the centre at the default size every time, which
+ * is most of a mission's worth of re-arranging for anyone not playing at the
+ * default. The geometry therefore outlives the process, in a small file
+ * beside the executable -- beside it rather than in the current directory,
+ * because the game chdir's into its asset tree and the two halves would
+ * otherwise disagree about where the file is.
+ *
+ * Only the restored geometry is stored. While a window is maximised SDL
+ * reports the maximised rectangle, so saving that would lose the size to go
+ * back to; the maximised state is a flag alongside it instead.
+ */
+typedef struct { int x, y, w, h, maximized, valid; } win_state;
+
+static win_state g_ws;
+int g_mouse_grab = 1;
+static int g_grab_released;          /* toggled by the release hotkey */
+/* Set by video_shutdown on the game thread. The SDL thread polls the window
+ * every iteration, so it has to stop doing that before anything is torn
+ * down. */
+static volatile LONG g_vid_stopping;
+#define GRAB_KEY_NAME "Scroll Lock"
+
+static void video_update_grab(void);
+
+static void win_state_path(char *buf, size_t cap)
+{
+    char *slash;
+    buf[0] = 0;
+    if (!GetModuleFileNameA(NULL, buf, (DWORD)cap)) return;
+    slash = strrchr(buf, '\\');
+    if (slash) slash[1] = 0;
+    strncat(buf, "fightport.window", cap - strlen(buf) - 1);
+}
+
+static void win_state_load(void)
+{
+    char path[MAX_PATH + 32];
+    FILE *f;
+    win_state t;
+    win_state_path(path, sizeof path);
+    if (!path[0] || (f = fopen(path, "r")) == NULL) {
+        LOGI("no saved window state at %s", path[0] ? path : "(unknown)");
+        return;
+    }
+    if (fscanf(f, "%d %d %d %d %d", &t.x, &t.y, &t.w, &t.h, &t.maximized) == 5
+        && t.w >= 320 && t.h >= 240 && t.w <= 16384 && t.h <= 16384) {
+        t.valid = 1;
+        g_ws = t;
+        LOGI("window state restored: %d,%d %dx%d%s", t.x, t.y, t.w, t.h,
+             t.maximized ? " maximized" : "");
+    }
+    fclose(f);
+}
+
+static void win_state_save(void)
+{
+    char path[MAX_PATH + 32];
+    FILE *f;
+    if (!g_ws.valid) return;
+    win_state_path(path, sizeof path);
+    if (!path[0] || (f = fopen(path, "w")) == NULL) return;
+    fprintf(f, "%d %d %d %d %d\n", g_ws.x, g_ws.y, g_ws.w, g_ws.h,
+            g_ws.maximized);
+    fclose(f);
+}
+
+/* Called for every move/resize. A maximised window reports its maximised
+ * rectangle, which is not what should be restored, so it only updates the
+ * flag. */
+static void win_state_track(void)
+{
+    Uint32 fl;
+    if (!g_win) return;
+    fl = SDL_GetWindowFlags(g_win);
+    g_ws.maximized = (fl & SDL_WINDOW_MAXIMIZED) ? 1 : 0;
+    if (!g_ws.maximized) {
+        SDL_GetWindowPosition(g_win, &g_ws.x, &g_ws.y);
+        SDL_GetWindowSize(g_win, &g_ws.w, &g_ws.h);
+    }
+    g_ws.valid = 1;
+}
+
+/* --------------------------------------------------------- mouse capture */
+/* The game draws its own cursor from int 33h state and steers it from
+ * relative motion, so SDL relative mode -- which hides the host pointer and
+ * frees it from the screen edges -- is what makes the two agree. DESKTOP.EXE
+ * is the one that needs it: without a capture the host pointer hits the edge
+ * of the screen while the game's own is still mid-travel, and the two drift
+ * apart for good.
+ *
+ * Only grab once the game has actually installed int 33h; before that there
+ * is nothing being steered and holding the pointer would just be rude. */
+static void video_update_grab(void)
+{
+    static int shown = -1;
+    int want;
+    if (!g_win || !g_mouse_grab) return;
+    want = !g_grab_released && mouse_driver_installed() &&
+           (SDL_GetWindowFlags(g_win) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    if (want != (SDL_GetRelativeMouseMode() == SDL_TRUE))
+        SDL_SetRelativeMouseMode(want ? SDL_TRUE : SDL_FALSE);
+
+    /* A captured pointer cannot reach the title bar, so the way back out has
+     * to be advertised somewhere the user will actually look. */
+    if (want != shown) {
+        SDL_SetWindowTitle(g_win,
+                           want ? "Schleichfahrt (ASMPort)  --  " GRAB_KEY_NAME
+                                  " releases the mouse"
+                                : "Schleichfahrt (ASMPort)  --  " GRAB_KEY_NAME
+                                  " captures the mouse");
+        shown = want;
+    }
+}
+
 static DWORD WINAPI vid_thread_main(LPVOID arg)
 {
     (void)arg;
@@ -106,10 +224,15 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
         SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
         SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
     }
+    win_state_load();
     g_win = SDL_CreateWindow("Schleichfahrt (ASMPort)",
-                             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                             g_vid_w * 2, g_vid_h * 2,
+                             g_ws.valid ? g_ws.x : SDL_WINDOWPOS_CENTERED,
+                             g_ws.valid ? g_ws.y : SDL_WINDOWPOS_CENTERED,
+                             g_ws.valid ? g_ws.w : g_vid_w * 2,
+                             g_ws.valid ? g_ws.h : g_vid_h * 2,
                              SDL_WINDOW_RESIZABLE |
+                             (g_ws.valid && g_ws.maximized
+                                  ? SDL_WINDOW_MAXIMIZED : 0) |
                              (g_glide_mode ? SDL_WINDOW_OPENGL : 0));
     if (!g_glide_mode) {
         g_ren = g_win ? SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED)
@@ -128,12 +251,30 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
 
     for (;;) {
         SDL_Event e;
+        /* Once the game thread has begun shutting down, do nothing at all --
+         * it has already closed the log and is about to call ExitProcess. */
+        if (g_vid_stopping) { Sleep(10); continue; }
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) g_quit = 1;
             else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
                 /* Alt+F4 / the close button quit; the game gets every key,
                  * including F12, so nothing is stolen from it. */
                 if (e.key.repeat) continue;      /* the hardware has no repeat */
+                /* Scroll Lock, or Ctrl+Alt+G where there is no Scroll Lock,
+                 * hands the pointer back so the window can be moved, resized
+                 * or maximised. Swallowed rather than queued -- it is the one
+                 * key the game does not get. */
+                if (e.key.keysym.scancode == SDL_SCANCODE_SCROLLLOCK ||
+                    (e.key.keysym.scancode == SDL_SCANCODE_G &&
+                     (e.key.keysym.mod & KMOD_CTRL) &&
+                     (e.key.keysym.mod & KMOD_ALT))) {
+                    if (e.type == SDL_KEYDOWN) {
+                        g_grab_released = !g_grab_released;
+                        LOGI("mouse %s by hotkey",
+                             g_grab_released ? "released" : "captured");
+                    }
+                    continue;
+                }
                 LOGT("SDL key %s scancode=%d",
                      e.type == SDL_KEYDOWN ? "down" : "up",
                      (int)e.key.keysym.scancode);
@@ -154,6 +295,12 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
             }
             else if (e.type == SDL_WINDOWEVENT) {
                 LOGT("SDL window event %d", (int)e.window.event);
+                /* Hold the pointer only while the window has focus, or
+                 * alt-tabbing away would leave it trapped. */
+                if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+                    video_update_grab();
+                else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                    SDL_SetRelativeMouseMode(SDL_FALSE);
                 /* Deliberately not LEAVE: the mouse leaving the window is
                  * normal during play and must not drop held keys. */
                 if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
@@ -163,8 +310,11 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                 }
             }
         }
+        win_state_track();
+        video_update_grab();
         if (g_quit) {
             LOGI("window closed; shutting down");
+            win_state_save();
             glide_summary();
             todo_dump();
             calltrace_dump();
@@ -178,7 +328,12 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                                       SDL_TEXTUREACCESS_STREAMING,
                                       g_vid_w, g_vid_h);
             SDL_RenderSetLogicalSize(g_ren, g_vid_w, g_vid_h);
-            SDL_SetWindowSize(g_win, g_vid_w * 2, g_vid_h * 2);
+            /* Only size the window when there is nothing to honour. The
+             * logical size already scales the picture, so resizing here too
+             * would undo a restored geometry on every mode change -- and
+             * desktop sets a mode during startup. */
+            if (!g_ws.valid)
+                SDL_SetWindowSize(g_win, g_vid_w * 2, g_vid_h * 2);
         }
         /* --autokeys N: press something every N milliseconds so a run can be
          * driven unattended. The desktop sits on its main menu until a key
@@ -241,11 +396,19 @@ int video_init(void)
 
 void video_shutdown(void)
 {
-    if (g_tex) SDL_DestroyTexture(g_tex);
-    if (g_ren) SDL_DestroyRenderer(g_ren);
-    if (g_win) SDL_DestroyWindow(g_win);
-    g_tex = NULL; g_ren = NULL; g_win = NULL;
-    SDL_Quit();
+    /* The normal exit for both halves of the chain comes through here, not
+     * through the close button, so this is what actually carries the geometry
+     * across a handoff. This runs on the game thread, so it only writes out
+     * what the SDL thread has already measured -- it does not ask SDL. */
+    InterlockedExchange(&g_vid_stopping, 1);
+    win_state_save();
+
+    /* Deliberately no SDL teardown. The SDL thread is still running and
+     * polls the window every iteration; destroying it from this thread
+     * faulted that thread mid-call, and the fault -- not the handoff code --
+     * became the process exit code, which ended the chain instead of
+     * launching the other half. ExitProcess follows immediately in
+     * emu_request_exit, so the OS reclaims all of it anyway. */
 }
 
 static void ensure_texture(void)

@@ -138,6 +138,11 @@ void mouse_sdl_release_all(void)
 
 int mouse_cursor_visible(void) { return g_installed && g_cursor_shown >= 0; }
 
+/* Whether the game has taken the mouse at all. video.c holds the pointer
+ * inside the window only while this is true: before int 33h is installed
+ * there is nothing to steer, and trapping the cursor then would be rude. */
+int mouse_driver_installed(void) { return g_installed; }
+
 /* ------------------------------------------------- event handler callback
  *
  * DESKTOP.EXE never polls function 0x03. It installs a handler with function
