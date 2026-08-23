@@ -115,6 +115,10 @@ uint32_t dos_get_ivec(int vec) { return g_ivec[vec & 0xFF]; }
 
 /* ------------------------------------------------------------- int 21h */
 
+/* Defined with the rest of the DOS console input queue further down. */
+static int dos_key_pending(void);
+static int dos_key_pop(void);
+
 int dos_int21(CONTEXT *c)
 {
     uint8_t ah = (uint8_t)(c->Eax >> 8);
@@ -335,10 +339,54 @@ int dos_int21(CONTEXT *c)
         set_cf(c, 0);
         return 1;
 
-    case 0x01: case 0x08: case 0x0B:   /* console input: never any */
+    case 0x0B:      /* check standard input status */
+        c->Eax = (c->Eax & 0xFFFFFF00u) | (dos_key_pending() ? 0xFF : 0x00);
+        set_cf(c, 0);
+        return 1;
+
+    case 0x01:      /* console input with echo    */
+    case 0x07:      /* direct console input, raw  */
+    case 0x08: {    /* console input, no echo     */
+        int ch = dos_key_pop();
+        if (ch < 0) {
+            /* These block in DOS. Blocking here would freeze the game thread
+             * -- and with it the timer and mouse, which are delivered from
+             * inside the fault handler -- so rewind to the int instruction
+             * instead. The game re-issues it, faults again, and every other
+             * interrupt keeps being serviced in between. Same spin the game
+             * already does on AH=0Bh, just one instruction wider. */
+            c->Eip -= 2;                       /* CD 21, never prefixed */
+            return 1;
+        }
+        c->Eax = (c->Eax & 0xFFFFFF00u) | (uint32_t)ch;
+        set_cf(c, 0);
+        return 1;
+    }
+
+    case 0x06:      /* direct console I/O: DL=FF reads, anything else writes */
+        if ((c->Edx & 0xFF) == 0xFF) {
+            int ch = dos_key_pop();
+            c->Eax = (c->Eax & 0xFFFFFF00u) | (uint32_t)(ch < 0 ? 0 : ch);
+            /* ZF set means "no character", which is how this call reports an
+             * empty buffer -- it never blocks. */
+            if (ch < 0) c->EFlags |=  0x40u;
+            else        c->EFlags &= ~0x40u;
+        }
+        set_cf(c, 0);
+        return 1;
+
+    case 0x0C: {    /* flush input buffer, then run the function in AL */
+        uint8_t fn = (uint8_t)(c->Eax & 0xFF);
+        while (dos_key_pop() >= 0) { }
+        if (fn == 0x01 || fn == 0x06 || fn == 0x07 || fn == 0x08) {
+            c->Eax = (c->Eax & 0xFFFF0000u) | ((uint32_t)fn << 8);
+            c->Eip -= 2;                       /* re-enter with AH = fn */
+            return 1;
+        }
         c->Eax &= 0xFFFFFF00u;
         set_cf(c, 0);
         return 1;
+    }
 
     case 0x09:      /* print $-terminated string */
         set_cf(c, 0);
@@ -572,6 +620,43 @@ void kbd_push_scancode(uint8_t sc)
 int kbd_pending(void)
 {
     return g_kbd_head != g_kbd_tail;
+}
+
+/* ------------------------------------------------- DOS console input ---- */
+/* DESKTOP.EXE has two keyboard front ends and picks between them with a mode
+ * word: its own int 9 ISR, which translates scancodes through built-in
+ * tables, and DOS console input via int 21h. Text entry -- naming a savegame
+ * -- switches to the DOS path, which is the sensible choice for a German
+ * game, since DOS returns characters for the actual keyboard layout while the
+ * ISR's tables are fixed. These three functions used to answer "no character,
+ * ever", so every text field in DESKTOP.EXE was dead: the game sat in a tight
+ * int 21h AH=0Bh poll (millions of faults parked on the instruction after it)
+ * and never saw a key.
+ *
+ * The characters come from SDL text input rather than from the scancode ring
+ * above -- that ring belongs to the game's own ISR, and taking bytes out of
+ * it would break the other front end. */
+static volatile uint8_t g_dos_key[64];
+static volatile int g_dos_head, g_dos_tail;
+
+void dos_key_push(uint8_t ch)
+{
+    int n = (g_dos_tail + 1) % (int)sizeof g_dos_key;
+    if (n == g_dos_head) return;               /* full: drop */
+    g_dos_key[g_dos_tail] = ch;
+    _ReadWriteBarrier();
+    g_dos_tail = n;
+}
+
+static int dos_key_pending(void) { return g_dos_head != g_dos_tail; }
+
+static int dos_key_pop(void)
+{
+    int ch;
+    if (g_dos_head == g_dos_tail) return -1;
+    ch = g_dos_key[g_dos_head];
+    g_dos_head = (g_dos_head + 1) % (int)sizeof g_dos_key;
+    return ch;
 }
 
 uint32_t host_ticks_ms(void) { return GetTickCount(); }

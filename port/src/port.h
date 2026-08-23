@@ -275,6 +275,10 @@ int  ioport_out(uint16_t port, int width, uint32_t val);
 extern volatile uint32_t g_joy_reads;
 
 void kbd_push_scancode(uint8_t sc);
+/* Characters for DOS console input (int 21h AH=01/06/07/08/0B/0C). Fed from
+ * SDL text input, which is layout-correct; the scancode ring above belongs to
+ * the game's own int 9 ISR and must not be drained for this. */
+void dos_key_push(uint8_t ch);
 int  kbd_pending(void);
 uint32_t host_ticks_ms(void);
 

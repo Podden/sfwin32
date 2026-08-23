@@ -246,6 +246,10 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
         return 1;
     }
     if (g_ren) SDL_RenderSetLogicalSize(g_ren, g_vid_w, g_vid_h);
+    /* DESKTOP.EXE's text fields read DOS console input, which needs characters
+     * rather than scancodes. Ask for them explicitly rather than relying on
+     * the default. */
+    SDL_StartTextInput();
     InterlockedExchange(&g_vid_ready, 1);
     LOGI("SDL thread up");
 
@@ -278,7 +282,49 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                 LOGT("SDL key %s scancode=%d",
                      e.type == SDL_KEYDOWN ? "down" : "up",
                      (int)e.key.keysym.scancode);
+                /* DOS console input wants characters, and the keys that carry
+                 * no printable text never arrive as SDL_TEXTINPUT -- but a
+                 * name field needs Return and Backspace above all else. */
+                if (e.type == SDL_KEYDOWN) {
+                    switch (e.key.keysym.scancode) {
+                    case SDL_SCANCODE_RETURN:
+                    case SDL_SCANCODE_KP_ENTER: dos_key_push(0x0D); break;
+                    case SDL_SCANCODE_BACKSPACE: dos_key_push(0x08); break;
+                    case SDL_SCANCODE_ESCAPE:    dos_key_push(0x1B); break;
+                    case SDL_SCANCODE_TAB:       dos_key_push(0x09); break;
+                    default: break;
+                    }
+                }
                 queue_key(e.key.keysym.scancode, e.type == SDL_KEYDOWN);
+            }
+            else if (e.type == SDL_TEXTINPUT) {
+                /* SDL has already applied the keyboard layout, so this is the
+                 * only source that gets a German keyboard's letters right.
+                 * The game is a DOS program and expects code page 437, which
+                 * agrees with UTF-8 across ASCII; the umlauts and sharp s are
+                 * the characters a savegame name is actually likely to want,
+                 * so map those rather than dropping them. */
+                static const struct { const char *utf8; uint8_t cp437; } tr[] = {
+                    { "\xc3\xa4", 0x84 }, { "\xc3\xb6", 0x94 },
+                    { "\xc3\xbc", 0x81 }, { "\xc3\x84", 0x8E },
+                    { "\xc3\x96", 0x99 }, { "\xc3\x9c", 0x9A },
+                    { "\xc3\x9f", 0xE1 },
+                };
+                const char *t = e.text.text;
+                int i;
+                LOGT("SDL text input '%s'", e.text.text);
+                while (*t) {
+                    if ((unsigned char)*t < 0x80) {
+                        dos_key_push((uint8_t)*t++);
+                        continue;
+                    }
+                    for (i = 0; i < (int)(sizeof tr / sizeof tr[0]); i++)
+                        if (!strncmp(t, tr[i].utf8, 2)) {
+                            dos_key_push(tr[i].cp437);
+                            break;
+                        }
+                    t += 2;                    /* the range we map is 2-byte */
+                }
             }
             else if (e.type == SDL_MOUSEMOTION) {
                 /* Logical-size scaling is on, so these deltas are already in
