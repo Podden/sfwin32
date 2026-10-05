@@ -58,9 +58,35 @@ static uint32_t g_probe_hits;
 static uint32_t g_ps_in, g_ps_out, g_ps_zfail, g_ps_chroma;
 int g_dumpsec;                  /* --dumpsec N: grab both buffers N s in */
 int g_glidetrace;               /* --glidetrace N: trace frame N only       */
+int g_glidecallers;             /* --glidecallers N: who draws in frame N   */
+
+/* --glidecallers: every distinct chain of game-code return addresses found
+ * on the stack under grDrawTriangle in one frame, with a count. The scan
+ * also picks up stale code pointers, so a chain is a hint, not a proof. */
+static void callers_note(const uint32_t *args, int dump)
+{
+    static struct { uint32_t r[6]; uint32_t n; } tab[512];
+    static int ntab;
+    uintptr_t cs = (uintptr_t)g_img.mem, ce = cs + g_img.code_size;
+    uint32_t r[6] = {0};
+    int i, k, n = 0;
+    if (dump) {
+        for (i = 0; i < ntab; i++)
+            LOGI("callers: %6u x  %08X %08X %08X %08X %08X %08X", tab[i].n,
+                 tab[i].r[0], tab[i].r[1], tab[i].r[2], tab[i].r[3], tab[i].r[4], tab[i].r[5]);
+        ntab = 0;
+        return;
+    }
+    for (k = -1; k < 200 && n < 6; k++)
+        if (args[k] >= cs && args[k] < ce) r[n++] = args[k] - g_img.delta;
+    for (i = 0; i < ntab && memcmp(tab[i].r, r, sizeof r); i++) {}
+    if (i == ntab && ntab < 512) { memcpy(tab[i].r, r, sizeof r); tab[i].n = 0; ntab++; }
+    if (i < ntab) tab[i].n++;
+}
 
 /* script "trace": the frame after next, whatever number it turns out to be */
 void glide_trace_next(void) { g_glidetrace = (int)g_glide_frame + 2; }
+void glide_callers_next(void) { g_glidecallers = (int)g_glide_frame + 2; g_objprobe_frame = g_glide_frame + 2; }
 
 /* Glide's own 16-bit format is 5:6:5, which is also what this port's
  * framebuffer already is, so the linear-frame-buffer calls can hand the game
@@ -1203,6 +1229,7 @@ static uint32_t gl_draw_triangle(uint32_t *a)
     v[0] = (const float *)(uintptr_t)a[0];
     v[1] = (const float *)(uintptr_t)a[1];
     v[2] = (const float *)(uintptr_t)a[2];
+    if (g_objprobe) objprobe_tri(v);
 
     /* --glidedebug: draw every triangle flat, untextured, with no depth or
      * blend, so "is the geometry arriving and transforming correctly" can be
@@ -1437,6 +1464,29 @@ static uint32_t gl_draw_triangle(uint32_t *a)
     }
     glEnd();
     return 0;
+}
+
+/* objprobe.c's replacement models: one Gouraud triangle in screen space
+ * (x, y, oow, r, g, b), through the game's own path -- depth, fog, cockpit
+ * stencil -- untextured and unblended whatever the game last set. */
+void glide_tri_rgb(const float p[3][6])
+{
+    float gv[3][15];
+    uint32_t a[3];
+    int cc_other = g_cc_other, cc_local = g_cc_local, i;
+    GLboolean blend = glIsEnabled(GL_BLEND);
+    memset(gv, 0, sizeof gv);
+    for (i = 0; i < 3; i++) {
+        gv[i][VX] = p[i][0]; gv[i][VY] = p[i][1]; gv[i][VOOW] = p[i][2];
+        gv[i][VR] = p[i][3]; gv[i][VG] = p[i][4]; gv[i][VB] = p[i][5];
+        gv[i][VA] = 255.0f;
+        a[i] = (uint32_t)(uintptr_t)gv[i];
+    }
+    g_cc_other = 0; g_cc_local = 0;
+    glDisable(GL_BLEND);
+    gl_draw_triangle(a);
+    if (blend) glEnable(GL_BLEND);
+    g_cc_other = cc_other; g_cc_local = cc_local;
 }
 
 /* grTexSource(tmu, startAddress, evenOdd, GrTexInfo*), where GrTexInfo is
@@ -2240,6 +2290,10 @@ uint32_t __cdecl glide_call(uint32_t idx, uint32_t *args)
     int want;
 
     im->calls++;
+    if (g_glidecallers > 0 && g_glide_frame >= (uint32_t)g_glidecallers) {
+        if (g_glide_frame > (uint32_t)g_glidecallers) { callers_note(args, 1); g_glidecallers = 0; }
+        else if (im->fn == gl_draw_triangle) callers_note(args, 0);
+    }
     /* --glidetrace N traces one frame and stops. Tracing the whole run is
      * useless here -- the render loop issues millions of calls -- and what
      * actually needs answering is the ORDER within a single frame. */
@@ -2416,6 +2470,7 @@ void glide_install(void)
 
     hplus_install();
     hdtext_install();
+    objprobe_install();
     for (i = 0; i < g_nimp; i++) if (g_imp[i].fn) impl++;
     LOGI("glide: %u imports redirected (%u implemented, %u stubbed);"
          " GLIDE2X.OVL is never loaded", g_nimp, impl, g_nimp - impl);

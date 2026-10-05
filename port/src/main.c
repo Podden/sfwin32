@@ -506,6 +506,14 @@ int main(int argc, char **argv)
             g_glidedebug = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--glidetrace") && i + 1 < argc)
             g_glidetrace = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--objprobe"))
+            g_objprobe = 1;
+        else if (!strcmp(argv[i], "--objreplace") && i + 1 < argc) {
+            strncpy(g_objreplace, argv[++i], sizeof g_objreplace - 1);
+            g_objprobe = 1;
+        }
+        else if (!strcmp(argv[i], "--glidecallers") && i + 1 < argc)
+            g_glidecallers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--glide") && i + 1 < argc)
             g_glide = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctex") && i + 1 < argc)

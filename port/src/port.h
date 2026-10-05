@@ -176,6 +176,7 @@ int  write_bmp24(const char *path, int w, int h, const uint8_t *rows,
 int  write_bmp_argb(const char *path, int w, int h, const uint32_t *px);
 void mouse_script_move(int x, int y);
 void glide_trace_next(void);
+void glide_callers_next(void);
 extern int g_render_scale;   /* --scale N: frame buffer is 640x480 * N  */
 extern int g_msaa;           /* --msaa N: samples, 0/1 off              */
 extern int g_smooth2d;       /* --smooth2d: bilinear 2D in 3dfx mode    */
@@ -286,6 +287,13 @@ extern int g_glide_mode;
  * of GLIDE2X.OVL. Must run after the image is loaded and relocated. */
 extern int g_glide;        /* --glide 0 off, 1 intercept (default) */
 extern int g_glidetrace;
+extern int g_glidecallers;
+extern int g_objprobe;
+void objprobe_install(void);
+void objprobe_tri(const float *const v[3]);
+void glide_tri_rgb(const float p[3][6]);
+extern char g_objreplace[32];
+extern uint32_t g_objprobe_frame;
 extern int g_glidedebug;
 extern int g_dumpsec;
 extern int g_probe_x, g_probe_y;   /* --glidetrace: log every call          */
