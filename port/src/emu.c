@@ -840,6 +840,7 @@ static void set_seg(int which, uint16_t val)
  * globals as we go and report from those instead. */
 static volatile uint32_t g_dbg_eip, g_dbg_code, g_dbg_op, g_dbg_ea;
 static volatile int      g_dbg_stage;
+static uint8_t *g_tramp;                   /* irq_inject_external's stub */
 
 static LONG emu_veh_inner(EXCEPTION_POINTERS *ep)
 {
@@ -875,6 +876,17 @@ static LONG emu_veh_inner(EXCEPTION_POINTERS *ep)
      * in-game test below, since the planted address is deliberately not a
      * valid one. */
     if (mouse_cb_returning(c)) return EXCEPTION_CONTINUE_EXECUTION;
+
+    /* The stale exception of the external-injection race (see below), when
+     * it surfaces at irq_inject_external's stub. Tested here because the stub
+     * lies outside the image. Resuming there pushes the interrupt frame, so
+     * the faulting instruction runs again after IRETD. */
+    if (g_tramp && c->Eip == (uint32_t)(uintptr_t)g_tramp) {
+        static uint32_t stale;
+        if (++stale <= 4 || (stale & 0xFFF) == 0)
+            LOGW("discarded stale exception at the interrupt stub, count %u", stale);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
 
     /* A vectored handler is process-wide: it sees exceptions from the SDL
      * thread's renderer, the CRT, and anything else in the process. Only the
@@ -1257,6 +1269,7 @@ static void watch_poll(CONTEXT *c)
  * (the symptom was `ep->ContextRecord` reading back as 0x23). Per-thread
  * because the SDL and timer threads run through here too. */
 static __declspec(thread) int g_veh_depth;
+static __declspec(thread) EXCEPTION_POINTERS *g_veh_outer;  /* for the nested report */
 
 /* ---- --fbwatch: who writes the framebuffer, and with what stride? -------
  *
@@ -1476,9 +1489,23 @@ static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
                  ep->ExceptionRecord->ExceptionCode,
                  ep->ContextRecord->Eip, ep->ContextRecord->EFlags,
                  GetCurrentThreadId(), nnest);
+        if (nnest <= 12) {   /* what the outer handler was looking at */
+            EXCEPTION_POINTERS *o = g_veh_outer;
+            LOGW("  nested: fault address %08lX, esp %08lX; outer ep %p ctx %p er %p",
+                 ep->ExceptionRecord->NumberParameters > 1
+                     ? (unsigned long)ep->ExceptionRecord->ExceptionInformation[1] : 0ul,
+                 ep->ContextRecord->Esp, (void *)o,
+                 o ? (void *)o->ContextRecord : NULL, o ? (void *)o->ExceptionRecord : NULL);
+            if (o && mem_present(o->ExceptionRecord))
+                LOGW("  outer: code %08lX at %p", o->ExceptionRecord->ExceptionCode,
+                     o->ExceptionRecord->ExceptionAddress);
+            if (o && mem_present(o->ContextRecord))
+                LOGW("  outer ctx: eip %08lX esp %08lX", o->ContextRecord->Eip, o->ContextRecord->Esp);
+        }
         return EXCEPTION_CONTINUE_SEARCH;
     }
     g_veh_depth++;
+    g_veh_outer = ep;
 
     /* If the handler itself faults, Windows tears the process down without
      * running any filter, and the log ends mid-sentence with no explanation.
@@ -1745,6 +1772,27 @@ static void irq_deliver_pending(CONTEXT *c)
     }
 }
 
+/* irq_inject_external's stub: push the interrupt frame, enter the ISR.
+ *   push dword [g_tr_eflags]; push dword [g_tr_cs]; push dword [g_tr_eip]
+ *   jmp  dword [g_tr_handler] */
+static volatile uint32_t g_tr_eip, g_tr_cs, g_tr_eflags, g_tr_handler;
+
+static void tramp_init(void)
+{
+    const volatile uint32_t *ops[4] = { &g_tr_eflags, &g_tr_cs, &g_tr_eip, &g_tr_handler };
+    uint8_t *w = (uint8_t *)VirtualAlloc(NULL, 32, MEM_RESERVE | MEM_COMMIT,
+                                         PAGE_EXECUTE_READWRITE);
+    int i;
+    if (!w) return;
+    for (i = 0; i < 4; i++) {
+        uint32_t a = (uint32_t)(uintptr_t)ops[i];
+        w[i * 6] = 0xFF;
+        w[i * 6 + 1] = i < 3 ? 0x35 : 0x25;
+        memcpy(w + i * 6 + 2, &a, 4);
+    }
+    g_tramp = w;
+}
+
 /* Fallback for when the game stops faulting.
  *
  * In-handler delivery cannot reach a loop that takes no exceptions -- and the
@@ -1770,10 +1818,10 @@ static void irq_inject_external(void)
 {
     CONTEXT c;
     uintptr_t lo = (uintptr_t)g_img.mem, hi = lo + g_img.code_size;
-    uint32_t handler, *sp;
+    uint32_t handler;
     int vec;
 
-    if (!g_game_thread) return;
+    if (!g_game_thread || !g_tramp) return;
     if (shadow_dirty()) return;
 
     if      (g_pend_irq1 > 0 && kbd_pending()) vec = 9;
@@ -1794,13 +1842,20 @@ static void irq_inject_external(void)
         return;
     }
 
-    c.Esp -= 12;
-    sp = (uint32_t *)(uintptr_t)c.Esp;
-    sp[0] = c.Eip;
-    sp[1] = c.SegCs;
-    sp[2] = c.EFlags;
+    /* The frame is pushed by the game thread itself, in g_tramp. Writing it
+     * from here was the cause of a rare crash: under WOW64 a thread caught
+     * while its exception is being dispatched still reports the faulting
+     * game context, and the frame written below that ESP landed on the
+     * dispatch's own structures -- the handler then read ep->ContextRecord
+     * as 0x23, the CS of the frame. Redirecting EIP alone touches no memory;
+     * the worst case left is the stale exception at the stub, discarded in
+     * the handler, or a redirect the dispatch overrides, which costs a tick. */
+    g_tr_eip = c.Eip;
+    g_tr_cs = c.SegCs;
+    g_tr_eflags = c.EFlags;
+    g_tr_handler = handler;
     c.EFlags &= ~0x100u;
-    c.Eip = handler;
+    c.Eip = (uint32_t)(uintptr_t)g_tramp;
     c.ContextFlags = CONTEXT_CONTROL;
 
     if (SetThreadContext(g_game_thread, &c)) {
@@ -1943,6 +1998,7 @@ void timer_start(void)
         LOGE("cannot duplicate game thread handle: %lu", GetLastError());
         return;
     }
+    tramp_init();
     g_timer_thread = CreateThread(NULL, 0, timer_thread_main, NULL, 0, NULL);
     if (!g_timer_thread) { LOGE("timer thread failed: %lu", GetLastError());
                            return; }
