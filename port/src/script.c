@@ -162,6 +162,15 @@ void script_tick(void)
             glide_trace_next();
         } else if (!strcmp(cmd, "log")) {
             LOGI("script: %s", arg);
+        } else if (!strcmp(cmd, "memdump")) {   /* the loaded image, fixups applied */
+            char path[MAX_PATH];
+            FILE *f;
+            _snprintf(path, sizeof path, "%s\\%s.bin", g_shot_dir, arg);
+            if ((f = fopen(path, "wb")) != NULL) {
+                fwrite(g_img.mem, 1, g_img.size, f);
+                fclose(f);
+                LOGI("script: image dumped to %s (delta 0x%08X)", path, g_img.delta);
+            }
         } else if (!strcmp(cmd, "quit")) {
             LOGI("script: quit");
             video_request_quit();

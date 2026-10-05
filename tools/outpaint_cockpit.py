@@ -31,7 +31,7 @@ SECRET = Path(r"C:\Users\daniel.pots\.claude\secrets\gemini_api_key")
 H = 1920                       # output height = 4x upscaled art
 W43, W169 = H * 4 // 3, H * 16 // 9
 BAND = 64                      # seam blend, pixels inside the 4:3 edge
-USD_PER_IMAGE = 0.24           # gemini-3-pro-image at 4K, list price
+USD_PER_IMAGE = 0.24         # gemini-3-pro-image at 4K, list price
 
 PROMPT = (
     "Image 1 is the cockpit view of a 1990s deep-sea combat submarine (pre-rendered CG, the game "

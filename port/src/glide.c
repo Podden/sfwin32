@@ -1158,16 +1158,6 @@ static uint32_t gl_draw_triangle(uint32_t *a)
              v[0][VR], v[0][VG], v[0][VB], g_depth_mode, g_depth_func,
              v[0][VSOW] * w0, v[0][VTOW] * w0, v[1][VSOW] * w1,
              v[1][VTOW] * w1, v[2][VSOW] * w2, v[2][VTOW] * w2);
-        if (getenv("SFP_VTXDUMP")) {             /* what else the game keeps per vertex */
-            char line[1024];
-            int k, n = 0;
-            n += _snprintf(line + n, sizeof line - n, "   vtx %p %+d %+d:",
-                           (void *)v[0], (int)((const char *)v[1] - (const char *)v[0]),
-                           (int)((const char *)v[2] - (const char *)v[0]));
-            for (k = 0; k < 40 && n < (int)sizeof line - 16; k++)
-                n += _snprintf(line + n, sizeof line - n, " %g", v[0][k]);
-            LOGI("%s", line);
-        }
     }
 
     if (g_probe_now) {

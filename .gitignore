@@ -41,3 +41,4 @@ hd*/
 runs/
 build*/
 .mcp.json
+tools/__pycache__/

@@ -314,6 +314,16 @@ int dos_int21(CONTEXT *c)
         if (top > hi) {
             LOGW("DOS resize to 0x%08X exceeds our region (top 0x%08zX)",
                  top, (size_t)hi);
+            {   /* who asked: return addresses into game code on the stack */
+                const uint32_t *sp = (const uint32_t *)(uintptr_t)c->Esp;
+                uintptr_t cs = (uintptr_t)g_img.mem, ce = cs + g_img.code_size;
+                int k, n = 0;
+                for (k = 0; k < 256 && n < 12; k++)
+                    if (sp[k] >= cs && sp[k] < ce) {
+                        LOGW("  stack[%d] -> orig 0x%08X", k, sp[k] - g_img.delta);
+                        n++;
+                    }
+            }
             c->Ebx = (uint32_t)(hi >> 12);      /* largest we can offer */
             return fail(c, 8);
         }

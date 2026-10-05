@@ -1403,10 +1403,38 @@ static int fbwatch_hit(EXCEPTION_POINTERS *ep)
     return 1;
 }
 
+/* --hwwatch ADDR: debug register 0 as a write watchpoint on one dword of the
+ * game's memory (orig address). Every distinct instruction that writes it is
+ * logged once -- what --watch cannot say, since it only sees values change. */
+uint32_t g_hwwatch;
+
+static int hwwatch_hit(EXCEPTION_POINTERS *ep)
+{
+    static uint32_t seen[64];
+    static int nseen;
+    CONTEXT *c = ep->ContextRecord;
+    int i;
+    if (!g_hwwatch || ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP ||
+        !(c->Dr6 & 1))
+        return 0;
+    for (i = 0; i < nseen && seen[i] != c->Eip; i++) {}
+    if (i == nseen && nseen < 64) {
+        seen[nseen++] = c->Eip;
+        LOGI("hwwatch: orig %08X written, next insn orig 0x%08X (value %08X) "
+             "eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X (orig = reg - %08X)",
+             g_hwwatch, c->Eip - g_img.delta,
+             *(volatile uint32_t *)(uintptr_t)(g_hwwatch + g_img.delta),
+             c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, g_img.delta);
+    }
+    c->Dr6 = 0;
+    return !(c->EFlags & 0x100u);       /* a pending trap still needs the handler */
+}
+
 static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
 {
     LONG r;
 
+    if (hwwatch_hit(ep)) return EXCEPTION_CONTINUE_EXECUTION;
     if (fbwatch_hit(ep)) return EXCEPTION_CONTINUE_EXECUTION;
     if (cblit_bp_hit(ep)) return EXCEPTION_CONTINUE_EXECUTION;
 
@@ -1487,6 +1515,11 @@ static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
          * to hand back, rather than by rewriting a running thread from
          * outside. */
         irq_deliver_pending(c);
+        if (g_hwwatch && resuming_game) {
+            c->ContextFlags |= CONTEXT_DEBUG_REGISTERS;
+            c->Dr0 = g_hwwatch + g_img.delta;
+            c->Dr7 = (c->Dr7 & ~0x000F0003u) | 1u | (1u << 16) | (3u << 18);
+        }
         g_fault_tick = now_ms();               /* the game is still faulting */
         g_last_ok_eip = c->Eip;
         watch_poll(c);

@@ -523,6 +523,8 @@ int main(int argc, char **argv)
                 (strtoul(argv[++i], NULL, 16) & ~0xFFFu);
         }
         else if (!strcmp(argv[i], "--calltrace")) want_calltrace = 1;
+        else if (!strcmp(argv[i], "--hwwatch") && i + 1 < argc)
+            g_hwwatch = (uint32_t)strtoul(argv[++i], NULL, 16);
         else if (!strcmp(argv[i], "--no-extern-irq")) g_extern_irq = 0;
         else if (!strcmp(argv[i], "--trace"))  g_log_level = LOG_TRACE;
         else if (!strcmp(argv[i], "--script") && i + 1 < argc)

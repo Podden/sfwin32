@@ -45,6 +45,7 @@ typedef struct {
 #define IMAGE_HEAP_RESERVE (256u * 1024 * 1024)   /* room to grow into    */
 
 extern le_image g_img;
+extern uint32_t g_hwwatch;               /* --hwwatch ADDR (orig)          */
 
 int  le_load(const char *path, le_image *out);
 void le_free(le_image *img);
