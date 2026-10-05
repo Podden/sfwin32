@@ -244,6 +244,7 @@ static uint32_t gl_glide_get_version(uint32_t *a)
 typedef struct {
     uint32_t key;        /* 0 = empty */
     GLuint   tex;
+    GLuint   tile[4];    /* the four quadrants, each its own texture */
 } texcache_ent;
 
 static SDL_GLContext g_glctx;
@@ -815,14 +816,51 @@ static int gl_ensure_context(void)
 /* Expand a paletted texture into RGBA and cache it. The key covers the
  * texture data, the palette and the chroma key, because all three change
  * independently and any of them changes the pixels. */
-static GLuint tex_upload(const uint8_t *data, int size, uint32_t key)
+/* Mipmapped, anisotropic texture parameters for the bound texture. */
+static void tex_params(GLint wrap)
+{
+    p_glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    if (g_max_aniso > 1.0f)
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_, g_max_aniso);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
+}
+
+/* The seabed is an atlas of four 128x128 tiles, one per terrain quad, laid
+ * down rotated and mirrored. Sampled out of the atlas, every filter reaches
+ * across a tile's edge into its neighbour -- bilinear by half a texel, and
+ * each mip level and anisotropic tap twice as far as the last -- which draws
+ * the tile grid across the whole seabed. Each quadrant therefore also gets a
+ * texture of its own, clamped at its edges, for the triangles that stay
+ * inside one (see draw_triangle). */
+static void tex_make_tiles(texcache_ent *e, const uint32_t *px, int w, int h)
+{
+    int q;
+    if (!e->tile[0]) glGenTextures(4, e->tile);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, w);
+    for (q = 0; q < 4; q++) {
+        glPixelStorei(GL_UNPACK_SKIP_PIXELS, (q & 1) * (w / 2));
+        glPixelStorei(GL_UNPACK_SKIP_ROWS, (q >> 1) * (h / 2));
+        glBindTexture(GL_TEXTURE_2D, e->tile[q]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w / 2, h / 2, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, px);
+        tex_params(GL_CLAMP_TO_EDGE);
+    }
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+}
+
+static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
 {
     static uint32_t rgba[256 * 256];
     uint32_t slot = key % TEXCACHE;
     int i, n = size * size;
     GLuint id;
 
-    if (g_texcache[slot].key == key) { g_tex_hit++; return g_texcache[slot].tex; }
+    if (g_texcache[slot].key == key) { g_tex_hit++; return &g_texcache[slot]; }
     g_tex_miss++;
 
     if (n > 256 * 256) n = 256 * 256;
@@ -856,25 +894,23 @@ static GLuint tex_upload(const uint8_t *data, int size, uint32_t key)
              (hd = hd_load("tex", dname, &hw, &hh)) != NULL)) {
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, hw, hh, 0,
                          GL_RGBA, GL_UNSIGNED_BYTE, hd);
+            /* Trilinear and anisotropic: the seabed recedes at a grazing
+             * angle for its whole extent, which is exactly where plain
+             * bilinear shimmers and smears. */
+            tex_params(GL_REPEAT);
+            if (size == 256) tex_make_tiles(&g_texcache[slot], hd, hw, hh);
             free(hd);
-        } else
+        } else {
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0,
                          GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+            tex_params(GL_REPEAT);
+            if (size == 256) tex_make_tiles(&g_texcache[slot], rgba, size, size);
+        }
     }
-    /* Trilinear and anisotropic: the seabed recedes at a grazing angle for
-     * its whole extent, which is exactly where plain bilinear shimmers and
-     * smears. */
-    p_glGenerateMipmap(GL_TEXTURE_2D);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR_);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    if (g_max_aniso > 1.0f)
-        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_, g_max_aniso);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 
     g_texcache[slot].key = key;
     g_texcache[slot].tex = id;
-    return id;
+    return &g_texcache[slot];
 }
 
 /* Depth starts fresh every frame. Within the frame the ordering is all this
@@ -1031,10 +1067,36 @@ static void scissor_virtual(int x0, int y0, int x1, int y1)
               (GLsizei)((x1 - x0) * sx + 0.5f), (GLsizei)((y1 - y0) * sy + 0.5f));
 }
 
+/* The quadrant (0..3) of a 256 atlas that holds all of the triangle's
+ * texture coordinates, or -1 if it spans more than one (models, the tiled
+ * backdrop). Coordinates are in texels, s = sow/oow. */
+static int triangle_tile(const float *const v[3], const texcache_ent *e)
+{
+    float s0 = 1e9f, s1 = -1e9f, t0 = 1e9f, t1 = -1e9f;
+    int i, qx, qy;
+    if (g_tex_size != 256 || !e->tile[0]) return -1;
+    for (i = 0; i < 3; i++) {
+        float oow = v[i][VOOW], s, t;
+        if (oow <= 0.0f) return -1;
+        s = v[i][VSOW] / oow;
+        t = v[i][VTOW] / oow;
+        if (s < s0) s0 = s;
+        if (s > s1) s1 = s;
+        if (t < t0) t0 = t;
+        if (t > t1) t1 = t;
+    }
+    qx = (int)floorf((s0 + s1) * 0.5f / 128.0f);
+    qy = (int)floorf((t0 + t1) * 0.5f / 128.0f);
+    if (qx < 0 || qx > 1 || qy < 0 || qy > 1) return -1;
+    if (s0 < qx * 128.0f - 0.05f || s1 > qx * 128.0f + 128.05f ||
+        t0 < qy * 128.0f - 0.05f || t1 > qy * 128.0f + 128.05f) return -1;
+    return qy * 2 + qx;
+}
+
 static uint32_t gl_draw_triangle(uint32_t *a)
 {
     const float *v[3];
-    int i, bias_mode;
+    int i, bias_mode, tile = -1;
 
     g_tris++;
     {   /* Rough area, which is all a fill-rate sample needs. */
@@ -1089,10 +1151,23 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         float w1 = v[1][VOOW] > 0.0f ? 1.0f / v[1][VOOW] : -1.0f;
         float w2 = v[2][VOOW] > 0.0f ? 1.0f / v[2][VOOW] : -1.0f;
         LOGI("   tri w=%.1f/%.1f/%.1f  xy=(%.0f,%.0f)(%.0f,%.0f)(%.0f,%.0f)  "
-             "tex=%08X rgb=%.0f,%.0f,%.0f mode=%d func=%d",
+             "tex=%08X rgb=%.0f,%.0f,%.0f mode=%d func=%d "
+             "st=(%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f)",
              w0, w1, w2, v[0][VX], v[0][VY], v[1][VX], v[1][VY],
              v[2][VX], v[2][VY], (uint32_t)(uintptr_t)g_tex_data,
-             v[0][VR], v[0][VG], v[0][VB], g_depth_mode, g_depth_func);
+             v[0][VR], v[0][VG], v[0][VB], g_depth_mode, g_depth_func,
+             v[0][VSOW] * w0, v[0][VTOW] * w0, v[1][VSOW] * w1,
+             v[1][VTOW] * w1, v[2][VSOW] * w2, v[2][VTOW] * w2);
+        if (getenv("SFP_VTXDUMP")) {             /* what else the game keeps per vertex */
+            char line[1024];
+            int k, n = 0;
+            n += _snprintf(line + n, sizeof line - n, "   vtx %p %+d %+d:",
+                           (void *)v[0], (int)((const char *)v[1] - (const char *)v[0]),
+                           (int)((const char *)v[2] - (const char *)v[0]));
+            for (k = 0; k < 40 && n < (int)sizeof line - 16; k++)
+                n += _snprintf(line + n, sizeof line - n, " %g", v[0][k]);
+            LOGI("%s", line);
+        }
     }
 
     if (g_probe_now) {
@@ -1181,9 +1256,12 @@ static uint32_t gl_draw_triangle(uint32_t *a)
                                             (uint32_t)(uintptr_t)g_tex_data),
                                      g_pal_hash),
                               g_chroma_on ? g_chroma_rgb | 0x1000000u : 0u);
+        texcache_ent *e;
         if (!key) key = 1;
         glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, tex_upload(g_tex_data, g_tex_size, key));
+        e = tex_upload(g_tex_data, g_tex_size, key);
+        tile = triangle_tile(v, e);
+        glBindTexture(GL_TEXTURE_2D, tile >= 0 ? e->tile[tile] : e->tex);
         glEnable(GL_ALPHA_TEST);
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE,
                   g_cc_factor == 8 ? GL_REPLACE : GL_MODULATE);
@@ -1260,8 +1338,13 @@ static uint32_t gl_draw_triangle(uint32_t *a)
                       p[VB] * (1.0f / 255.0f), 1.0f);
         /* homogeneous texture coords: the hardware does the s/q divide that
          * Glide expresses as sow/oow */
-        glTexCoord4f(p[VSOW] / (float)g_tex_size, p[VTOW] / (float)g_tex_size,
-                     0.0f, oow);
+        if (tile >= 0)                       /* the quadrant's own texture */
+            glTexCoord4f((p[VSOW] - (float)((tile & 1) * 128) * oow) / 128.0f,
+                         (p[VTOW] - (float)((tile >> 1) * 128) * oow) / 128.0f,
+                         0.0f, oow);
+        else
+            glTexCoord4f(p[VSOW] / (float)g_tex_size, p[VTOW] / (float)g_tex_size,
+                         0.0f, oow);
         /* glOrtho(.., -1, 1) gives z_ndc = -z_eye, so the eye-space value has
          * to be negated to land at window depth z. Getting this backwards put
          * the black full-viewport quad at depth 0 -- nearest -- where it
@@ -1625,6 +1708,29 @@ static uint32_t gl_lfb_unlock(uint32_t *a)
 
 /* The FBO is the finished frame: scale it into the window, 4:3 and centred,
  * and swap. Nothing is cleared -- the frame buffer is persistent. */
+/* Widescreen cockpit art: <hd>/wide/<name>.png is a full-screen image widened
+ * to 16:9 (tools/outpaint_cockpit.py). Its sides are drawn beside the 4:3
+ * frame while that image is the cockpit on screen; alpha fades it into the
+ * frame at the seam. g_wide_cur is the one for the last full-screen image. */
+static GLuint g_wide_cur;
+static int    g_wide_w, g_wide_h;
+
+/* A script shot also saves the whole window (<shot>_win.bmp) when the
+ * widescreen sides are on it, since the frame buffer alone is 4:3. */
+static char g_wide_shot[MAX_PATH + 8];
+
+static void shot_window(const char *path, int w, int h)
+{
+    uint8_t *px = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!px) return;
+    p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, 0);
+    glReadBuffer(GL_BACK);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, 0x80E0 /* GL_BGR */, GL_UNSIGNED_BYTE, px);
+    write_bmp24(path, w, h, px, w * 3);
+    free(px);
+}
+
 static void present(void)
 {
     int dw = g_fbw, dh = g_fbh, vw, vh, vx, vy;
@@ -1643,6 +1749,34 @@ static void present(void)
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, src);
     p_glBlitFramebuffer(0, 0, g_fbw, g_fbh, vx, vy, vx + vw, vy + vh,
                         GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+    /* Cockpit sides, over the bars and faded into the frame's edges. Only
+     * while the cockpit mask is up: the outside views have no cockpit. */
+    if (g_wide_cur && g_mask_ready && dw > vw && g_wide_h) {
+        int ww = (int)((long)vh * g_wide_w / g_wide_h);
+        if (g_prog) p_glUseProgram(0);
+        glViewport((dw - ww) / 2, vy, ww, vh);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_ALPHA_TEST);
+        glDisable(GL_FOG);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, g_wide_cur);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+        glBegin(GL_QUADS);
+            glTexCoord2f(0, 0); glVertex3f(0,       0,       0);
+            glTexCoord2f(1, 0); glVertex3f(GLIDE_W, 0,       0);
+            glTexCoord2f(1, 1); glVertex3f(GLIDE_W, GLIDE_H, 0);
+            glTexCoord2f(0, 1); glVertex3f(0,       GLIDE_H, 0);
+        glEnd();
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        glDisable(GL_BLEND);
+        glViewport(0, 0, g_fbw, g_fbh);
+        if (g_wide_shot[0]) shot_window(g_wide_shot, dw, dh);
+    }
+    g_wide_shot[0] = 0;
     SDL_GL_SwapWindow(video_window());
     p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
     glEnable(GL_SCISSOR_TEST);
@@ -1669,7 +1803,13 @@ static uint32_t gl_buffer_swap(uint32_t *a)
 
     lfb_flush();
     if (script_shot_wanted()) {
-        shot_from_fbo(script_shot_wanted());
+        const char *p = script_shot_wanted();
+        size_t n = strlen(p);
+        shot_from_fbo(p);
+        if (n > 4 && n < sizeof g_wide_shot - 4) {
+            memcpy(g_wide_shot, p, n - 4);                /* drop ".bmp" */
+            strcpy(g_wide_shot + n - 4, "_win.bmp");
+        }
         script_shot_done();
     }
     present();
@@ -1689,7 +1829,34 @@ static uint32_t gl_buffer_swap(uint32_t *a)
  * are drawn into the frame buffer at full resolution instead. Returns 0 if
  * there is none, and the caller draws the original. */
 #define HD2D_CACHE 4096
-static struct { uint64_t key; GLuint tex; int missing, seen; } g_hd2d[HD2D_CACHE];
+static struct { uint64_t key; GLuint tex, wide; int missing, seen; } g_hd2d[HD2D_CACHE];
+
+/* Widescreen cockpit art (g_wide_cur, see present): one texture per
+ * full-screen image that has a <hd>/wide/ version. */
+static struct { GLuint tex; int w, h; } g_wide_size[16];
+
+static GLuint hd_texture(const uint32_t *px, int w, int h)
+{
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, px);
+    p_glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return tex;
+}
+
+static void wide_select(GLuint tex)
+{
+    int i;
+    g_wide_cur = tex;
+    for (i = 0; i < 16; i++)
+        if (g_wide_size[i].tex == tex) { g_wide_w = g_wide_size[i].w; g_wide_h = g_wide_size[i].h; }
+}
 
 /* A screen rectangle that keeps showing new pictures is a live display (the
  * cockpit monitors are composed in software each frame), not art: after a
@@ -1735,6 +1902,7 @@ static int hd_image_draw(const uint32_t *rgba, int x, int y, int w, int h)
              * different picture every frame and would flood the dump. */
             if (++g_hd2d[slot].seen == 3 && hd_dump("2d", name, w, h, rgba))
                 LOGI("hd: dumped image %s at %d,%d", name, x, y);
+            if (w == GLIDE_W && h == GLIDE_H) wide_select(g_hd2d[slot].wide);
             if (g_hd2d[slot].missing) return 0;
             tex = g_hd2d[slot].tex;
             break;
@@ -1752,18 +1920,23 @@ static int hd_image_draw(const uint32_t *rgba, int x, int y, int w, int h)
             g_hd2d[slot].seen = 1;
             if (w * h >= 320 * 240 && hd_dump("2d", name, w, h, rgba))
                 LOGI("hd: dumped image %s at %d,%d", name, x, y);
+            if (w == GLIDE_W && h == GLIDE_H) {
+                int ww = 0, wh = 0, i;
+                uint32_t *wp = g_hd_dir[0] ? hd_load("wide", name, &ww, &wh) : NULL;
+                if (wp) {
+                    g_hd2d[slot].wide = hd_texture(wp, ww, wh);
+                    free(wp);
+                    for (i = 0; i < 16 && g_wide_size[i].tex; i++) {}
+                    if (i < 16) {
+                        g_wide_size[i].tex = g_hd2d[slot].wide;
+                        g_wide_size[i].w = ww; g_wide_size[i].h = wh;
+                    }
+                }
+                wide_select(g_hd2d[slot].wide);
+            }
             if (!px) { g_hd2d[slot].missing = 1; return 0; }
-            glGenTextures(1, &tex);
-            glBindTexture(GL_TEXTURE_2D, tex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, iw, ih, 0, GL_RGBA,
-                         GL_UNSIGNED_BYTE, px);
+            tex = hd_texture(px, iw, ih);
             free(px);
-            p_glGenerateMipmap(GL_TEXTURE_2D);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                            GL_LINEAR_MIPMAP_LINEAR_);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             g_hd2d[slot].tex = tex;
             break;
         }

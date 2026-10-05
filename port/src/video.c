@@ -366,7 +366,7 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
             calltrace_dump();
             cdrawscan_report();
             log_shutdown();
-            ExitProcess(0);
+            TerminateProcess(GetCurrentProcess(), 0);   /* see emu_request_exit */
         }
         if (InterlockedExchange(&g_mode_dirty, 0) && g_ren) {
             if (g_tex) SDL_DestroyTexture(g_tex);

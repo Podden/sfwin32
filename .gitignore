@@ -37,6 +37,7 @@ third_party/
 
 # Game-derived output: dumps, HD replacements, screenshots, run logs
 dump*/
-hd/
+hd*/
 runs/
 build*/
+.mcp.json

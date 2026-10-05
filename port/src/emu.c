@@ -1922,7 +1922,12 @@ void emu_request_exit(int code)
     calltrace_dump();
     log_shutdown();
     video_shutdown();
-    ExitProcess((UINT)code);
+    /* Not ExitProcess: that runs every DLL's detach while the SDL thread is
+     * still inside the driver, and the GL driver occasionally fails fast
+     * there (0xC0000409) -- which then replaces `code`, the very value the
+     * SF.EXE chain decides the next half by. Everything worth keeping is
+     * already written: logs are closed, files went out through WriteFile. */
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
 }
 
 int emu_install(void)
