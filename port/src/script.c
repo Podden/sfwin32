@@ -150,6 +150,8 @@ void script_tick(void)
             g_shot_deadline = now + 3000;
             InterlockedExchange(&g_shot_pending, 1);
             return;
+        } else if (!strcmp(cmd, "trace")) {
+            glide_trace_next();
         } else if (!strcmp(cmd, "log")) {
             LOGI("script: %s", arg);
         } else if (!strcmp(cmd, "quit")) {

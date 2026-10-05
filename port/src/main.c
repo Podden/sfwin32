@@ -532,6 +532,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--chain-index") && i + 1 < argc)
             g_chain_index = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--3dfx")) { /* only read by --chain */ }
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc)
+            g_render_scale = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--msaa") && i + 1 < argc)
+            g_msaa = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--smooth2d")) g_smooth2d = 1;
         else { usage(argv[0]); return 2; }
     }
 

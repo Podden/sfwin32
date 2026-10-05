@@ -173,6 +173,10 @@ int  write_bmp24(const char *path, int w, int h, const uint8_t *rows,
                  int stride);
 int  write_bmp_argb(const char *path, int w, int h, const uint32_t *px);
 void mouse_script_move(int x, int y);
+void glide_trace_next(void);
+extern int g_render_scale;   /* --scale N: frame buffer is 640x480 * N  */
+extern int g_msaa;           /* --msaa N: samples, 0/1 off              */
+extern int g_smooth2d;       /* --smooth2d: bilinear 2D in 3dfx mode    */
 
 /* The 64 KB banked window the game blits through, plus the shadow surface. */
 extern uint8_t *g_vram;           /* full virtual framebuffer              */

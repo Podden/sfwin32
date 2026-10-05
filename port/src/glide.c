@@ -56,9 +56,11 @@ int g_probe_x = -1, g_probe_y = -1;
 static int g_probe_now;
 static uint32_t g_probe_hits;
 static uint32_t g_ps_in, g_ps_out, g_ps_zfail, g_ps_chroma;
-static uint32_t g_tris_after_lfb;
 int g_dumpsec;                  /* --dumpsec N: grab both buffers N s in */
 int g_glidetrace;               /* --glidetrace N: trace frame N only       */
+
+/* script "trace": the frame after next, whatever number it turns out to be */
+void glide_trace_next(void) { g_glidetrace = (int)g_glide_frame + 2; }
 
 /* Glide's own 16-bit format is 5:6:5, which is also what this port's
  * framebuffer already is, so the linear-frame-buffer calls can hand the game
@@ -306,7 +308,72 @@ static uint32_t g_fog_color;
 static uint8_t  g_fog_table[GR_FOG_TABLE_SIZE];
 static float    g_fog_w[GR_FOG_TABLE_SIZE];
 static void (APIENTRY *p_glFogCoordf)(GLfloat);
-static int      g_lfb_synced, g_lfb_dirty, g_frame_seeded;
+/* ------------------------------------------------------- frame buffer
+ *
+ * The Glide frame buffer is an offscreen FBO at g_fbw x g_fbh -- 640x480
+ * times the render scale -- and it is persistent, as the Voodoo's was: the
+ * game paints its cockpit once and afterwards redraws only what moves. All
+ * Glide coordinates stay in the game's own 640x480 space; the projection
+ * maps them onto the FBO, so geometry gains resolution for free.
+ *
+ * The game also writes the frame buffer through the CPU (grLfbLock, then raw
+ * 16-bit stores) and those writes are interleaved with 3D: in one frame it
+ * draws the scene, blits the target monitor's background, draws the target
+ * ship into it, and only then paints the HUD. So the CPU copy (g_vram) is a
+ * 640x480 view of the FBO, refreshed on demand, and what the game writes into
+ * it goes back into the FBO as soon as anything else would be drawn over it:
+ * the copy is diffed against a snapshot taken when it was handed out, and
+ * only changed pixels are uploaded. Ordering is then exactly the game's. */
+static GLuint   g_fbo, g_fbo_tex, g_fbo_rb;      /* single-sample, resolved   */
+static GLuint   g_fbo_ms, g_fbo_ms_col, g_fbo_ms_ds;  /* render target if MSAA */
+static GLuint   g_fbo_small, g_fbo_small_rb;     /* 640x480 for read-back     */
+static GLuint   g_overlay_tex, g_mask_tex;
+static int      g_fbw = GLIDE_W, g_fbh = GLIDE_H;
+static int      g_vram_valid;          /* g_vram mirrors the FBO            */
+static int      g_lfb_pending;         /* game may have written g_vram      */
+static int      g_lock_depth;
+static int      g_frame_started;
+static uint16_t g_lfb_snap[GLIDE_W * GLIDE_H];
+int g_render_scale;                    /* --scale N, 0 = from the desktop   */
+int g_msaa = 4;                        /* --msaa N                          */
+int g_smooth2d;                        /* --smooth2d: bilinear 2D overlays  */
+
+#define GL_FRAMEBUFFER_          0x8D40
+#define GL_READ_FRAMEBUFFER_     0x8CA8
+#define GL_DRAW_FRAMEBUFFER_     0x8CA9
+#define GL_RENDERBUFFER_         0x8D41
+#define GL_COLOR_ATTACHMENT0_    0x8CE0
+#define GL_DEPTH_STENCIL_ATTACHMENT_ 0x821A
+#define GL_DEPTH24_STENCIL8_     0x88F0
+#define GL_RGBA8_                0x8058
+#define GL_FRAMEBUFFER_COMPLETE_ 0x8CD5
+#define GL_LINEAR_MIPMAP_LINEAR_ 0x2703
+#define GL_TEXTURE_MAX_ANISOTROPY_ 0x84FE
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY_ 0x84FF
+#define GL_MAX_SAMPLES_          0x8D57
+
+static void (APIENTRY *p_glGenFramebuffers)(GLsizei, GLuint *);
+static void (APIENTRY *p_glBindFramebuffer)(GLenum, GLuint);
+static void (APIENTRY *p_glFramebufferTexture2D)(GLenum, GLenum, GLenum,
+                                                 GLuint, GLint);
+static void (APIENTRY *p_glFramebufferRenderbuffer)(GLenum, GLenum, GLenum,
+                                                    GLuint);
+static GLenum (APIENTRY *p_glCheckFramebufferStatus)(GLenum);
+static void (APIENTRY *p_glGenRenderbuffers)(GLsizei, GLuint *);
+static void (APIENTRY *p_glBindRenderbuffer)(GLenum, GLuint);
+static void (APIENTRY *p_glRenderbufferStorage)(GLenum, GLenum, GLsizei,
+                                                GLsizei);
+static void (APIENTRY *p_glRenderbufferStorageMultisample)(GLenum, GLsizei,
+                                                           GLenum, GLsizei,
+                                                           GLsizei);
+static void (APIENTRY *p_glBlitFramebuffer)(GLint, GLint, GLint, GLint,
+                                            GLint, GLint, GLint, GLint,
+                                            GLbitfield, GLenum);
+static void (APIENTRY *p_glGenerateMipmap)(GLenum);
+static float g_max_aniso;
+
+/* Where everything is drawn: the multisampled target when MSAA is on. */
+static GLuint draw_fbo(void) { return g_fbo_ms ? g_fbo_ms : g_fbo; }
 /* GR_BUFFER_AUXBUFFER: the depth buffer, which this game writes through
  * the LFB to stamp its cockpit mask. */
 static uint16_t g_auxbuf[GLIDE_W * GLIDE_H];
@@ -568,6 +635,125 @@ static GLenum blend_gl(int f)
     }
 }
 
+#define GLPROC(var, name) \
+    (*(void **)&(var) = SDL_GL_GetProcAddress(name))
+
+/* The render scale: --scale N, or enough that the FBO is at least as tall as
+ * the desktop, so a full-screen window is supersampled rather than
+ * stretched. */
+static int pick_scale(void)
+{
+    SDL_DisplayMode dm;
+    int s = g_render_scale;
+    if (s <= 0) {
+        s = 2;
+        if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.h > 0)
+            s = (dm.h + GLIDE_H - 1) / GLIDE_H;
+    }
+    if (s < 1) s = 1;
+    if (s > 6) s = 6;
+    return s;
+}
+
+static int fbo_create(void)
+{
+    int scale = pick_scale(), samples = g_msaa;
+    GLint maxs = 0;
+
+    if (!GLPROC(p_glGenFramebuffers, "glGenFramebuffers") ||
+        !GLPROC(p_glBindFramebuffer, "glBindFramebuffer") ||
+        !GLPROC(p_glFramebufferTexture2D, "glFramebufferTexture2D") ||
+        !GLPROC(p_glFramebufferRenderbuffer, "glFramebufferRenderbuffer") ||
+        !GLPROC(p_glCheckFramebufferStatus, "glCheckFramebufferStatus") ||
+        !GLPROC(p_glGenRenderbuffers, "glGenRenderbuffers") ||
+        !GLPROC(p_glBindRenderbuffer, "glBindRenderbuffer") ||
+        !GLPROC(p_glRenderbufferStorage, "glRenderbufferStorage") ||
+        !GLPROC(p_glRenderbufferStorageMultisample,
+                "glRenderbufferStorageMultisample") ||
+        !GLPROC(p_glBlitFramebuffer, "glBlitFramebuffer") ||
+        !GLPROC(p_glGenerateMipmap, "glGenerateMipmap")) {
+        LOGE("glide: OpenGL 3.0 framebuffer objects are required");
+        return 0;
+    }
+    g_fbw = GLIDE_W * scale;
+    g_fbh = GLIDE_H * scale;
+
+    /* resolved colour + depth/stencil: the read-back and present source */
+    glGenTextures(1, &g_fbo_tex);
+    glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8_, g_fbw, g_fbh, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    p_glGenRenderbuffers(1, &g_fbo_rb);
+    p_glBindRenderbuffer(GL_RENDERBUFFER_, g_fbo_rb);
+    p_glRenderbufferStorage(GL_RENDERBUFFER_, GL_DEPTH24_STENCIL8_, g_fbw, g_fbh);
+    p_glGenFramebuffers(1, &g_fbo);
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, g_fbo);
+    p_glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_,
+                             GL_TEXTURE_2D, g_fbo_tex, 0);
+    p_glFramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_DEPTH_STENCIL_ATTACHMENT_,
+                                GL_RENDERBUFFER_, g_fbo_rb);
+    if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER_) != GL_FRAMEBUFFER_COMPLETE_) {
+        LOGE("glide: frame buffer object incomplete");
+        return 0;
+    }
+
+    glGetIntegerv(GL_MAX_SAMPLES_, &maxs);
+    if (samples > maxs) samples = maxs;
+    if (samples > 1) {
+        p_glGenRenderbuffers(1, &g_fbo_ms_col);
+        p_glBindRenderbuffer(GL_RENDERBUFFER_, g_fbo_ms_col);
+        p_glRenderbufferStorageMultisample(GL_RENDERBUFFER_, samples, GL_RGBA8_,
+                                           g_fbw, g_fbh);
+        p_glGenRenderbuffers(1, &g_fbo_ms_ds);
+        p_glBindRenderbuffer(GL_RENDERBUFFER_, g_fbo_ms_ds);
+        p_glRenderbufferStorageMultisample(GL_RENDERBUFFER_, samples,
+                                           GL_DEPTH24_STENCIL8_, g_fbw, g_fbh);
+        p_glGenFramebuffers(1, &g_fbo_ms);
+        p_glBindFramebuffer(GL_FRAMEBUFFER_, g_fbo_ms);
+        p_glFramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_,
+                                    GL_RENDERBUFFER_, g_fbo_ms_col);
+        p_glFramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_DEPTH_STENCIL_ATTACHMENT_,
+                                    GL_RENDERBUFFER_, g_fbo_ms_ds);
+        if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER_) !=
+            GL_FRAMEBUFFER_COMPLETE_) {
+            LOGW("glide: %dx MSAA target incomplete; rendering without", samples);
+            p_glBindFramebuffer(GL_FRAMEBUFFER_, g_fbo);
+            g_fbo_ms = 0;
+            samples = 0;
+        }
+    }
+
+    /* 640x480 colour-only target the read-back downsamples into */
+    p_glGenRenderbuffers(1, &g_fbo_small_rb);
+    p_glBindRenderbuffer(GL_RENDERBUFFER_, g_fbo_small_rb);
+    p_glRenderbufferStorage(GL_RENDERBUFFER_, GL_RGBA8_, GLIDE_W, GLIDE_H);
+    p_glGenFramebuffers(1, &g_fbo_small);
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, g_fbo_small);
+    p_glFramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_,
+                                GL_RENDERBUFFER_, g_fbo_small_rb);
+
+    glGenTextures(1, &g_overlay_tex);
+    glBindTexture(GL_TEXTURE_2D, g_overlay_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, GLIDE_W, GLIDE_H, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, NULL);
+    glGenTextures(1, &g_mask_tex);
+
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_, &g_max_aniso);
+    if (g_max_aniso > 16.0f) g_max_aniso = 16.0f;
+
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0, 0, 0, 1);
+    glClearDepth(1.0);
+    glClearStencil(0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    LOGI("glide: frame buffer %dx%d (scale %d), MSAA %dx, anisotropy %.0fx",
+         g_fbw, g_fbh, scale, samples > 1 ? samples : 0, (double)g_max_aniso);
+    return 1;
+}
+
 static int gl_ensure_context(void)
 {
     if (g_gl_ready) return 1;
@@ -588,17 +774,15 @@ static int gl_ensure_context(void)
         LOGI("glide: OpenGL %s / %s", (const char *)glGetString(GL_VERSION),
              (const char *)glGetString(GL_RENDERER));
         LOGI("glide: drawable %dx%d, double-buffered=%d", dw, dh, db);
-        {   GLint zb = 0, sb = 0;
-            glGetIntegerv(GL_DEPTH_BITS, &zb);
-            glGetIntegerv(GL_STENCIL_BITS, &sb);
-            LOGI("glide: depth bits=%d stencil bits=%d", (int)zb, (int)sb);
-        }
     }
 
-    glViewport(0, 0, GLIDE_W, GLIDE_H);
+    if (!fbo_create()) return 0;
+
+    /* Glide's own 640x480 space, y down, mapped onto the whole FBO */
+    glViewport(0, 0, g_fbw, g_fbh);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(0, GLIDE_W, GLIDE_H, 0, -1, 1);   /* y down, as Glide's origin */
+    glOrtho(0, GLIDE_W, GLIDE_H, 0, -1, 1);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glEnable(GL_DEPTH_TEST);
@@ -657,8 +841,14 @@ static GLuint tex_upload(const uint8_t *data, int size, uint32_t key)
     glBindTexture(GL_TEXTURE_2D, id);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    /* Trilinear and anisotropic: the seabed recedes at a grazing angle for
+     * its whole extent, which is exactly where plain bilinear shimmers and
+     * smears. */
+    p_glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR_);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    if (g_max_aniso > 1.0f)
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_, g_max_aniso);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 
@@ -667,53 +857,158 @@ static GLuint tex_upload(const uint8_t *data, int size, uint32_t key)
     return id;
 }
 
-/* Draw g_vram over the colour buffer without touching depth.
- *
- * The Glide frame buffer is persistent: the cockpit is painted once and only
- * the moving parts are redrawn, and the per-frame "clear" is a full-viewport
- * quad drawn with GR_CMP_NOTEQUAL -- which makes the *depth* buffer a cockpit
- * mask. Pixels the 3D never touches keep the far value the initial
- * grBufferClear left, so the quad is rejected there and the cockpit survives.
- * That only holds if GL's colour buffer really is the persistent frame
- * buffer, so it is seeded from g_vram once per frame before any triangle.
- * Depth is deliberately left alone: it has to carry across frames for the
- * mask to mean anything. */
-static void gl_seed_color_from_vram(void)
+/* Depth starts fresh every frame. Within the frame the ordering is all this
+ * game needs, and the stencil (the cockpit mask) is left alone. */
+static void frame_begin(void)
 {
-    if (g_frame_seeded || !g_vram) return;
-    g_frame_seeded = 1;
-
+    if (g_frame_started) return;
+    g_frame_started = 1;
     glDisable(GL_SCISSOR_TEST);
-    if (g_prog) p_glUseProgram(0);   /* a plain blit, not scene geometry */
-    glDisable(GL_STENCIL_TEST);        /* the seed covers the whole screen */
-    glDisable(GL_FOG);                 /* ...and is not part of the scene   */
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glDisable(GL_BLEND);
-    glDisable(GL_ALPHA_TEST);
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_blit_tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, GLIDE_W, GLIDE_H, 0,
-                 GL_RGB, GL_UNSIGNED_SHORT_5_6_5, g_vram);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    glColor4f(1, 1, 1, 1);
-    glBegin(GL_QUADS);
-        glTexCoord2f(0, 0); glVertex3f(0,       0,       0);
-        glTexCoord2f(1, 0); glVertex3f(GLIDE_W, 0,       0);
-        glTexCoord2f(1, 1); glVertex3f(GLIDE_W, GLIDE_H, 0);
-        glTexCoord2f(0, 1); glVertex3f(0,       GLIDE_H, 0);
-    glEnd();
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-
-    /* Depth starts fresh every frame. The back buffer's depth is undefined
-     * after a swap, so nothing may carry across it; within the frame the
-     * ordering is all this game needs. */
     glDepthMask(GL_TRUE);
     glClearDepth(1.0);
     glClear(GL_DEPTH_BUFFER_BIT);
     glEnable(GL_SCISSOR_TEST);
+}
+
+/* The FBO holding the finished pixels: resolve the multisampled target into
+ * the single-sample one first if there is one. Leaves the draw FBO bound. */
+static GLuint resolve_fbo(void)
+{
+    if (g_fbo_ms) {
+        p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_ms);
+        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_fbo);
+        glDisable(GL_SCISSOR_TEST);
+        p_glBlitFramebuffer(0, 0, g_fbw, g_fbh, 0, 0, g_fbw, g_fbh,
+                            GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glEnable(GL_SCISSOR_TEST);
+        p_glBindFramebuffer(GL_FRAMEBUFFER_, g_fbo_ms);
+    }
+    return g_fbo;
+}
+
+/* Draw a rectangle of 640x480-space pixels into the frame buffer. `px` is
+ * 0xAABBGGRR, `stride` in pixels; alpha 0 leaves the frame buffer as it was.
+ * Plain fixed-function blit: no depth, no stencil, no fog, no clip. */
+static void overlay_draw(const uint32_t *px, int stride, int x, int y, int w,
+                         int h, int filter_linear)
+{
+    GLint f = filter_linear ? GL_LINEAR : GL_NEAREST;
+    float u0 = x / (float)GLIDE_W, v0 = y / (float)GLIDE_H;
+    float u1 = (x + w) / (float)GLIDE_W, v1 = (y + h) / (float)GLIDE_H;
+
+    if (w <= 0 || h <= 0) return;
+    if (g_prog) p_glUseProgram(0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_FOG);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, g_overlay_tex);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glColor4f(1, 1, 1, 1);
+    glBegin(GL_QUADS);
+        glTexCoord2f(u0, v0); glVertex3f((float)x,       (float)y,       0);
+        glTexCoord2f(u1, v0); glVertex3f((float)(x + w), (float)y,       0);
+        glTexCoord2f(u1, v1); glVertex3f((float)(x + w), (float)(y + h), 0);
+        glTexCoord2f(u0, v1); glVertex3f((float)x,       (float)(y + h), 0);
+    glEnd();
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glDisable(GL_BLEND);
+    glEnable(GL_SCISSOR_TEST);
+}
+
+static uint32_t rgb565_to_abgr(uint16_t v, uint32_t alpha)
+{
+    uint32_t r = (v >> 11) & 31, g = (v >> 5) & 63, b = v & 31;
+    return ((r << 3) | (r >> 2)) | (((g << 2) | (g >> 4)) << 8) |
+           (((b << 3) | (b >> 2)) << 16) | alpha;
+}
+
+/* Bring g_vram up to date with the FBO, downsampled to 640x480. */
+static void lfb_sync_from_gl(void)
+{
+    static uint16_t px[GLIDE_W * GLIDE_H];
+    int y;
+
+    if (g_vram_valid || !g_gl_ready || !g_vram) return;
+    g_vram_valid = 1;
+    p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, resolve_fbo());
+    p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_fbo_small);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBlitFramebuffer(0, 0, g_fbw, g_fbh, 0, 0, GLIDE_W, GLIDE_H,
+                        GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_small);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, GLIDE_W, GLIDE_H, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, px);
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
+    glEnable(GL_SCISSOR_TEST);
+
+    /* GL reads bottom-up; the game's frame buffer is top-down. */
+    for (y = 0; y < GLIDE_H; y++)
+        memcpy((uint16_t *)g_vram + (size_t)y * GLIDE_W,
+               px + (size_t)(GLIDE_H - 1 - y) * GLIDE_W, GLIDE_W * 2);
+    memcpy(g_lfb_snap, g_vram, sizeof g_lfb_snap);
+}
+
+/* Push what the game wrote into g_vram since it was handed out back into the
+ * FBO: only the pixels that differ from the snapshot, so 3D the game did not
+ * paint over keeps its full resolution. */
+static void lfb_flush(void)
+{
+    static uint32_t rgba[GLIDE_W * GLIDE_H];
+    const uint16_t *cur = (const uint16_t *)g_vram;
+    int x, y, x0 = GLIDE_W, y0 = GLIDE_H, x1 = -1, y1 = -1;
+
+    if (!g_lfb_pending || !g_gl_ready || !g_vram) return;
+    g_lfb_pending = g_lock_depth > 0;      /* still handed out: keep watching */
+
+    for (y = 0; y < GLIDE_H; y++) {
+        const uint16_t *c = cur + (size_t)y * GLIDE_W;
+        const uint16_t *s = g_lfb_snap + (size_t)y * GLIDE_W;
+        if (!memcmp(c, s, GLIDE_W * 2)) continue;
+        if (y < y0) y0 = y;
+        y1 = y;
+        for (x = 0; x < GLIDE_W; x++)
+            if (c[x] != s[x]) { if (x < x0) x0 = x; if (x > x1) x1 = x; }
+    }
+    if (x1 < 0) return;
+
+    /* one pixel of margin, so a filtered upload samples current neighbours */
+    if (x0 > 0) x0--;
+    if (y0 > 0) y0--;
+    if (x1 < GLIDE_W - 1) x1++;
+    if (y1 < GLIDE_H - 1) y1++;
+    for (y = y0; y <= y1; y++) {
+        const uint16_t *c = cur + (size_t)y * GLIDE_W;
+        const uint16_t *s = g_lfb_snap + (size_t)y * GLIDE_W;
+        uint32_t *d = rgba + (size_t)y * GLIDE_W;
+        for (x = x0; x <= x1; x++)
+            d[x] = rgb565_to_abgr(c[x], c[x] != s[x] ? 0xFF000000u : 0);
+    }
+    overlay_draw(rgba + (size_t)y0 * GLIDE_W + x0, GLIDE_W, x0, y0,
+                 x1 + 1 - x0, y1 + 1 - y0, g_smooth2d);
+    for (y = y0; y <= y1; y++)
+        memcpy(g_lfb_snap + (size_t)y * GLIDE_W + x0,
+               cur + (size_t)y * GLIDE_W + x0, (size_t)(x1 + 1 - x0) * 2);
+}
+
+/* Scissor in 640x480 space, upper-left origin, onto the FBO. */
+static void scissor_virtual(int x0, int y0, int x1, int y1)
+{
+    float sx = g_fbw / (float)GLIDE_W, sy = g_fbh / (float)GLIDE_H;
+    glScissor((GLint)(x0 * sx + 0.5f), (GLint)((GLIDE_H - y1) * sy + 0.5f),
+              (GLsizei)((x1 - x0) * sx + 0.5f), (GLsizei)((y1 - y0) * sy + 0.5f));
 }
 
 static uint32_t gl_draw_triangle(uint32_t *a)
@@ -722,17 +1017,6 @@ static uint32_t gl_draw_triangle(uint32_t *a)
     int i, bias_mode;
 
     g_tris++;
-    /* Does the game draw 3D *after* touching the frame buffer? If it does,
-     * the read-back/blit round trip loses it: the snapshot taken at the lock
-     * is blitted over everything at swap, so any later geometry vanishes from
-     * the image while the depth buffer still says it was drawn. */
-    if (g_lfb_dirty) {
-        g_tris_after_lfb++;
-        if (g_tris_after_lfb == 1 || (g_tris_after_lfb % 20000) == 0)
-            LOGW("glide: %u triangles drawn AFTER an LFB lock (frame %u) -- "
-                 "these are lost by the read-back blit",
-                 g_tris_after_lfb, g_glide_frame);
-    }
     {   /* Rough area, which is all a fill-rate sample needs. */
         const float *q0 = (const float *)(uintptr_t)a[0];
         const float *q1 = (const float *)(uintptr_t)a[1];
@@ -744,7 +1028,9 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         g_ps_out += (uint32_t)(ar * 0.5f);
     }
     if (!gl_ensure_context()) return 0;
-    gl_seed_color_from_vram();
+    lfb_flush();               /* the game's 2D so far lies under this */
+    frame_begin();
+    g_vram_valid = 0;
 
     v[0] = (const float *)(uintptr_t)a[0];
     v[1] = (const float *)(uintptr_t)a[1];
@@ -1050,9 +1336,7 @@ static uint32_t gl_clip_window(uint32_t *a)
     if (g_clip_y1 > GLIDE_H) g_clip_y1 = GLIDE_H;
     if (!gl_ensure_context()) return 0;
     glEnable(GL_SCISSOR_TEST);
-    /* Glide's origin is upper-left; GL scissors from the lower-left. */
-    glScissor((GLint)a[0], (GLint)(GLIDE_H - a[3]),
-              (GLsizei)(a[2] - a[0]), (GLsizei)(a[3] - a[1]));
+    scissor_virtual(g_clip_x0, g_clip_y0, g_clip_x1, g_clip_y1);
     LOGI("glide: clip window %u,%u .. %u,%u", a[0], a[1], a[2], a[3]);
     return 0;
 }
@@ -1159,43 +1443,12 @@ static uint32_t gl_buffer_clear(uint32_t *a)
         glClearColor(cr, cg, cb, 1.0f);
     }
     glClearDepth(1.0);
+    lfb_flush();
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    g_vram_valid = 0;
     return 0;
 }
 
-/* The 3D result has to exist as CPU pixels before the game writes its HUD on
- * top of it, because it writes through the pointer this hands back. Reading
- * back once, on the frame's first lock, is what keeps the two layers in the
- * one buffer Glide's callers assume. */
-static void lfb_sync_from_gl(void)
-{
-    static uint16_t band[GLIDE_W * GLIDE_H];
-    int w = g_clip_x1 - g_clip_x0, h = g_clip_y1 - g_clip_y0, y;
-
-    if (g_lfb_synced || !g_gl_ready || !g_vram) return;
-    g_lfb_synced = 1;
-    if (w <= 0 || h <= 0) return;
-
-    /* Only the clip rectangle. The frame buffer is persistent as far as this
-     * game is concerned: it paints the cockpit once and thereafter redraws
-     * only the moving parts of the HUD, so a full-screen read-back would
-     * erase the cockpit every frame -- which is exactly what it did. The 3D
-     * never renders outside the clip window anyway. */
-    glDisable(GL_SCISSOR_TEST);
-    glReadPixels(g_clip_x0, GLIDE_H - g_clip_y1, w, h,
-                 GL_RGB, GL_UNSIGNED_SHORT_5_6_5, band);
-    glEnable(GL_SCISSOR_TEST);
-
-    /* GL reads bottom-up; the game's frame buffer is top-down. Pixels the
-     * game owns -- the cockpit it painted through the LFB and then never
-     * repaints -- are skipped. Without that the 3D erases them: the game
-     * "clears" each frame with a quad spanning the whole clip window, and on
-     * this build the cockpit is not redrawn afterwards, so it has to survive
-     * in the frame buffer rather than be regenerated. */
-    for (y = 0; y < h; y++)
-        memcpy((uint16_t *)g_vram + (size_t)(g_clip_y0 + y) * GLIDE_W + g_clip_x0,
-               band + (size_t)(h - 1 - y) * w, (size_t)w * 2);
-}
 
 /* Turn the aux buffer the game wrote into a stencil mask.
  *
@@ -1229,27 +1482,50 @@ static void aux_init(void)
 
 static void aux_upload_mask(void)
 {
-    static GLubyte sten[GLIDE_W * GLIDE_H];
+    static GLubyte mask[GLIDE_W * GLIDE_H];
     uint32_t zero = 0;
-    int x, y;
+    int i;
 
     if (!g_gl_ready) return;
-
-    /* GL is bottom-up, the game's buffer top-down. */
-    for (y = 0; y < GLIDE_H; y++) {
-        const uint16_t *src = g_auxbuf + (size_t)(GLIDE_H - 1 - y) * GLIDE_W;
-        GLubyte        *dst = sten + (size_t)y * GLIDE_W;
-        for (x = 0; x < GLIDE_W; x++) {
-            dst[x] = src[x] == 0 ? 1 : 0;      /* 1 = masked off */
-            zero += src[x] == 0;
-        }
+    for (i = 0; i < GLIDE_W * GLIDE_H; i++) {
+        mask[i] = g_auxbuf[i] == 0 ? 255 : 0;      /* 255 = masked off */
+        zero += g_auxbuf[i] == 0;
     }
 
+    /* Stamped into the stencil at the frame buffer's own resolution, by a
+     * full-screen quad that only survives the alpha test where masked. */
+    glBindTexture(GL_TEXTURE_2D, g_mask_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, GLIDE_W, GLIDE_H, 0, GL_ALPHA,
+                 GL_UNSIGNED_BYTE, mask);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    if (g_prog) p_glUseProgram(0);
     glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_BLEND);
+    glDisable(GL_FOG);
     glStencilMask(0xFF);
-    glRasterPos2i(0, GLIDE_H);
-    glDrawPixels(GLIDE_W, GLIDE_H, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, sten);
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
+    glEnable(GL_STENCIL_TEST);
+    glStencilFunc(GL_ALWAYS, 1, 0xFF);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glEnable(GL_ALPHA_TEST);
+    glEnable(GL_TEXTURE_2D);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex3f(0,       0,       0);
+        glTexCoord2f(1, 0); glVertex3f(GLIDE_W, 0,       0);
+        glTexCoord2f(1, 1); glVertex3f(GLIDE_W, GLIDE_H, 0);
+        glTexCoord2f(0, 1); glVertex3f(0,       GLIDE_H, 0);
+    glEnd();
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_STENCIL_TEST);
     glEnable(GL_SCISSOR_TEST);
     g_mask_ready = 1;
     LOGI("glide: cockpit mask from aux buffer: %u of %u pixels masked off",
@@ -1284,8 +1560,10 @@ static uint32_t gl_lfb_lock(uint32_t *a)
     }
 
     if (!g_vram) return 0;
+    lfb_flush();
     lfb_sync_from_gl();
-    g_lfb_dirty = 1;
+    g_lfb_pending = 1;
+    g_lock_depth++;
     info[1] = (uint32_t)(uintptr_t)g_vram;
     info[2] = GLIDE_W * 2;
     info[3] = a[2];
@@ -1298,233 +1576,104 @@ static uint32_t gl_lfb_unlock(uint32_t *a)
     if (a[1] == 2 && g_aux_locked) {
         g_aux_locked = 0;
         aux_upload_mask();
+    } else if (a[1] != 2 && g_lock_depth > 0) {
+        g_lock_depth--;
+        lfb_flush();
     }
     return 1;
 }
 
-/* Whatever the game composited on the CPU is the finished frame, so it goes
- * back over the 3D as a full-screen blit. Frames that never locked the buffer
- * are pure GL and just get swapped. */
+/* The FBO is the finished frame: scale it into the window, 4:3 and centred,
+ * and swap. Nothing is cleared -- the frame buffer is persistent. */
+static void present(void)
+{
+    int dw = g_fbw, dh = g_fbh, vw, vh, vx, vy;
+    GLuint src = resolve_fbo();
+
+    SDL_GL_GetDrawableSize(video_window(), &dw, &dh);
+    if ((long)dw * 3 > (long)dh * 4) { vh = dh; vw = dh * 4 / 3; }
+    else                             { vw = dw; vh = dw * 3 / 4; }
+    vx = (dw - vw) / 2;
+    vy = (dh - vh) / 2;
+
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, 0);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, src);
+    p_glBlitFramebuffer(0, 0, g_fbw, g_fbh, vx, vy, vx + vw, vy + vh,
+                        GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    SDL_GL_SwapWindow(video_window());
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
+    glEnable(GL_SCISSOR_TEST);
+}
+
+/* script "shot": the frame buffer at its own resolution, not the window. */
+static void shot_from_fbo(const char *path)
+{
+    uint8_t *px = (uint8_t *)malloc((size_t)g_fbw * g_fbh * 3);
+    if (!px) return;
+    p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, resolve_fbo());
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, g_fbw, g_fbh, 0x80E0 /* GL_BGR */, GL_UNSIGNED_BYTE, px);
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
+    write_bmp24(path, g_fbw, g_fbh, px, g_fbw * 3);   /* both bottom-up */
+    free(px);
+}
+
 static uint32_t gl_buffer_swap(uint32_t *a)
 {
     (void)a;
     g_glide_frame++;
     if (!gl_ensure_context()) return 0;
 
-    if (g_lfb_dirty) {
-        /* The window is larger than Glide's 640x480 -- video_init opens it at
-         * twice that -- and everything above renders into a 640x480 viewport
-         * so the read-backs line up with the frame buffer. Only this final
-         * present covers the whole window; without it GL paints one quarter
-         * of the window and the rest is never drawn at all, which is what an
-         * apparently blank window turned out to be. */
-        int dw = GLIDE_W * 2, dh = GLIDE_H * 2;
-        SDL_GL_GetDrawableSize(video_window(), &dw, &dh);
-        glViewport(0, 0, dw, dh);
-
-        glDisable(GL_SCISSOR_TEST);
-        if (g_prog) p_glUseProgram(0);   /* a plain blit, not scene geometry */
-        glDisable(GL_STENCIL_TEST);    /* the present covers the whole window */
-        glDisable(GL_FOG);             /* the composited frame is not fogged */
-        glDisable(GL_DEPTH_TEST);
-        glDisable(GL_BLEND);
-        glDisable(GL_ALPHA_TEST);
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, g_blit_tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, GLIDE_W, GLIDE_H, 0,
-                     GL_RGB, GL_UNSIGNED_SHORT_5_6_5, g_vram);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-        glColor4f(1, 1, 1, 1);
-        glBegin(GL_QUADS);
-            glTexCoord2f(0, 0); glVertex3f(0,       0,       0);
-            glTexCoord2f(1, 0); glVertex3f(GLIDE_W, 0,       0);
-            glTexCoord2f(1, 1); glVertex3f(GLIDE_W, GLIDE_H, 0);
-            glTexCoord2f(0, 1); glVertex3f(0,       GLIDE_H, 0);
-        glEnd();
-        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-        glViewport(0, 0, GLIDE_W, GLIDE_H);   /* back to Glide's own size */
-        glEnable(GL_SCISSOR_TEST);
-    }
-
-    /* --dumpsec N: capture colour and depth N seconds in, so a human can fly
-     * to the thing that looks wrong first. Frame counts are no use for that
-     * at ~1500 fps. Both buffers come from the same frame, and the depth goes
-     * out as raw floats as well as an image so it can be measured rather than
-     * eyeballed. */
-    if (g_dumpsec > 0) {
-        static Uint32 t0;
-        static int done;
-        Uint32 now = SDL_GetTicks();
-        if (!t0) t0 = now;
-        if (g_probe_now) {                 /* one frame only */
-            g_probe_now = 0;
-            LOGI("probe %d,%d: %u triangles covered this pixel",
-                 g_probe_x, g_probe_y, g_probe_hits);
-        }
-        if (!done && now - t0 >= (Uint32)g_dumpsec * 1000) {
-            if (g_probe_x >= 0) { g_probe_now = 1; g_probe_hits = 0; }
-            static GLfloat  d[GLIDE_W * GLIDE_H];
-            static uint16_t g[GLIDE_W * GLIDE_H];
-            const char *dir = "C:/Users/martin/AppData/Local/Temp/claude/"
-                              "D--Schleichfahrt-Schleichfahrt-ASMPort/"
-                              "1d71cff4-70be-4860-a570-9e715e79da0a/scratchpad/";
-            char path[512];
-            FILE *f;
-            int x, y, dw = GLIDE_W, dh = GLIDE_H;
-            uint16_t *shot;
-            float lo = 1.0f, hi = 0.0f;
-
-            done = 1;
-            glDisable(GL_SCISSOR_TEST);
-
-            /* depth, straight off the buffer this frame */
-            glReadPixels(0, 0, GLIDE_W, GLIDE_H, GL_DEPTH_COMPONENT, GL_FLOAT, d);
-            sprintf(path, "%sgrab_depth.raw", dir);
-            if ((f = fopen(path, "wb")) != NULL) {
-                fwrite(d, sizeof(GLfloat), GLIDE_W * GLIDE_H, f); fclose(f);
-            }
-            for (x = 0; x < GLIDE_W * GLIDE_H; x++) {
-                if (d[x] < lo) lo = d[x];
-                if (d[x] > hi && d[x] < 1.0f) hi = d[x];
-            }
-            for (y = 0; y < GLIDE_H; y++)
-                for (x = 0; x < GLIDE_W; x++) {
-                    float v = d[y * GLIDE_W + x];
-                    int   n = (int)(255.0f * (hi > lo ? (v - lo) / (hi - lo) : 0));
-                    if (n < 0) n = 0;
-                    if (n > 255) n = 255;
-                    g[(GLIDE_H - 1 - y) * GLIDE_W + x] =
-                        (uint16_t)(((n & 0xF8) << 8) | ((n & 0xFC) << 3) | (n >> 3));
-                }
-            sprintf(path, "%sgrab_depth.bin", dir);
-            if ((f = fopen(path, "wb")) != NULL) {
-                fwrite(g, 2, GLIDE_W * GLIDE_H, f); fclose(f);
-            }
-
-            /* colour, the whole window as presented */
-            SDL_GL_GetDrawableSize(video_window(), &dw, &dh);
-            shot = (uint16_t *)malloc((size_t)dw * dh * 2);
-            if (shot) {
-                glReadPixels(0, 0, dw, dh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, shot);
-                sprintf(path, "%sgrab_color.bin", dir);
-                if ((f = fopen(path, "wb")) != NULL) {
-                    for (y = dh - 1; y >= 0; y--)
-                        fwrite(shot + (size_t)y * dw, 2, dw, f);
-                    fclose(f);
-                }
-                free(shot);
-            }
-            glEnable(GL_SCISSOR_TEST);
-            LOGI("glide: captured colour %dx%d and depth %dx%d at %u s "
-                 "(depth range %.6f..%.6f)", dw, dh, GLIDE_W, GLIDE_H,
-                 g_dumpsec, lo, hi);
-        }
-    }
-
-    /* --dumpvram N: the normal path lives in render_frame, which glide mode
-     * never runs. Read the whole drawable after the present, so what lands in
-     * the file is exactly what the window shows -- reading a 640x480 corner
-     * of a 1280x960 window is how a blank window went unnoticed. */
-    if (g_glidedebug == 7 && g_dumpvram_frames == 1) {
-        static GLfloat d[GLIDE_W * GLIDE_H];
-        static uint16_t g[GLIDE_W * GLIDE_H];
-        FILE *f;
-        int x, y;
-        glDisable(GL_SCISSOR_TEST);
-        glReadPixels(0, 0, GLIDE_W, GLIDE_H, GL_DEPTH_COMPONENT, GL_FLOAT, d);
-        glEnable(GL_SCISSOR_TEST);
-        /* Stretch the used range so the gradient is actually visible. */
-        {   float lo = 1.0f, hi = 0.0f;
-            for (x = 0; x < GLIDE_W * GLIDE_H; x++) {
-                if (d[x] < lo) lo = d[x];
-                if (d[x] > hi && d[x] < 1.0f) hi = d[x];
-            }
-            LOGI("glide: depth buffer range %.6f .. %.6f", lo, hi);
-            for (y = 0; y < GLIDE_H; y++)
-                for (x = 0; x < GLIDE_W; x++) {
-                    float v = d[y * GLIDE_W + x];
-                    int   n = (int)(255.0f * (hi > lo ? (v - lo) / (hi - lo) : 0));
-                    if (n < 0) n = 0; if (n > 255) n = 255;
-                    g[(GLIDE_H - 1 - y) * GLIDE_W + x] =
-                        (uint16_t)(((n & 0xF8) << 8) | ((n & 0xFC) << 3) | (n >> 3));
-                }
-        }
-        if ((f = fopen("depth.bin", "wb")) != NULL) {
-            fwrite(g, 2, GLIDE_W * GLIDE_H, f); fclose(f);
-            LOGI("glide: dumped depth buffer to depth.bin");
-        }
-    }
-
-    if (g_dumpvram_frames > 0 && --g_dumpvram_frames == 0) {
-        int dw = GLIDE_W, dh = GLIDE_H;
-        uint16_t *shot;
-        FILE *f;
-        SDL_GL_GetDrawableSize(video_window(), &dw, &dh);
-        shot = (uint16_t *)malloc((size_t)dw * dh * 2);
-        if (shot) {
-            int y;
-            glReadPixels(0, 0, dw, dh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, shot);
-            if ((f = fopen("vram.bin", "wb")) != NULL) {
-                for (y = dh - 1; y >= 0; y--)          /* GL reads bottom-up */
-                    fwrite(shot + (size_t)y * dw, 2, dw, f);
-                fclose(f);
-                LOGI("glide: dumped %dx%d window to vram.bin", dw, dh);
-            }
-            free(shot);
-        }
-    }
-
+    lfb_flush();
     if (script_shot_wanted()) {
-        int dw = GLIDE_W, dh = GLIDE_H;
-        uint8_t *px;
-        SDL_GL_GetDrawableSize(video_window(), &dw, &dh);
-        px = (uint8_t *)malloc((size_t)dw * dh * 3);
-        if (px) {
-            glDisable(GL_SCISSOR_TEST);
-            glPixelStorei(GL_PACK_ALIGNMENT, 1);
-            glReadPixels(0, 0, dw, dh, 0x80E0 /* GL_BGR */, GL_UNSIGNED_BYTE, px);
-            glEnable(GL_SCISSOR_TEST);
-            write_bmp24(script_shot_wanted(), dw, dh, px, dw * 3);  /* GL is bottom-up, as BMP */
-            free(px);
-        }
+        shot_from_fbo(script_shot_wanted());
         script_shot_done();
     }
-
-    SDL_GL_SwapWindow(video_window());
+    present();
 
     /* End of frame -- deliberately not grBufferClear. This game calls
      * grBufferClear exactly once for the entire run and clears each frame by
-     * drawing a full-viewport quad with GR_CMP_NOTEQUAL instead, which resets
-     * the depth buffer as a side effect. Resetting the read-back flag there
-     * syncs the frame buffer once and then leaves the 3D frozen for the rest
-     * of the run, which is exactly what it looked like. */
+     * drawing a full-viewport quad with GR_CMP_NOTEQUAL instead. */
     if ((g_glide_frame % 500) == 0)
         LOGI("glide: frame %u, %u triangles, tex %u hit / %u miss, pal=%d",
              g_glide_frame, g_tris, g_tex_hit, g_tex_miss, g_pal_valid);
-    g_lfb_synced   = 0;
-    g_lfb_dirty    = 0;
-    g_frame_seeded = 0;
+    g_frame_started = 0;
     return 0;
 }
 
-/* (dst_buffer, dst_x, dst_y, src_format, w, h, src_stride, src_data) */
+/* (dst_buffer, dst_x, dst_y, src_format, w, h, src_stride, src_data). The
+ * full-screen ones are the cockpit art and are drawn filtered. */
 static uint32_t gl_lfb_write_region(uint32_t *a)
 {
+    static uint32_t rgba[GLIDE_W * GLIDE_H];
     const uint8_t *src = (const uint8_t *)(uintptr_t)a[7];
-    uint32_t x = a[1], y = a[2], w = a[4], h = a[5], r;
+    uint32_t x = a[1], y = a[2], w = a[4], h = a[5], r, c;
     int32_t  stride = (int32_t)a[6];
 
-    if (!src || !g_vram) return 0;
-    lfb_sync_from_gl();
-    g_lfb_dirty = 1;
+    if (!src || !g_vram || !gl_ensure_context()) return 0;
     if (x >= GLIDE_W || y >= GLIDE_H) return 0;
     if (w > GLIDE_W - x) w = GLIDE_W - x;
     if (h > GLIDE_H - y) h = GLIDE_H - y;
-    for (r = 0; r < h; r++)
-        memcpy(g_vram + ((size_t)(y + r) * GLIDE_W + x) * 2,
-               src + (int32_t)r * stride, w * 2);
+    lfb_flush();               /* earlier CPU writes lie under this one */
+
+    for (r = 0; r < h; r++) {
+        const uint16_t *s = (const uint16_t *)(src + (int32_t)r * stride);
+        for (c = 0; c < w; c++) rgba[r * w + c] = rgb565_to_abgr(s[c], 0xFF000000u);
+    }
+    overlay_draw(rgba, (int)w, (int)x, (int)y, (int)w, (int)h,
+                 g_smooth2d || (w == GLIDE_W && h == GLIDE_H));
+
+    /* keep the CPU view current if it is, so the next lock need not re-read */
+    if (g_vram_valid)
+        for (r = 0; r < h; r++) {
+            memcpy(g_vram + ((size_t)(y + r) * GLIDE_W + x) * 2,
+                   src + (int32_t)r * stride, w * 2);
+            memcpy(g_lfb_snap + (size_t)(y + r) * GLIDE_W + x,
+                   src + (int32_t)r * stride, w * 2);
+        }
     return 1;
 }
 
@@ -1534,7 +1683,8 @@ static uint32_t gl_lfb_read_region(uint32_t *a)
     uint8_t *dst = (uint8_t *)(uintptr_t)a[6];
     uint32_t x = a[1], y = a[2], w = a[3], h = a[4], stride = a[5], r;
 
-    if (!dst || !g_vram) return 0;
+    if (!dst || !g_vram || !gl_ensure_context()) return 0;
+    lfb_flush();
     lfb_sync_from_gl();
     if (x >= GLIDE_W || y >= GLIDE_H) return 0;
     if (w > GLIDE_W - x) w = GLIDE_W - x;
