@@ -83,9 +83,17 @@ void script_load(const char *path, const char *mode, int index)
          path);
 }
 
+/* SDL's names, with '_' for a space ("Keypad_0") since arguments split on
+ * whitespace. */
 static SDL_Scancode key_named(const char *name)
 {
-    SDL_Scancode sc = SDL_GetScancodeFromName(name);
+    char buf[64];
+    SDL_Scancode sc;
+    int i;
+    for (i = 0; name[i] && i < (int)sizeof buf - 1; i++)
+        buf[i] = name[i] == '_' ? ' ' : name[i];
+    buf[i] = 0;
+    sc = SDL_GetScancodeFromName(buf);
     if (sc == SDL_SCANCODE_UNKNOWN) LOGW("script: unknown key '%s'", name);
     return sc;
 }

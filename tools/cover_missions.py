@@ -66,7 +66,7 @@ def main() -> None:
             try:
                 p = subprocess.run(
                     [str(EXE), "--assets", str(GAME), "--mode", args.mode,
-                     "--script", str(ROOT / "runs" / "cover.txt"),
+                     "--script", str(ROOT / "tools" / "cover.txt"),
                      "--shotdir", str(RUNS / mission),
                      "--dump", str(ROOT / args.dump)],
                     cwd=RUNS, timeout=args.seconds,

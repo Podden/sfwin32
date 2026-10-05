@@ -1,0 +1,32 @@
+# coverage pass: walk into the mission, look around, cycle targets
+wait 5000
+key Return
+wait 3000
+key Return
+wait 3000
+key Return
+wait 2000
+down Left
+wait 6000
+up Left
+down Up
+wait 1500
+up Up
+down Right
+wait 5000
+up Right
+key T
+wait 1500
+key T
+wait 1500
+key T
+wait 1500
+key T
+wait 1500
+shot cover
+down Down
+wait 2500
+up Down
+key U
+wait 2000
+quit

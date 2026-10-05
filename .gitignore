@@ -34,3 +34,9 @@ analysis/
 # local game data and build deps
 game/
 third_party/
+
+# Game-derived output: dumps, HD replacements, screenshots, run logs
+dump*/
+hd/
+runs/
+build*/
