@@ -1453,6 +1453,9 @@ static uint32_t gl_alpha_blend(uint32_t *a)
     return 0;
 }
 
+static void aux_init(void);
+static void aux_upload_mask(void);
+
 /* grBufferClear(color, alpha, depth) */
 static uint32_t gl_buffer_clear(uint32_t *a)
 {
@@ -1466,6 +1469,23 @@ static uint32_t gl_buffer_clear(uint32_t *a)
     lfb_flush();
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     g_vram_valid = 0;
+
+    /* A real clear writes the depth value over the aux buffer as well, and
+     * with it over the cockpit mask's zeros. The outside views (chase, look
+     * at, death) clear this way every frame instead of drawing the masked
+     * clear quad, and must not keep the cockpit's silhouette. */
+    if (g_depth_mask) {
+        int x, y;
+        aux_init();
+        for (y = g_clip_y0; y < g_clip_y1; y++)
+            for (x = g_clip_x0; x < g_clip_x1; x++)
+                g_auxbuf[y * GLIDE_W + x] = (uint16_t)a[2];
+        if (a[2] && g_clip_x0 == 0 && g_clip_y0 == 0 &&
+            g_clip_x1 == GLIDE_W && g_clip_y1 == GLIDE_H)
+            g_mask_ready = 0;
+        else if (g_mask_ready)
+            aux_upload_mask();
+    }
     return 0;
 }
 
