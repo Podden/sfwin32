@@ -26,6 +26,7 @@ add_executable(fightport
   src/glide.c
   src/script.c
   src/hd.c
+  src/media.c
 )
 
 target_include_directories(fightport PRIVATE src "${SDL2_ROOT}/include")
@@ -33,6 +34,10 @@ target_link_libraries(fightport PRIVATE
   "${SDL2_ROOT}/lib/x86/SDL2.lib"
   "${SDL2_ROOT}/lib/x86/SDL2main.lib"
   opengl32
+  mfplat
+  mfreadwrite
+  mfuuid
+  propsys
   winmm                    # timeBeginPeriod, for a usable IRQ0 tick rate
   windowscodecs ole32      # WIC, for --hd PNG replacements
 )

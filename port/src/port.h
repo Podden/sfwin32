@@ -207,6 +207,18 @@ void audio_select_image(int image);
 void audio_install_hooks(void);
 void audio_shutdown(void);
 
+/* media.c: audio files decoded through Media Foundation, to interleaved
+ * 16-bit stereo at the file's own rate. */
+typedef struct {
+    int16_t      *pcm;          /* cap frames, allocated by the decoder */
+    size_t        cap;
+    volatile LONG ready;        /* frames decoded so far                */
+    volatile LONG cancel;       /* set to stop the decoder early        */
+    int           rate;
+} media_pcm;
+uint32_t media_audio_length_ms(const char *path);
+int      media_decode_audio(const char *path, media_pcm *out);
+
 /* Polyphony. The game requests NumOfVoices from CONFIG.DES (ships as 8); this
  * raises the request. 16 is the most its own per-voice arrays can hold. */
 void audio_set_voice_count(int n);

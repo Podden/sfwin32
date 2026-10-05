@@ -27,6 +27,7 @@
 
 #include "port.h"
 #include <SDL.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -95,7 +96,8 @@ static int             g_image = AUDIO_IMAGE_FIGHT;
 #define SMP_STOPPED  0x0008
 
 #define MAX_VOICES   16
-#define MIX_RATE     22050
+#define MIX_RATE     44100     /* CD rate; the effects are resampled */
+#define DEFAULT_RATE 22050     /* a voice's rate until the game sets one */
 #define MIX_CHANNELS 2
 #define MIX_SAMPLES  1024
 
@@ -295,6 +297,8 @@ static uint32_t g_dbg_mixed, g_dbg_nonsilent;
 
 /* ------------------------------------------------------------- the mixer */
 
+static void cd_mix(int frames);      /* CD audio, further down */
+
 static void SDLCALL mix_cb(void *ud, Uint8 *stream, int len)
 {
     int frames = len / (MIX_CHANNELS * (int)sizeof(int16_t));
@@ -389,6 +393,8 @@ static void SDLCALL mix_cb(void *ud, Uint8 *stream, int len)
             g_sq_pos += step;
         }
     }
+
+    cd_mix(frames);
 
     /* Every voice can reach full scale on its own, so summing several of them
      * overflows -- which is what simultaneous sounds turn into: hard clipping,
@@ -488,7 +494,7 @@ static void *__cdecl h_allocate_sample_handle(void *dig)
         if (!g_voice[v].used) {
             memset(&g_voice[v], 0, sizeof g_voice[v]);
             g_voice[v].used = 1;
-            g_voice[v].rate = MIX_RATE;
+            g_voice[v].rate = DEFAULT_RATE;
             g_voice[v].volume = 127;
             g_voice[v].pan = 64;
             g_voice[v].loops = 1;
@@ -515,7 +521,7 @@ static void __cdecl h_init_sample(void *h)
     if (g_dev) SDL_LockAudioDevice(g_dev);
     s->playing = 0; s->data = NULL; s->len = 0; s->raw_bytes = 0; s->fmt = 0;
     s->pos = 0;
-    s->rate = MIX_RATE; s->volume = 127; s->pan = 64; s->loops = 1;
+    s->rate = DEFAULT_RATE; s->volume = 127; s->pan = 64; s->loops = 1;
     if (g_dev) SDL_UnlockAudioDevice(g_dev);
 }
 
@@ -862,6 +868,240 @@ static int32_t __cdecl h_sample_buffer_ready(void *handle)
     return slot;
 }
 
+/* ---- CD audio -----------------------------------------------------------
+ *
+ * The fight plays its music from the CD's audio tracks through Miles' Red
+ * Book API. The call sites in FIGHT.EXE (orig 0x62138-0x62326) settle the
+ * signatures, all cdecl like the rest of Miles: AIL_redbook_open(0) yields a
+ * handle, then per piece AIL_redbook_track_info(h, track, &start_ms, &end_ms)
+ * and AIL_redbook_play(h, start_ms, end_ms), with AIL_redbook_status polled
+ * for the end (1 playing, 3 stopped) and AIL_redbook_stop/close on the way
+ * out. The real implementation talks to MSCDEX, which is not there.
+ *
+ * Answered instead from ripped tracks, MUSIC\trackNN.<ext> in the asset
+ * directory (anything Media Foundation decodes), laid out on a virtual disc
+ * whose positions follow from the files' own lengths. Track 1 is the data
+ * track, as on the real CD. Without any track files open answers NULL, the
+ * same as "no CD drive", and the game carries on silent as before.
+ *
+ * DESKTOP.EXE links the same functions but its own code never calls them
+ * (every call site lies inside Miles itself), so only the fight images are
+ * hooked. FIGHT3's addresses are FIGHT's plus the constant 0x10920 found for
+ * the sample API above; both sets were named from their own format strings
+ * by ailtable3.py. */
+typedef enum {
+    RB_OPEN, RB_CLOSE, RB_PLAY, RB_STOP, RB_STATUS, RB_TRACK_INFO, RB_TRACKS,
+    RB_POSITION, RB_COUNT
+} rb_entry;
+
+static const uint32_t g_rb_fight[RB_COUNT] = {
+    0x0003CC30u, 0x0003CB80u, 0x0003C310u, 0x0003C210u,
+    0x0003C920u, 0x0003C730u, 0x0003C820u, 0x0003C530u
+};
+static const uint32_t g_rb_fight3[RB_COUNT] = {
+    0x0004D550u, 0x0004D4A0u, 0x0004CC30u, 0x0004CB30u,
+    0x0004D240u, 0x0004D050u, 0x0004D140u, 0x0004CE50u
+};
+
+#define REDBOOK_PLAYING 1
+#define REDBOOK_STOPPED 3
+#define CD_MAX_TRACKS   99
+#define CD_PREGAP_MS    2000
+#define CD_VOLUME       176         /* of 256: music under the effects */
+
+typedef struct {
+    media_pcm     pcm;
+    char          path[MAX_PATH];
+    volatile LONG refs;            /* the mixer's and the decoder's       */
+    volatile LONG decoded;         /* decoder finished                    */
+    double        pos;             /* fractional frame read position      */
+    uint32_t      start_ms;        /* disc position of the file's frame 0 */
+    uint32_t      stop_ms;         /* stop here, in file time             */
+    uint32_t      skip_ms;         /* start this far into the file        */
+    int           finished;
+} cd_play;
+
+static char      g_cd_path[CD_MAX_TRACKS + 1][MAX_PATH];
+static uint32_t  g_cd_start[CD_MAX_TRACKS + 1], g_cd_end[CD_MAX_TRACKS + 1];
+static int       g_cd_tracks;      /* highest track number, 0 = no disc */
+static cd_play  *g_cd;             /* what the mixer plays; audio lock */
+static uint32_t  g_cd_handle[4];   /* the HREDBOOK the game holds */
+
+static void cd_release(cd_play *p)
+{
+    if (p && InterlockedDecrement(&p->refs) == 0) {
+        free(p->pcm.pcm);
+        free(p);
+    }
+}
+
+static DWORD WINAPI cd_decode_thread(void *arg)
+{
+    cd_play *p = (cd_play *)arg;
+    if (!media_decode_audio(p->path, &p->pcm))
+        LOGW("audio: CD track %s could not be decoded", p->path);
+    InterlockedExchange(&p->decoded, 1);
+    cd_release(p);
+    return 0;
+}
+
+/* Called from mix_cb, under the audio lock. */
+static void cd_mix(int frames)
+{
+    cd_play *p = g_cd;
+    double step;
+    int i;
+
+    if (!p || p->finished || !p->pcm.rate) return;
+    if (p->skip_ms) { p->pos = (double)p->skip_ms * p->pcm.rate / 1000.0; p->skip_ms = 0; }
+    step = (double)p->pcm.rate / (double)MIX_RATE;
+    for (i = 0; i < frames; i++) {
+        uint32_t idx = (uint32_t)p->pos;
+        uint32_t ready = (uint32_t)p->pcm.ready;
+        double   f = p->pos - (double)idx;
+        const int16_t *a;
+
+        if ((double)idx * 1000.0 >= (double)p->stop_ms * p->pcm.rate ||
+            (p->decoded && idx + 1 >= ready)) {
+            p->finished = 1;
+            LOGI("audio: CD track %s finished", p->path);
+            break;
+        }
+        if (idx + 1 >= ready) break;          /* decoder behind: a short gap */
+        a = p->pcm.pcm + (size_t)idx * 2;
+        g_mixbuf[i * 2 + 0] += (int32_t)((a[0] + (a[2] - a[0]) * f) * CD_VOLUME / 256);
+        g_mixbuf[i * 2 + 1] += (int32_t)((a[1] + (a[3] - a[1]) * f) * CD_VOLUME / 256);
+        p->pos += step;
+    }
+}
+
+static void cd_switch(cd_play *next)
+{
+    cd_play *old;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    old = g_cd;
+    g_cd = next;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+    if (old) { InterlockedExchange(&old->pcm.cancel, 1); cd_release(old); }
+}
+
+static void cd_scan(void)
+{
+    static const char *ext[] = { "flac", "mp3", "m4a", "wav", "wma" };
+    uint32_t at = 0;
+    int t, e;
+
+    g_cd_tracks = 0;
+    g_cd_end[1] = 0;
+    for (t = 2; t <= CD_MAX_TRACKS; t++) {
+        uint32_t len = 0;
+        for (e = 0; e < (int)(sizeof ext / sizeof ext[0]) && !len; e++) {
+            _snprintf(g_cd_path[t], MAX_PATH, "MUSIC\\track%02d.%s", t, ext[e]);
+            g_cd_path[t][MAX_PATH - 1] = 0;
+            if (GetFileAttributesA(g_cd_path[t]) != INVALID_FILE_ATTRIBUTES)
+                len = media_audio_length_ms(g_cd_path[t]);
+        }
+        if (!len) break;
+        at += CD_PREGAP_MS;
+        g_cd_start[t] = at;
+        g_cd_end[t] = at + len;
+        at += len;
+        g_cd_tracks = t;
+        LOGI("audio: CD track %d = %s, %u:%02u", t, g_cd_path[t],
+             len / 60000, len / 1000 % 60);
+    }
+    if (g_cd_tracks) g_cd_end[1] = CD_PREGAP_MS;    /* the data track */
+}
+
+static uint32_t h_redbook_open(uint32_t which)
+{
+    if (!g_cd_tracks) cd_scan();
+    LOGI("audio: AIL_redbook_open(%u) -> %s", which,
+         g_cd_tracks ? "virtual CD" : "no music files, no CD");
+    return g_cd_tracks ? (uint32_t)(uintptr_t)g_cd_handle : 0;
+}
+
+static void h_redbook_close(uint32_t h)
+{
+    (void)h;
+    cd_switch(NULL);
+}
+
+static uint32_t h_redbook_tracks(uint32_t h)
+{
+    (void)h;
+    return (uint32_t)g_cd_tracks;
+}
+
+static void h_redbook_track_info(uint32_t h, uint32_t track,
+                                 uint32_t *start, uint32_t *end)
+{
+    (void)h;
+    if (track < 1 || (int)track > g_cd_tracks) track = 1;
+    if (start) *start = track == 1 ? 0 : g_cd_start[track];
+    if (end)   *end = g_cd_end[track];
+}
+
+static uint32_t h_redbook_play(uint32_t h, uint32_t start, uint32_t end)
+{
+    cd_play *p;
+    HANDLE th;
+    int t;
+
+    (void)h;
+    for (t = 2; t <= g_cd_tracks; t++)
+        if (start + 500 >= g_cd_start[t] && start < g_cd_end[t]) break;
+    if (t > g_cd_tracks) {
+        LOGW("audio: AIL_redbook_play(%u, %u) is on no audio track", start, end);
+        cd_switch(NULL);
+        return 0;
+    }
+    p = (cd_play *)calloc(1, sizeof *p);
+    if (!p) return 0;
+    strcpy(p->path, g_cd_path[t]);
+    p->refs = 2;
+    p->start_ms = g_cd_start[t];
+    p->stop_ms = (end < g_cd_end[t] ? end : g_cd_end[t]) - g_cd_start[t];
+    /* ponytail: a start inside the track is reached by decoding up to it,
+     * a second or two late for one late in a track; seek the reader if the
+     * game turns out to resume mid-track. */
+    p->skip_ms = start > g_cd_start[t] ? start - g_cd_start[t] : 0;
+    th = CreateThread(NULL, 0, cd_decode_thread, p, 0, NULL);
+    if (!th) { free(p); return 0; }
+    CloseHandle(th);
+    LOGI("audio: AIL_redbook_play(%u, %u) -> track %d", start, end, t);
+    cd_switch(p);
+    return 1;
+}
+
+static uint32_t h_redbook_stop(uint32_t h)
+{
+    (void)h;
+    cd_switch(NULL);
+    return 1;
+}
+
+static uint32_t h_redbook_status(uint32_t h)
+{
+    uint32_t st;
+    (void)h;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    st = g_cd && !g_cd->finished ? REDBOOK_PLAYING : REDBOOK_STOPPED;
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+    return st;
+}
+
+static uint32_t h_redbook_position(uint32_t h)
+{
+    uint32_t ms = 0;
+    (void)h;
+    if (g_dev) SDL_LockAudioDevice(g_dev);
+    if (g_cd && g_cd->pcm.rate)
+        ms = g_cd->start_ms + (uint32_t)(g_cd->pos * 1000.0 / g_cd->pcm.rate);
+    if (g_dev) SDL_UnlockAudioDevice(g_dev);
+    return ms;
+}
+
 /* ------------------------------------------------------------- hooking */
 
 /* Overwrite an AIL entry point with a jump to ours. Object 1 is mapped
@@ -966,6 +1206,22 @@ void audio_install_hooks(void)
          * whatever CONFIG.DES asks for, and streamed audio -- if this build
          * streams at all -- would need its own two addresses derived. */
         LOGI("audio: fight3 uses the Miles hooks only, no per-image patches");
+    }
+
+    if (g_image != AUDIO_IMAGE_DESKTOP) {
+        static const struct { rb_entry e; void *fn; const char *name; } rb[] = {
+            { RB_OPEN,       h_redbook_open,       "AIL_redbook_open"       },
+            { RB_CLOSE,      h_redbook_close,      "AIL_redbook_close"      },
+            { RB_PLAY,       h_redbook_play,       "AIL_redbook_play"       },
+            { RB_STOP,       h_redbook_stop,       "AIL_redbook_stop"       },
+            { RB_STATUS,     h_redbook_status,     "AIL_redbook_status"     },
+            { RB_TRACK_INFO, h_redbook_track_info, "AIL_redbook_track_info" },
+            { RB_TRACKS,     h_redbook_tracks,     "AIL_redbook_tracks"     },
+            { RB_POSITION,   h_redbook_position,   "AIL_redbook_position"   },
+        };
+        const uint32_t *a = g_image == AUDIO_IMAGE_FIGHT3 ? g_rb_fight3 : g_rb_fight;
+        for (i = 0; i < (int)(sizeof rb / sizeof rb[0]); i++)
+            hook(a[rb[i].e], rb[i].fn, rb[i].name);
     }
 }
 
