@@ -839,8 +839,28 @@ static GLuint tex_upload(const uint8_t *data, int size, uint32_t key)
     else glGenTextures(1, &id);
 
     glBindTexture(GL_TEXTURE_2D, id);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    {   /* Named by content, not by address: the same atlas lands at a
+         * different address in every run. A replacement may be any size --
+         * texture coordinates are normalised by the original size. */
+        char name[48], dname[24];
+        uint64_t dh = hd_hash(data, (size_t)n, 0);
+        uint32_t *hd = NULL;
+        int hw = 0, hh = 0;
+        _snprintf(dname, sizeof dname, "%016llx", (unsigned long long)dh);
+        _snprintf(name, sizeof name, "%s_%08x%s", dname, g_pal_hash,
+                  g_chroma_on ? "k" : "");
+        if (hd_dump("tex", name, size, size, rgba))
+            LOGI("hd: dumped texture %s (%dx%d)", name, size, size);
+        if (g_hd_dir[0] &&
+            ((hd = hd_load("tex", name, &hw, &hh)) != NULL ||
+             (hd = hd_load("tex", dname, &hw, &hh)) != NULL)) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, hw, hh, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, hd);
+            free(hd);
+        } else
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    }
     /* Trilinear and anisotropic: the seabed recedes at a grazing angle for
      * its whole extent, which is exactly where plain bilinear shimmers and
      * smears. */
@@ -1644,6 +1664,116 @@ static uint32_t gl_buffer_swap(uint32_t *a)
     return 0;
 }
 
+/* A whole image the game blits (cockpit art, monitor backgrounds) may have a
+ * high-resolution replacement, named by a hash of its pixels and size. Those
+ * are drawn into the frame buffer at full resolution instead. Returns 0 if
+ * there is none, and the caller draws the original. */
+#define HD2D_CACHE 4096
+static struct { uint64_t key; GLuint tex; int missing, seen; } g_hd2d[HD2D_CACHE];
+
+/* A screen rectangle that keeps showing new pictures is a live display (the
+ * cockpit monitors are composed in software each frame), not art: after a
+ * few distinct contents it is no longer hashed, dumped or replaced. */
+#define HD2D_REGIONS 64
+#define HD2D_LIVE    8
+static struct { int x, y, w, h, distinct; } g_hd2d_rgn[HD2D_REGIONS];
+
+static int *hd_region(int x, int y, int w, int h)
+{
+    static int overflow = HD2D_LIVE + 1;
+    int i;
+    for (i = 0; i < HD2D_REGIONS; i++) {
+        if (!g_hd2d_rgn[i].w) {
+            g_hd2d_rgn[i].x = x; g_hd2d_rgn[i].y = y;
+            g_hd2d_rgn[i].w = w; g_hd2d_rgn[i].h = h;
+        }
+        if (g_hd2d_rgn[i].x == x && g_hd2d_rgn[i].y == y &&
+            g_hd2d_rgn[i].w == w && g_hd2d_rgn[i].h == h)
+            return &g_hd2d_rgn[i].distinct;
+    }
+    return &overflow;
+}
+
+static int hd_image_draw(const uint32_t *rgba, int x, int y, int w, int h)
+{
+    char name[48];
+    uint64_t key;
+    uint32_t slot, probe;
+    GLuint tex = 0;
+    int *distinct;
+
+    if (w * h < 32 * 32) return 0;            /* glyphs and lamps: not worth it */
+    distinct = hd_region(x, y, w, h);
+    if (*distinct > HD2D_LIVE) return 0;
+    key = hd_hash(rgba, (size_t)w * h * 4, (uint64_t)w * 65536u + (uint64_t)h);
+    _snprintf(name, sizeof name, "%016llx_%dx%d", (unsigned long long)key, w, h);
+
+    for (probe = 0; probe < HD2D_CACHE; probe++) {
+        slot = (uint32_t)((key + probe) % HD2D_CACHE);
+        if (g_hd2d[slot].key == key) {
+            /* Only images that come back are art; the monitors redraw a
+             * different picture every frame and would flood the dump. */
+            if (++g_hd2d[slot].seen == 3 && hd_dump("2d", name, w, h, rgba))
+                LOGI("hd: dumped image %s at %d,%d", name, x, y);
+            if (g_hd2d[slot].missing) return 0;
+            tex = g_hd2d[slot].tex;
+            break;
+        }
+        if (!g_hd2d[slot].key) {
+            int iw = 0, ih = 0;
+            uint32_t *px = g_hd_dir[0] ? hd_load("2d", name, &iw, &ih) : NULL;
+            if (++*distinct > HD2D_LIVE) {
+                LOGI("hd: %dx%d at %d,%d is a live display; not replaced",
+                     w, h, x, y);
+                free(px);
+                return 0;
+            }
+            g_hd2d[slot].key = key;
+            g_hd2d[slot].seen = 1;
+            if (w * h >= 320 * 240 && hd_dump("2d", name, w, h, rgba))
+                LOGI("hd: dumped image %s at %d,%d", name, x, y);
+            if (!px) { g_hd2d[slot].missing = 1; return 0; }
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, iw, ih, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, px);
+            free(px);
+            p_glGenerateMipmap(GL_TEXTURE_2D);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                            GL_LINEAR_MIPMAP_LINEAR_);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            g_hd2d[slot].tex = tex;
+            break;
+        }
+    }
+    if (!tex) return 0;
+
+    if (g_prog) p_glUseProgram(0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_FOG);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex3f((float)x,       (float)y,       0);
+        glTexCoord2f(1, 0); glVertex3f((float)(x + w), (float)y,       0);
+        glTexCoord2f(1, 1); glVertex3f((float)(x + w), (float)(y + h), 0);
+        glTexCoord2f(0, 1); glVertex3f((float)x,       (float)(y + h), 0);
+    glEnd();
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glDisable(GL_BLEND);
+    glEnable(GL_SCISSOR_TEST);
+    return 1;
+}
+
 /* (dst_buffer, dst_x, dst_y, src_format, w, h, src_stride, src_data). The
  * full-screen ones are the cockpit art and are drawn filtered. */
 static uint32_t gl_lfb_write_region(uint32_t *a)
@@ -1663,8 +1793,9 @@ static uint32_t gl_lfb_write_region(uint32_t *a)
         const uint16_t *s = (const uint16_t *)(src + (int32_t)r * stride);
         for (c = 0; c < w; c++) rgba[r * w + c] = rgb565_to_abgr(s[c], 0xFF000000u);
     }
-    overlay_draw(rgba, (int)w, (int)x, (int)y, (int)w, (int)h,
-                 g_smooth2d || (w == GLIDE_W && h == GLIDE_H));
+    if (!hd_image_draw(rgba, (int)x, (int)y, (int)w, (int)h))
+        overlay_draw(rgba, (int)w, (int)x, (int)y, (int)w, (int)h,
+                     g_smooth2d || (w == GLIDE_W && h == GLIDE_H));
 
     /* keep the CPU view current if it is, so the next lock need not re-read */
     if (g_vram_valid)

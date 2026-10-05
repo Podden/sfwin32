@@ -178,6 +178,14 @@ extern int g_render_scale;   /* --scale N: frame buffer is 640x480 * N  */
 extern int g_msaa;           /* --msaa N: samples, 0/1 off              */
 extern int g_smooth2d;       /* --smooth2d: bilinear 2D in 3dfx mode    */
 
+/* hd.c: --dump DIR / --hd DIR, content-hashed asset dumps and replacements */
+extern char g_dump_dir[MAX_PATH];
+extern char g_hd_dir[MAX_PATH];
+uint64_t  hd_hash(const void *p, size_t n, uint64_t h);
+int       hd_dump(const char *kind, const char *name, int w, int h,
+                  const uint32_t *px);
+uint32_t *hd_load(const char *kind, const char *name, int *w, int *h);
+
 /* The 64 KB banked window the game blits through, plus the shadow surface. */
 extern uint8_t *g_vram;           /* full virtual framebuffer              */
 extern uint32_t g_vram_size;
