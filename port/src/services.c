@@ -268,6 +268,13 @@ int dos_int21(CONTEXT *c)
         DWORD method = (c->Eax & 0xFF) == 1 ? FILE_CURRENT
                      : (c->Eax & 0xFF) == 2 ? FILE_END : FILE_BEGIN;
         if (fd >= MAX_FH || !g_fh[fd]) return fail(c, 6);
+        /* With a high-part pointer SetFilePointer takes hi:off as one 64-bit
+         * distance, so a negative offset needs its sign in hi as well; with
+         * hi = 0 a step back of 2 bytes went 4 GB forwards, every read after
+         * it hit EOF, and a model whose face straddled the stdio buffer's
+         * 4 KB edge (ifracht4, bfm7) was parsed from garbage -- the nine
+         * missions that died loading them. */
+        hi = off < 0 ? -1 : 0;
         pos = SetFilePointer(g_fh[fd], off, &hi, method);
         if (pos == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR)
             return fail(c, 5);
