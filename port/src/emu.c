@@ -1407,6 +1407,7 @@ static int fbwatch_hit(EXCEPTION_POINTERS *ep)
  * game's memory (orig address). Every distinct instruction that writes it is
  * logged once -- what --watch cannot say, since it only sees values change. */
 uint32_t g_hwwatch;
+int      g_hwwatch_rw;
 
 static int hwwatch_hit(EXCEPTION_POINTERS *ep)
 {
@@ -1420,11 +1421,21 @@ static int hwwatch_hit(EXCEPTION_POINTERS *ep)
     for (i = 0; i < nseen && seen[i] != c->Eip; i++) {}
     if (i == nseen && nseen < 64) {
         seen[nseen++] = c->Eip;
-        LOGI("hwwatch: orig %08X written, next insn orig 0x%08X (value %08X) "
+        LOGI("hwwatch: orig %08X touched, next insn orig 0x%08X (value %08X) "
              "eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X (orig = reg - %08X)",
              g_hwwatch, c->Eip - g_img.delta,
              *(volatile uint32_t *)(uintptr_t)(g_hwwatch + g_img.delta),
              c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, g_img.delta);
+        {   /* and who called: return addresses into game code on the stack */
+            const uint32_t *sp = (const uint32_t *)(uintptr_t)c->Esp;
+            uintptr_t cs = (uintptr_t)g_img.mem, ce = cs + g_img.code_size;
+            int k, n = 0;
+            for (k = 0; k < 96 && n < 8; k++)
+                if (sp[k] >= cs && sp[k] < ce) {
+                    LOGI("  stack[%d] -> orig 0x%08X", k, sp[k] - g_img.delta);
+                    n++;
+                }
+        }
     }
     c->Dr6 = 0;
     return !(c->EFlags & 0x100u);       /* a pending trap still needs the handler */
@@ -1518,7 +1529,8 @@ static LONG CALLBACK emu_veh(EXCEPTION_POINTERS *ep)
         if (g_hwwatch && resuming_game) {
             c->ContextFlags |= CONTEXT_DEBUG_REGISTERS;
             c->Dr0 = g_hwwatch + g_img.delta;
-            c->Dr7 = (c->Dr7 & ~0x000F0003u) | 1u | (1u << 16) | (3u << 18);
+            c->Dr7 = (c->Dr7 & ~0x000F0003u) | 1u | ((g_hwwatch_rw ? 3u : 1u) << 16) |
+                     (3u << 18);
         }
         g_fault_tick = now_ms();               /* the game is still faulting */
         g_last_ok_eip = c->Eip;

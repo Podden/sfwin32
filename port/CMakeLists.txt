@@ -24,6 +24,7 @@ add_executable(fightport
   src/calltrace.c
   src/cblit.c
   src/glide.c
+  src/hdtext.c
   src/script.c
   src/hd.c
   src/media.c

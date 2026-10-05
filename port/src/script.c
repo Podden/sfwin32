@@ -162,14 +162,69 @@ void script_tick(void)
             glide_trace_next();
         } else if (!strcmp(cmd, "log")) {
             LOGI("script: %s", arg);
-        } else if (!strcmp(cmd, "memdump")) {   /* the loaded image, fixups applied */
+        } else if (!strcmp(cmd, "watchlfb")) {
+            /* watchlfb X Y: watch writes to that pixel of the CPU frame buffer */
+            int px, py;
+            if (sscanf(arg, "%d %d", &px, &py) == 2 && g_vram) {
+                g_hwwatch = (uint32_t)(uintptr_t)(g_vram + ((size_t)py * 640 + px) * 2) -
+                            g_img.delta;
+                LOGI("script: watching LFB %d,%d (orig %08X)", px, py, g_hwwatch);
+            }
+        } else if (!strcmp(cmd, "watchfind")) {
+            /* watchfind FILE OFFSET: find 32 bytes of a game file in memory
+             * (the heap moves between runs) and watch reads and writes of
+             * them, as --hwwatch ADDR:rw would */
+            char fn[MAX_PATH];
+            unsigned off = 0;
+            uint8_t pat[32];
+            FILE *f;
+            if (sscanf(arg, "%259s %u", fn, &off) == 2 && (f = fopen(fn, "rb")) != NULL) {
+                size_t n;
+                fseek(f, (long)off, SEEK_SET);
+                n = fread(pat, 1, sizeof pat, f);
+                fclose(f);
+                if (n == sizeof pat) {
+                    MEMORY_BASIC_INFORMATION mi;
+                    uint8_t *p = g_img.mem, *end = g_img.mem + g_img.reserved;
+                    while (p < end && VirtualQuery(p, &mi, sizeof mi)) {
+                        uint8_t *e = (uint8_t *)mi.BaseAddress + mi.RegionSize, *q;
+                        if (mi.State == MEM_COMMIT)
+                            for (q = p; q + sizeof pat <= e; q++)
+                                if (!memcmp(q, pat, sizeof pat)) {
+                                    g_hwwatch_rw = 1;
+                                    g_hwwatch = (uint32_t)(uintptr_t)q - g_img.delta;
+                                    LOGI("script: %s+%u at orig %08X, watched", fn, off,
+                                         g_hwwatch);
+                                    p = end;
+                                    break;
+                                }
+                        if (p < end) p = e;
+                    }
+                }
+            }
+            if (!g_hwwatch) LOGW("script: watchfind %s: not found", arg);
+        } else if (!strcmp(cmd, "memdump")) {   /* image + heap, fixups applied */
             char path[MAX_PATH];
             FILE *f;
             _snprintf(path, sizeof path, "%s\\%s.bin", g_shot_dir, arg);
             if ((f = fopen(path, "wb")) != NULL) {
-                fwrite(g_img.mem, 1, g_img.size, f);
+                /* the whole reservation up to its last committed page; pages
+                 * never committed come out as zeros */
+                static const uint8_t zero[4096];
+                MEMORY_BASIC_INFORMATION mi;
+                uint8_t *p = g_img.mem, *end = g_img.mem + g_img.reserved, *top = p;
+                while (p < end && VirtualQuery(p, &mi, sizeof mi)) {
+                    uint8_t *e = (uint8_t *)mi.BaseAddress + mi.RegionSize;
+                    if (mi.State == MEM_COMMIT) top = e < end ? e : end;
+                    p = e;
+                }
+                for (p = g_img.mem; p < top; p += 4096) {
+                    VirtualQuery(p, &mi, sizeof mi);
+                    fwrite(mi.State == MEM_COMMIT ? p : zero, 1, 4096, f);
+                }
                 fclose(f);
-                LOGI("script: image dumped to %s (delta 0x%08X)", path, g_img.delta);
+                LOGI("script: image dumped to %s (delta 0x%08X, %u bytes)", path,
+                     g_img.delta, (unsigned)(top - g_img.mem));
             }
         } else if (!strcmp(cmd, "quit")) {
             LOGI("script: quit");

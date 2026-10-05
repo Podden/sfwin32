@@ -46,6 +46,7 @@ typedef struct {
 
 extern le_image g_img;
 extern uint32_t g_hwwatch;               /* --hwwatch ADDR (orig)          */
+extern int      g_hwwatch_rw;            /* ... ADDR:rw: reads as well     */
 
 int  le_load(const char *path, le_image *out);
 void le_free(le_image *img);
@@ -286,6 +287,22 @@ extern int g_probe_x, g_probe_y;   /* --glidetrace: log every call          */
 int  video_set_linear_mode(int w, int h, int bpp);
 struct SDL_Window *video_window(void);
 void glide_install(void);
+
+/* hdtext.c: the bitmap-font glyphs FIGHT3 blits, redrawn with an outline
+ * font at frame-buffer resolution (3dfx build) */
+typedef struct {
+    int      x, y, w, h;               /* cell in the buffer, pixels        */
+    uint8_t  ch;                       /* character (CP437)                 */
+    uint8_t  mask[16 * 16];            /* w x h, the original ink           */
+    uint32_t row_rgb[16];              /* its colour per row, 0xAABBGGRR    */
+} hdtext_glyph;
+extern int g_hdtext;                   /* --nohdtext: 0                     */
+void hdtext_install(void);
+void hdtext_frame(void);
+int  hdtext_take(const void *buf, uint32_t stride, int w, int h, hdtext_glyph *out, int max);
+void hdtext_erase(uint32_t *px, int stride, const hdtext_glyph *g);
+void hdtext_draw(const hdtext_glyph *g, float x, float y);
+
 void glide_summary(void);
 
 int  dos_int21(CONTEXT *c);

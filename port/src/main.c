@@ -524,7 +524,11 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--calltrace")) want_calltrace = 1;
         else if (!strcmp(argv[i], "--hwwatch") && i + 1 < argc)
-            g_hwwatch = (uint32_t)strtoul(argv[++i], NULL, 16);
+        {   /* ADDR, or ADDR:rw to catch readers too */
+            char *end;
+            g_hwwatch = (uint32_t)strtoul(argv[++i], &end, 16);
+            g_hwwatch_rw = !strcmp(end, ":rw");
+        }
         else if (!strcmp(argv[i], "--no-extern-irq")) g_extern_irq = 0;
         else if (!strcmp(argv[i], "--trace"))  g_log_level = LOG_TRACE;
         else if (!strcmp(argv[i], "--script") && i + 1 < argc)
@@ -539,6 +543,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--msaa") && i + 1 < argc)
             g_msaa = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--smooth2d")) g_smooth2d = 1;
+        else if (!strcmp(argv[i], "--nohdtext")) g_hdtext = 0;
         else if (!strcmp(argv[i], "--wide") && i + 1 < argc)
             g_wide_arg = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc)

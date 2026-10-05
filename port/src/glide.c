@@ -1049,6 +1049,22 @@ static void lfb_sync_from_gl(void)
     memcpy(g_lfb_snap, g_vram, sizeof g_lfb_snap);
 }
 
+/* After an overlay upload at x, y: the bitmap-font glyphs in it, drawn again
+ * crisp over their erased originals (hdtext.c). Leaves the state as
+ * overlay_draw does. */
+static hdtext_glyph g_glyphs[512];
+
+static void hdtext_overlay(int n, int x, int y)
+{
+    int i;
+    if (!n) return;
+    glDisable(GL_SCISSOR_TEST);
+    for (i = 0; i < n; i++)
+        hdtext_draw(&g_glyphs[i], (float)(x + g_glyphs[i].x), (float)(y + g_glyphs[i].y));
+    glDisable(GL_BLEND);
+    glEnable(GL_SCISSOR_TEST);
+}
+
 /* Push what the game wrote into g_vram since it was handed out back into the
  * FBO: only the pixels that differ from the snapshot, so 3D the game did not
  * paint over keeps its full resolution. */
@@ -1056,7 +1072,7 @@ static void lfb_flush(void)
 {
     static uint32_t rgba[GLIDE_W * GLIDE_H];
     const uint16_t *cur = (const uint16_t *)g_vram;
-    int x, y, x0 = GLIDE_W, y0 = GLIDE_H, x1 = -1, y1 = -1;
+    int x, y, x0 = GLIDE_W, y0 = GLIDE_H, x1 = -1, y1 = -1, ng, n, i;
 
     if (!g_lfb_pending || !g_gl_ready || !g_vram) return;
     g_lfb_pending = g_lock_depth > 0;      /* still handed out: keep watching */
@@ -1077,6 +1093,25 @@ static void lfb_flush(void)
     if (y0 > 0) y0--;
     if (x1 < GLIDE_W - 1) x1++;
     if (y1 < GLIDE_H - 1) y1++;
+    ng = hdtext_take(g_vram, GLIDE_W * 2, GLIDE_W, GLIDE_H, g_glyphs,
+                     (int)(sizeof g_glyphs / sizeof g_glyphs[0]));
+    for (i = n = 0; i < ng; i++) {         /* only the ones written just now */
+        const hdtext_glyph *g = &g_glyphs[i];
+        int k = 0;
+        for (y = 0; y < g->h && !k; y++)
+            for (x = 0; x < g->w && !k; x++)
+                k = g->mask[y * g->w + x] &&
+                    cur[(size_t)(g->y + y) * GLIDE_W + g->x + x] !=
+                    g_lfb_snap[(size_t)(g->y + y) * GLIDE_W + g->x + x];
+        if (k) g_glyphs[n++] = *g;
+    }
+    ng = n;
+    for (i = 0; i < ng; i++) {             /* whole cells: erasing reads them */
+        if (g_glyphs[i].x < x0) x0 = g_glyphs[i].x;
+        if (g_glyphs[i].y < y0) y0 = g_glyphs[i].y;
+        if (g_glyphs[i].x + g_glyphs[i].w - 1 > x1) x1 = g_glyphs[i].x + g_glyphs[i].w - 1;
+        if (g_glyphs[i].y + g_glyphs[i].h - 1 > y1) y1 = g_glyphs[i].y + g_glyphs[i].h - 1;
+    }
     for (y = y0; y <= y1; y++) {
         const uint16_t *c = cur + (size_t)y * GLIDE_W;
         const uint16_t *s = g_lfb_snap + (size_t)y * GLIDE_W;
@@ -1084,8 +1119,10 @@ static void lfb_flush(void)
         for (x = x0; x <= x1; x++)
             d[x] = rgb565_to_abgr(c[x], c[x] != s[x] ? 0xFF000000u : 0);
     }
+    for (i = 0; i < ng; i++) hdtext_erase(rgba, GLIDE_W, &g_glyphs[i]);
     overlay_draw(rgba + (size_t)y0 * GLIDE_W + x0, GLIDE_W, x0, y0,
                  x1 + 1 - x0, y1 + 1 - y0, g_smooth2d);
+    hdtext_overlay(ng, 0, 0);
     for (y = y0; y <= y1; y++)
         memcpy(g_lfb_snap + (size_t)y * GLIDE_W + x0,
                cur + (size_t)y * GLIDE_W + x0, (size_t)(x1 + 1 - x0) * 2);
@@ -1860,6 +1897,7 @@ static uint32_t gl_buffer_swap(uint32_t *a)
 {
     (void)a;
     g_glide_frame++;
+    hdtext_frame();
     if (!gl_ensure_context()) return 0;
 
     lfb_flush();
@@ -2091,9 +2129,14 @@ static uint32_t gl_lfb_write_region(uint32_t *a)
         const uint16_t *s = (const uint16_t *)(src + (int32_t)r * stride);
         for (c = 0; c < w; c++) rgba[r * w + c] = rgb565_to_abgr(s[c], 0xFF000000u);
     }
-    if (!hd_image_draw(rgba, (int)x, (int)y, (int)w, (int)h))
+    if (!hd_image_draw(rgba, (int)x, (int)y, (int)w, (int)h)) {
+        int ng = stride > 0 ? hdtext_take(src, (uint32_t)stride, (int)w, (int)h, g_glyphs,
+                                          (int)(sizeof g_glyphs / sizeof g_glyphs[0])) : 0;
+        for (r = 0; r < (uint32_t)ng; r++) hdtext_erase(rgba, (int)w, &g_glyphs[r]);
         overlay_draw(rgba, (int)w, (int)x, (int)y, (int)w, (int)h,
                      g_smooth2d || (w == GLIDE_W && h == GLIDE_H));
+        hdtext_overlay(ng, (int)x, (int)y);
+    }
 
     /* keep the CPU view current if it is, so the next lock need not re-read */
     if (g_vram_valid)
@@ -2345,6 +2388,7 @@ void glide_install(void)
     }
 
     hplus_install();
+    hdtext_install();
     for (i = 0; i < g_nimp; i++) if (g_imp[i].fn) impl++;
     LOGI("glide: %u imports redirected (%u implemented, %u stubbed);"
          " GLIDE2X.OVL is never loaded", g_nimp, impl, g_nimp - impl);
