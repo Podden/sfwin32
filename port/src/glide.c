@@ -351,6 +351,11 @@ static int g_view_y0 = -1, g_view_y1;  /* rows of the game's 3D view (clip) */
  * place of the game's aux buffer. 0 while the screen shows anything else. */
 static GLuint g_cockpit_cur;
 static float  g_cockpit_hw;            /* half width, 640-space units       */
+/* The outside views put the 3D in a letterbox: a 640x480 frame that is black
+ * but for two grey lines, with the bars stamped into the aux buffer. Under
+ * Hor+ that frame is not drawn and nothing is masked, so the 3D fills the
+ * whole screen there as it does in the cockpit. */
+static int    g_letterbox;
 #define GLIDE_VW (GLIDE_W + 2 * g_ext)
 
 static int hplus_ext(void)
@@ -1701,7 +1706,9 @@ static void aux_upload_mask(void)
         mask[i] = g_auxbuf[i] == 0 ? 255 : 0;      /* 255 = masked off */
         zero += g_auxbuf[i] == 0;
     }
-    if (g_ext && g_view_y0 >= 0 && !g_cockpit_cur) /* Hor+: see scissor_clip */
+    if (g_ext && g_letterbox)               /* outside views: see letterbox_select */
+        memset(mask, 0, sizeof mask);
+    else if (g_ext && g_view_y0 >= 0 && !g_cockpit_cur) /* Hor+: see scissor_clip */
         for (i = 0; i < GLIDE_W * GLIDE_H; i++)
             if (i / GLIDE_W < g_view_y0 || i / GLIDE_W >= g_view_y1) mask[i] = 255;
 
@@ -1971,6 +1978,15 @@ static void wide_select(GLuint tex)
         if (g_wide_size[i].tex == tex) { g_wide_w = g_wide_size[i].w; g_wide_h = g_wide_size[i].h; }
 }
 
+static void cockpit_select(GLuint tex, float hw);
+
+static void letterbox_select(int on)
+{
+    if (on == g_letterbox) return;
+    g_letterbox = on;
+    if (g_mask_ready) aux_upload_mask();
+}
+
 static void cockpit_select(GLuint tex, float hw)
 {
     if (tex == g_cockpit_cur) return;
@@ -2129,7 +2145,18 @@ static uint32_t gl_lfb_write_region(uint32_t *a)
         const uint16_t *s = (const uint16_t *)(src + (int32_t)r * stride);
         for (c = 0; c < w; c++) rgba[r * w + c] = rgb565_to_abgr(s[c], 0xFF000000u);
     }
-    if (!hd_image_draw(rgba, (int)x, (int)y, (int)w, (int)h)) {
+    if (g_ext && w == GLIDE_W && h == GLIDE_H) {
+        uint32_t lit = 0;
+        for (r = 0; r < w * h; r++) lit += (rgba[r] & 0xFFFFFFu) != 0;
+        letterbox_select(lit < w * h / 100);
+        if (g_letterbox) {
+            wide_select(0);
+            cockpit_select(0, 0.0f);
+        }
+    }
+    if (g_letterbox && w == GLIDE_W && h == GLIDE_H) {
+        /* not drawn: see g_letterbox */
+    } else if (!hd_image_draw(rgba, (int)x, (int)y, (int)w, (int)h)) {
         int ng = stride > 0 ? hdtext_take(src, (uint32_t)stride, (int)w, (int)h, g_glyphs,
                                           (int)(sizeof g_glyphs / sizeof g_glyphs[0])) : 0;
         for (r = 0; r < (uint32_t)ng; r++) hdtext_erase(rgba, (int)w, &g_glyphs[r]);
