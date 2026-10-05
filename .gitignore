@@ -30,3 +30,7 @@ analysis/
 # Local agent/editor state
 .claude/
 .vs/
+
+# local game data and build deps
+game/
+third_party/

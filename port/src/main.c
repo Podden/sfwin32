@@ -26,6 +26,8 @@ const char *g_cmdline;
  * than having the port guess. */
 typedef enum { MODE_FIGHT, MODE_DESKTOP, MODE_FIGHT3 } game_mode;
 static game_mode g_mode = MODE_FIGHT;
+static const char *g_script_path;       /* --script FILE                   */
+static int g_chain_index;               /* which child of --chain this is  */
 static const char *mode_name(void)
 {
     return g_mode == MODE_DESKTOP ? "desktop"
@@ -347,6 +349,7 @@ static int run_child(const char *self_path, int argc, char **argv,
     append_arg(cmd, sizeof cmd, self_path);
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--chain")) continue;
+        if (!strcmp(argv[i], "--chain-index")) { i++; continue; }
         if (!strcmp(argv[i], "--mode")) { i++; continue; }  /* ours to set */
         if (!strcmp(argv[i], "--args")) { i++; continue; }  /* ...and this  */
         append_arg(cmd, sizeof cmd, argv[i]);
@@ -355,6 +358,12 @@ static int run_child(const char *self_path, int argc, char **argv,
     append_arg(cmd, sizeof cmd, mode);
     append_arg(cmd, sizeof cmd, "--args");
     append_arg(cmd, sizeof cmd, args);
+    {   static int index;
+        char num[16];
+        sprintf(num, "%d", ++index);
+        append_arg(cmd, sizeof cmd, "--chain-index");
+        append_arg(cmd, sizeof cmd, num);
+    }
 
     printf("[chain] %s\n", cmd);
 
@@ -375,7 +384,7 @@ static int run_child(const char *self_path, int argc, char **argv,
 static int chain_supervisor(int argc, char **argv)
 {
     char self_path[MAX_PATH];
-    const char *mode, *args;
+    const char *mode, *args, *fight_mode = "fight";
     int code;
 
     /* Each child runs for minutes at a time, and stdio fully buffers stdout
@@ -406,6 +415,13 @@ static int chain_supervisor(int argc, char **argv)
      * warm and 4 restores the autosave, while 3 is the only one that goes
      * back to the start menu. Passing "cold" unconditionally, as this did,
      * discarded that choice and sent the player to the menu every time. */
+    /* --3dfx: missions run in FIGHT3.EXE, the Glide build. The station half
+     * stays DESKTOP.EXE -- it is all 2D, and FIGHT3 reads and writes the same
+     * FIGHTIN/FIGHTOUT handoff files. */
+    {   int i;
+        for (i = 1; i < argc; i++)
+            if (!strcmp(argv[i], "--3dfx")) fight_mode = "fight3";
+    }
     mode = "desktop";
     args = "ice";
     for (;;) {
@@ -416,7 +432,7 @@ static int chain_supervisor(int argc, char **argv)
         }
         switch (code) {
         case 1: mode = "desktop"; args = "warm";     break;
-        case 2: mode = "fight";   args = "solo";     break;
+        case 2: mode = fight_mode; args = "solo";    break;
         case 3: mode = "desktop"; args = "cold";     break;
         case 4: mode = "desktop"; args = "autosave"; break;
         default:
@@ -509,6 +525,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--calltrace")) want_calltrace = 1;
         else if (!strcmp(argv[i], "--no-extern-irq")) g_extern_irq = 0;
         else if (!strcmp(argv[i], "--trace"))  g_log_level = LOG_TRACE;
+        else if (!strcmp(argv[i], "--script") && i + 1 < argc)
+            g_script_path = argv[++i];
+        else if (!strcmp(argv[i], "--shotdir") && i + 1 < argc)
+            script_set_shot_dir(argv[++i]);
+        else if (!strcmp(argv[i], "--chain-index") && i + 1 < argc)
+            g_chain_index = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--3dfx")) { /* only read by --chain */ }
         else { usage(argv[0]); return 2; }
     }
 
@@ -531,6 +554,9 @@ int main(int argc, char **argv)
            : g_mode == MODE_FIGHT3  ? "fight3.log" : "fight.log");
     LOGI("Schleichfahrt static port starting: mode %s, image %s",
          mode_name(), exe);
+    if (g_script_path)
+        script_load(g_script_path, g_mode == MODE_DESKTOP ? "desktop" : "fight",
+                    g_chain_index);
 
     /* The game opens its data with DOS-relative paths, so the asset directory
      * has to be the working directory. */

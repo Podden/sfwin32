@@ -160,6 +160,19 @@ void video_set_bank(int window, int bank);
 void video_present(void);
 void video_pump(void);            /* SDL events -> keyboard/quit           */
 int  video_want_quit(void);
+void video_request_quit(void);
+void video_script_key(int sdl_scancode, int pressed);
+
+/* --script: unattended input and screenshots, see script.c */
+void script_load(const char *path, const char *mode, int index);
+void script_set_shot_dir(const char *dir);
+void script_tick(void);
+const char *script_shot_wanted(void);
+void script_shot_done(void);
+int  write_bmp24(const char *path, int w, int h, const uint8_t *rows,
+                 int stride);
+int  write_bmp_argb(const char *path, int w, int h, const uint32_t *px);
+void mouse_script_move(int x, int y);
 
 /* The 64 KB banked window the game blits through, plus the shadow surface. */
 extern uint8_t *g_vram;           /* full virtual framebuffer              */

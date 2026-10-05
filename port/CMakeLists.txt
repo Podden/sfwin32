@@ -24,6 +24,7 @@ add_executable(fightport
   src/calltrace.c
   src/cblit.c
   src/glide.c
+  src/script.c
 )
 
 target_include_directories(fightport PRIVATE src "${SDL2_ROOT}/include")

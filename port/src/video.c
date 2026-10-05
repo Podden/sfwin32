@@ -404,6 +404,7 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                 t_key = now;
             }
         }
+        script_tick();
         render_frame();
         SDL_Delay(16);
     }
@@ -582,6 +583,11 @@ static void render_frame(void)
         }
     }
 
+    if (script_shot_wanted()) {
+        write_bmp_argb(script_shot_wanted(), g_vid_w, g_vid_h, g_conv);
+        script_shot_done();
+    }
+
     SDL_UpdateTexture(g_tex, NULL, g_conv, g_vid_w * 4);
     SDL_RenderClear(g_ren);
     SDL_RenderCopy(g_ren, g_tex, NULL, NULL);
@@ -736,6 +742,14 @@ void video_pump(void)
 }
 
 int video_want_quit(void) { return g_quit; }
+void video_request_quit(void) { g_quit = 1; }
+
+/* Script input goes through the same queue as the keyboard, so the 0xE0
+ * prefixes and held-key bookkeeping are identical to a real press. */
+void video_script_key(int sdl_scancode, int pressed)
+{
+    queue_key((SDL_Scancode)sdl_scancode, pressed);
+}
 
 /* -------------------------------------------------------------- VBE core */
 

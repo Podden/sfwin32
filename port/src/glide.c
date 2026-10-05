@@ -646,7 +646,7 @@ static GLuint tex_upload(const uint8_t *data, int size, uint32_t key)
         uint32_t c = g_pal_argb[data[i]];
         /* chroma-keyed texels become transparent and are dropped by the
          * alpha test, which is what Glide's chroma key does */
-        rgba[i] = (g_chroma_on && (c & 0x00FFFFFF) == (g_chroma_val & 0x00FFFFFF))
+        rgba[i] = (g_chroma_on && (c & 0x00FFFFFF) == (g_chroma_rgb & 0x00FFFFFF))
                     ? (c & 0x00FFFFFF)
                     : (c | 0xFF000000);
     }
@@ -845,10 +845,16 @@ static uint32_t gl_draw_triangle(uint32_t *a)
     /* The cockpit mask applies to every triangle. Those pixels hold depth 0,
      * which rejects the clear quad (bias 0, GR_CMP_NOTEQUAL) and the scene
      * alike (GR_CMP_LESS against 0 never passes), so nothing 3D reaches them. */
-    if (g_mask_ready) {
+    /* ...except where the depth test cannot reject anything. The target
+     * monitor's own view is drawn with GR_CMP_ALWAYS into a window that lies
+     * entirely inside the masked cockpit; on a Voodoo the zero depth there
+     * simply never gets compared. */
+    if (g_mask_ready && g_depth_mode && g_depth_func != 7) {
         glEnable(GL_STENCIL_TEST);
         glStencilFunc(GL_EQUAL, 0, 0xFF);
         glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    } else {
+        glDisable(GL_STENCIL_TEST);
     }
 
     /* GR_DEPTHBUFFER_*_COMPARE_TO_BIAS (3 and 4): per the Glide reference the
@@ -1063,7 +1069,13 @@ static uint32_t gl_fog_table(uint32_t *a)
     const uint8_t *t = (const uint8_t *)(uintptr_t)a[0];
     if (!t) return 0;
     memcpy(g_fog_table, t, GR_FOG_TABLE_SIZE);
-    g_fog_valid = 1;
+    g_fog_valid = getenv("SFP_NOFOG") == NULL;
+    {   char line[GR_FOG_TABLE_SIZE * 4 + 1];
+        int i, n = 0;
+        for (i = 0; i < GR_FOG_TABLE_SIZE; i++)
+            n += sprintf(line + n, "%u ", g_fog_table[i]);
+        LOGI("glide: fog table: %s", line);
+    }
     LOGI("glide: fog table loaded (%u..%u over w %.0f..%.0f)",
          g_fog_table[0], g_fog_table[GR_FOG_TABLE_SIZE - 1],
          g_fog_w[0], g_fog_w[GR_FOG_TABLE_SIZE - 1]);
@@ -1092,6 +1104,12 @@ static uint32_t gl_chroma_value(uint32_t *a)
     float r, g, b;
     g_chroma_val = a[0];
     glide_unpack(a[0], &r, &g, &b);
+    {   static uint32_t last = 0xDEADBEEFu;
+        if (a[0] != last) {
+            last = a[0];
+            LOGI("glide: chroma key value 0x%08X (fmt %d)", a[0], g_color_fmt);
+        }
+    }
     g_chroma_rgb = ((uint32_t)(r * 255.0f + 0.5f))
                  | ((uint32_t)(g * 255.0f + 0.5f) << 8)
                  | ((uint32_t)(b * 255.0f + 0.5f) << 16);
@@ -1200,6 +1218,15 @@ static void lfb_sync_from_gl(void)
  * has no single-pass equivalent, whereas a stencil does exactly the right
  * thing and leaves depth free to be cleared per frame -- which double
  * buffering requires anyway. */
+static void aux_init(void)
+{
+    static int done;
+    size_t i;
+    if (done) return;
+    done = 1;
+    for (i = 0; i < (size_t)GLIDE_W * GLIDE_H; i++) g_auxbuf[i] = 0xFFFF;
+}
+
 static void aux_upload_mask(void)
 {
     static GLubyte sten[GLIDE_W * GLIDE_H];
@@ -1240,14 +1267,14 @@ static uint32_t gl_lfb_lock(uint32_t *a)
     if (!info) return 0;
 
     if (a[1] == 2) {                       /* GR_BUFFER_AUXBUFFER */
-        /* Pre-filled with the far value so a lock the game never writes to
-         * uploads the depth grBufferClear already established, rather than
-         * stamping zeros. This game does exactly that -- it locks the aux
-         * buffer once at startup and writes nothing -- and zeros read as
-         * "nearest everywhere", which makes every scene triangle fail
-         * GR_CMP_LESS and renders an empty viewport. */
-        size_t i;
-        for (i = 0; i < (size_t)GLIDE_W * GLIDE_H; i++) g_auxbuf[i] = 0xFFFF;
+        /* The aux buffer is persistent, as the Voodoo's depth buffer is. It
+         * starts at the far value (see aux_init), so a lock the game never
+         * writes to keeps the depth grBufferClear established. Refilling it on
+         * every lock was wrong: with a target locked the game stamps zeros
+         * over just the 60x60 target monitor each frame and expects the
+         * cockpit zeros from startup to still be there -- refilling erased
+         * them, and the viewport clear then painted over the whole cockpit. */
+        aux_init();
         g_aux_locked = 1;
         info[1] = (uint32_t)(uintptr_t)g_auxbuf;
         info[2] = GLIDE_W * 2;
@@ -1447,6 +1474,22 @@ static uint32_t gl_buffer_swap(uint32_t *a)
             }
             free(shot);
         }
+    }
+
+    if (script_shot_wanted()) {
+        int dw = GLIDE_W, dh = GLIDE_H;
+        uint8_t *px;
+        SDL_GL_GetDrawableSize(video_window(), &dw, &dh);
+        px = (uint8_t *)malloc((size_t)dw * dh * 3);
+        if (px) {
+            glDisable(GL_SCISSOR_TEST);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, dw, dh, 0x80E0 /* GL_BGR */, GL_UNSIGNED_BYTE, px);
+            glEnable(GL_SCISSOR_TEST);
+            write_bmp24(script_shot_wanted(), dw, dh, px, dw * 3);  /* GL is bottom-up, as BMP */
+            free(px);
+        }
+        script_shot_done();
     }
 
     SDL_GL_SwapWindow(video_window());

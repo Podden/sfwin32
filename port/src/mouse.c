@@ -107,6 +107,17 @@ void mouse_sdl_motion(int dx, int dy)
     cb_raise(MEV_MOVE);
 }
 
+/* --script "mouse X Y": screen pixel to the game's own coordinate range. */
+void mouse_script_move(int x, int y)
+{
+    int sw = g_vid_w > 0 ? g_vid_w : 640;
+    int sh = g_vid_h > 0 ? g_vid_h : 480;
+    g_mx = g_min_x + x * (g_max_x - g_min_x + 1) / sw;
+    g_my = g_min_y + y * (g_max_y - g_min_y + 1) / sh;
+    clamp_position();
+    cb_raise(MEV_MOVE);
+}
+
 void mouse_sdl_button(int button, int pressed)
 {
     int mask;
