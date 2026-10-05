@@ -1,15 +1,17 @@
-"""Upscale and smooth the game's videos: 640x240 @ 10 fps -> 1920x1440 @ 30 fps.
+"""Upscale and smooth the game's videos: 640x240 @ 10 fps -> 1920x720 @ 30 fps.
 
     python tools/upscale_video.py [--src DIR] [--out hd/mvi] [--only FILM] [--names D02,D03]
 
 Input is the MVI material already converted to <name>.mp4 + <name>.wav
 (Schleichfahrt2's exporter). Per video: frames out with ffmpeg, Real-ESRGAN
-(anime-video model, x2) for detail, RIFE v4.6 for two in-between frames per
-pair, then H.264 at the display aspect -- MVI pixels are twice as tall as
-wide, 640x240 shown as 640x480 -- with the original soundtrack. Output goes
-to <out>/<category>/<name>.mp4, which fightport plays in place of the MVI.
-Existing outputs are skipped. Intermediate frames are JPEG to keep the
-temporary disk use to a few GB for the longest film.
+(anime-video model, x3) for detail, RIFE v4.6 for two in-between frames per
+pair, then H.264. The game shows a film 1:1 as a 640x240 band across the
+middle of the screen, so the output keeps that 8:3 shape; it has no sound,
+the game plays the film's own. Output goes to <out>/<category>/<name>.mp4,
+which fightport draws over that band. Existing outputs are skipped.
+Intermediate frames are PNG: the earlier JPEG round trips plus a deband pass
+came out as a diagonal hatch over every frame. The longest film needs about
+20 GB of temporary space.
 """
 import argparse
 import shutil
@@ -45,19 +47,13 @@ def process(mp4: Path, dst: Path, fps_out: int) -> None:
         for d in (raw, up, mid):
             d.mkdir()
         run(["ffmpeg", "-v", "error", "-i", mp4, "-vsync", "0", raw / "%06d.png"])
-        run([ESRGAN, "-i", raw, "-o", up, "-n", "realesr-animevideov3", "-s", "2",
-             "-f", "jpg"])
+        run([ESRGAN, "-i", raw, "-o", up, "-n", "realesr-animevideov3", "-s", "3"])
         # RIFE needs the target count; x3 frames over the same duration
-        run([RIFE, "-i", up, "-o", mid, "-m", "rife-v4.6", "-n", n * 3, "-f", "%08d.jpg"],
+        run([RIFE, "-i", up, "-o", mid, "-m", "rife-v4.6", "-n", n * 3, "-f", "%08d.png"],
             cwd=RIFE_DIR)
-        wav = mp4.with_suffix(".wav")
-        cmd = ["ffmpeg", "-v", "error", "-y", "-framerate", fps_out, "-i", mid / "%08d.jpg"]
-        if wav.exists():
-            cmd += ["-i", wav, "-c:a", "aac", "-b:a", "160k"]
-        cmd += ["-vf", "deband=1thr=0.03:2thr=0.03:3thr=0.03:range=24:blur=1,"
-                "scale=1920:1440:flags=lanczos", "-c:v", "libx264", "-preset",
-                "slow", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                "-shortest", dst]
+        cmd = ["ffmpeg", "-v", "error", "-y", "-framerate", fps_out, "-i", mid / "%08d.png",
+               "-an", "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt",
+               "yuv420p", "-movflags", "+faststart", dst]
         dst.parent.mkdir(parents=True, exist_ok=True)
         run(cmd)
 
@@ -65,7 +61,7 @@ def process(mp4: Path, dst: Path, fps_out: int) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", type=Path, default=SRC)
-    ap.add_argument("--out", type=Path, default=ROOT / "hd" / "mvi")
+    ap.add_argument("--out", type=Path, default=ROOT / "hd_v2" / "mvi")
     ap.add_argument("--only", default="FILM", help="comma-separated categories")
     ap.add_argument("--names", default="", help="comma-separated video names")
     args = ap.parse_args()

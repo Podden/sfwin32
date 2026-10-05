@@ -28,6 +28,7 @@ int g_vid_active;
 static SDL_Window   *g_win;
 static SDL_Renderer *g_ren;
 static SDL_Texture  *g_tex;
+static SDL_Texture  *g_mtex;           /* an HD film's picture (media.c)    */
 static uint32_t      g_pal[256];
 static uint32_t     *g_conv;
 static int           g_quit;
@@ -503,7 +504,8 @@ void video_set_bank(int window, int bank)
  * Never call this from the game thread -- SDL owns its window's thread. */
 static void render_frame(void)
 {
-    int x, y;
+    int x, y, mw, mh, fresh;
+    const uint32_t *mp;
     const uint8_t *src;
     uint32_t *dst;
 
@@ -583,14 +585,47 @@ static void render_frame(void)
         }
     }
 
+    /* An HD film over the game's own, which runs underneath. The game
+     * shows a film 1:1 as a 640x240 band across the middle. */
+    mp = movie_frame(&mw, &mh, &fresh);
+
     if (script_shot_wanted()) {
-        write_bmp_argb(script_shot_wanted(), g_vid_w, g_vid_h, g_conv);
+        int s = mp ? mw / g_vid_w : 0;
+        uint32_t *big = s && mw == s * g_vid_w && 2 * mh == s * g_vid_h
+                      ? (uint32_t *)malloc((size_t)mw * mh * 8) : NULL;
+        if (big) {             /* the film's resolution, as the window shows it */
+            for (y = 0; y < 2 * mh; y++)
+                for (x = 0; x < mw; x++)
+                    big[(size_t)y * mw + x] = y >= mh / 2 && y < mh / 2 + mh
+                        ? mp[(size_t)(y - mh / 2) * mw + x]
+                        : g_conv[(size_t)(y / s) * g_vid_w + x / s];
+            write_bmp_argb(script_shot_wanted(), mw, 2 * mh, big);
+            free(big);
+            {   /* and the game's own picture under it, to check the two agree */
+                char lo[MAX_PATH + 80];
+                _snprintf(lo, sizeof lo, "%s.game.bmp", script_shot_wanted());
+                write_bmp_argb(lo, g_vid_w, g_vid_h, g_conv);
+            }
+        } else
+            write_bmp_argb(script_shot_wanted(), g_vid_w, g_vid_h, g_conv);
         script_shot_done();
     }
 
     SDL_UpdateTexture(g_tex, NULL, g_conv, g_vid_w * 4);
     SDL_RenderClear(g_ren);
     SDL_RenderCopy(g_ren, g_tex, NULL, NULL);
+    if (mp) {
+        SDL_Rect r;
+        if (!g_mtex) {
+            g_mtex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_ARGB8888,
+                                       SDL_TEXTUREACCESS_STREAMING, mw, mh);
+            if (g_mtex) SDL_SetTextureScaleMode(g_mtex, SDL_ScaleModeLinear);
+        }
+        if (g_mtex && fresh) SDL_UpdateTexture(g_mtex, NULL, mp, mw * 4);
+        r.x = 0; r.w = g_vid_w;
+        r.y = g_vid_h / 4; r.h = g_vid_h / 2;
+        if (g_mtex) SDL_RenderCopy(g_ren, g_mtex, NULL, &r);
+    }
     SDL_RenderPresent(g_ren);
     g_last_present = SDL_GetTicks();
 

@@ -221,6 +221,11 @@ typedef struct {
 } media_pcm;
 uint32_t media_audio_length_ms(const char *path);
 int      media_decode_audio(const char *path, media_pcm *out);
+/* HD films: <hd>/mvi/<CATEGORY>/<NAME>.mp4 over GFX\MVI\<CATEGORY>\<NAME>.MVI */
+void     movie_open(const char *dos_path, int fd);
+void     movie_close(int fd);
+const uint32_t *movie_frame(int *w, int *h, int *fresh);   /* SDL thread */
+double   audio_stream_seconds(void);
 
 /* Polyphony. The game requests NumOfVoices from CONFIG.DES (ships as 8); this
  * raises the request. 16 is the most its own per-voice arrays can hold. */

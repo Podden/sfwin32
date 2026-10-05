@@ -287,6 +287,7 @@ static stream_chunk  g_sq[STREAM_QUEUE];
 static volatile LONG g_sq_count;       /* filled entries; both threads touch it */
 static int           g_sq_read, g_sq_write;
 static double        g_sq_pos;         /* fractional frame position in g_sq_read */
+static volatile LONG g_sq_done;        /* frames of finished chunks, ever        */
 static int           g_sq_next_slot;   /* which slot index to offer the game next */
 static voice        *g_stream_voice;   /* the HSAMPLE the game streams through   */
 
@@ -373,6 +374,7 @@ static void SDLCALL mix_cb(void *ud, Uint8 *stream, int len)
 
             while (fi >= cur->frames) {          /* finished this chunk */
                 g_sq_pos -= (double)cur->frames;         /* keep phase */
+                g_sq_done += (LONG)cur->frames;
                 g_sq_read = (g_sq_read + 1) % STREAM_QUEUE;
                 if (InterlockedDecrement(&g_sq_count) <= 0) {
                     LOGT("audio: stream queue empty after %u frames "
@@ -459,6 +461,15 @@ static voice *as_voice(void *h)
     return NULL;
 }
 
+/* How far the cinematic stream has played, in seconds, counted from the
+ * start of the process: the clock an HD film follows (media.c). */
+double audio_stream_seconds(void)
+{
+    const voice *sv = g_stream_voice;
+    int rate = sv && sv->rate > 0 ? sv->rate : 22050;
+    return ((double)g_sq_done + g_sq_pos) / rate;
+}
+
 static int32_t __cdecl h_install_DIG_INI(void **dig)
 {
     if (dig) *dig = &g_driver_token;
@@ -466,6 +477,7 @@ static int32_t __cdecl h_install_DIG_INI(void **dig)
      * previous movie. The chunk allocations themselves are kept and reused --
      * they are the right size already. */
     if (g_dev) SDL_LockAudioDevice(g_dev);
+    g_sq_done += (LONG)g_sq_pos;               /* the clock keeps running */
     g_sq_count = 0;
     g_sq_read = g_sq_write = g_sq_next_slot = 0;
     g_sq_pos = 0;

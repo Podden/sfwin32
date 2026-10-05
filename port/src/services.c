@@ -209,12 +209,14 @@ int dos_int21(CONTEXT *c)
         if (fd < 0) { CloseHandle(h); return fail(c, 4); }
         g_fh_dev[fd] = 0;
         LOGT("open '%s' -> %d", dos_path(c), fd);
+        movie_open(dos_path(c), fd);
         return ok16(c, (uint16_t)fd);
     }
 
     case 0x3E: {    /* close */
         uint16_t fd = (uint16_t)(c->Ebx & 0xFFFF);
         if (fd < MAX_FH && g_fh[fd]) {
+            movie_close(fd);
             if (!g_fh_dev[fd]) CloseHandle(g_fh[fd]);
             g_fh[fd] = NULL;
             g_fh_dev[fd] = 0;
