@@ -539,6 +539,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--msaa") && i + 1 < argc)
             g_msaa = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--smooth2d")) g_smooth2d = 1;
+        else if (!strcmp(argv[i], "--wide") && i + 1 < argc)
+            g_wide_arg = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc)
             GetFullPathNameA(argv[++i], MAX_PATH, g_dump_dir, NULL);
         else if (!strcmp(argv[i], "--hd") && i + 1 < argc)

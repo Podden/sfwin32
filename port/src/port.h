@@ -178,6 +178,7 @@ void glide_trace_next(void);
 extern int g_render_scale;   /* --scale N: frame buffer is 640x480 * N  */
 extern int g_msaa;           /* --msaa N: samples, 0/1 off              */
 extern int g_smooth2d;       /* --smooth2d: bilinear 2D in 3dfx mode    */
+extern int g_wide_arg;       /* --wide N: Hor+ columns per side, -1 auto */
 
 /* hd.c: --dump DIR / --hd DIR, content-hashed asset dumps and replacements */
 extern char g_dump_dir[MAX_PATH];

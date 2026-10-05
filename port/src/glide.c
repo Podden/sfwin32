@@ -336,6 +336,36 @@ static int      g_lock_depth;
 static int      g_frame_started;
 static uint16_t g_lfb_snap[GLIDE_W * GLIDE_H];
 int g_render_scale;                    /* --scale N, 0 = from the desktop   */
+int g_wide_arg = -1;                   /* --wide N, -1 = from the desktop   */
+
+/* Hor+ widescreen: the frame buffer is wider than the game's 640 columns by
+ * g_ext on each side, and Glide x runs from -g_ext to 640 + g_ext. The game's
+ * own 640x480 (2D, LFB, cockpit) sits unchanged in the middle; only the 3D
+ * reaches the sides, once hplus_view() has widened the game's clip planes. */
+static int g_ext, g_ext_known;
+static int g_view_y0 = -1, g_view_y1;  /* rows of the game's 3D view (clip) */
+
+/* Under Hor+ a cockpit image may have a 16:9 replacement with a far bigger
+ * window, <hd>/cockpit/<name>.png (tools/cockpit_wide.py): drawn across the
+ * whole frame in place of the 4:3 art, and its alpha is the cockpit mask in
+ * place of the game's aux buffer. 0 while the screen shows anything else. */
+static GLuint g_cockpit_cur;
+static float  g_cockpit_hw;            /* half width, 640-space units       */
+#define GLIDE_VW (GLIDE_W + 2 * g_ext)
+
+static int hplus_ext(void)
+{
+    SDL_DisplayMode dm;
+    if (g_ext_known) return g_ext;
+    g_ext_known = 1;
+    if (g_wide_arg >= 0) g_ext = g_wide_arg;
+    else if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.h > 0 &&
+             (long)dm.w * 3 > (long)dm.h * 4)
+        g_ext = (int)(((long)GLIDE_H * dm.w / dm.h - GLIDE_W) / 2);
+    if (g_ext > GLIDE_W) g_ext = GLIDE_W;
+    LOGI("glide: Hor+ %d columns each side (%d x %d)", g_ext, GLIDE_VW, GLIDE_H);
+    return g_ext;
+}
 int g_msaa = 4;                        /* --msaa N                          */
 int g_smooth2d;                        /* --smooth2d: bilinear 2D overlays  */
 
@@ -676,7 +706,7 @@ static int fbo_create(void)
         LOGE("glide: OpenGL 3.0 framebuffer objects are required");
         return 0;
     }
-    g_fbw = GLIDE_W * scale;
+    g_fbw = (GLIDE_W + 2 * hplus_ext()) * scale;
     g_fbh = GLIDE_H * scale;
 
     /* resolved colour + depth/stencil: the read-back and present source */
@@ -779,11 +809,12 @@ static int gl_ensure_context(void)
 
     if (!fbo_create()) return 0;
 
-    /* Glide's own 640x480 space, y down, mapped onto the whole FBO */
+    /* Glide's own 640x480 space, y down, mapped onto the whole FBO (plus
+     * the Hor+ columns either side) */
     glViewport(0, 0, g_fbw, g_fbh);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(0, GLIDE_W, GLIDE_H, 0, -1, 1);
+    glOrtho(-g_ext, GLIDE_W + g_ext, GLIDE_H, 0, -1, 1);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glEnable(GL_DEPTH_TEST);
@@ -1002,8 +1033,9 @@ static void lfb_sync_from_gl(void)
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, resolve_fbo());
     p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_fbo_small);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(0, 0, g_fbw, g_fbh, 0, 0, GLIDE_W, GLIDE_H,
-                        GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    p_glBlitFramebuffer(g_ext * (g_fbh / GLIDE_H), 0,
+                        (g_ext + GLIDE_W) * (g_fbh / GLIDE_H), g_fbh,
+                        0, 0, GLIDE_W, GLIDE_H, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_small);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, GLIDE_W, GLIDE_H, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, px);
@@ -1062,9 +1094,21 @@ static void lfb_flush(void)
 /* Scissor in 640x480 space, upper-left origin, onto the FBO. */
 static void scissor_virtual(int x0, int y0, int x1, int y1)
 {
-    float sx = g_fbw / (float)GLIDE_W, sy = g_fbh / (float)GLIDE_H;
-    glScissor((GLint)(x0 * sx + 0.5f), (GLint)((GLIDE_H - y1) * sy + 0.5f),
+    float sx = g_fbw / (float)GLIDE_VW, sy = g_fbh / (float)GLIDE_H;
+    glScissor((GLint)((x0 + g_ext) * sx + 0.5f), (GLint)((GLIDE_H - y1) * sy + 0.5f),
               (GLsizei)((x1 - x0) * sx + 0.5f), (GLsizei)((y1 - y0) * sy + 0.5f));
+}
+
+/* The game's clip window. Under Hor+ the full-width 3D view is opened to
+ * the whole frame: the sides belong to the 3D alone, and in the middle the
+ * stencil keeps the 3D off the rows the 4:3 view never covered (see
+ * aux_upload_mask). */
+static void scissor_clip(void)
+{
+    if (g_ext && g_clip_x0 == 0 && g_clip_x1 == GLIDE_W)
+        scissor_virtual(-g_ext, 0, GLIDE_W + g_ext, GLIDE_H);
+    else
+        scissor_virtual(g_clip_x0, g_clip_y0, g_clip_x1, g_clip_y1);
 }
 
 /* The quadrant (0..3) of a 256 atlas that holds all of the triangle's
@@ -1339,7 +1383,15 @@ static uint32_t gl_draw_triangle(uint32_t *a)
          * to be negated to land at window depth z. Getting this backwards put
          * the black full-viewport quad at depth 0 -- nearest -- where it
          * occluded the entire scene behind it. */
-        glVertex3f(p[VX], p[VY], 1.0f - z * 2.0f);
+        /* The quad the viewport is cleared with spans exactly the game's
+         * 640 columns; under Hor+ it has to clear the sides as well. */
+        if (bias_mode && g_ext && (p[VX] <= 0.0f || p[VX] >= (float)GLIDE_W))
+            glVertex3f(p[VX] <= 0.0f ? (float)-g_ext : (float)(GLIDE_W + g_ext),
+                       p[VY] <= (float)g_clip_y0 ? 0.0f :
+                       p[VY] >= (float)g_clip_y1 ? (float)GLIDE_H : p[VY],
+                       1.0f - z * 2.0f);
+        else
+            glVertex3f(p[VX], p[VY], 1.0f - z * 2.0f);
     }
     glEnd();
     return 0;
@@ -1419,6 +1471,8 @@ static uint32_t gl_tex_download_table(uint32_t *a)
     return 0;
 }
 
+static void aux_upload_mask(void);
+
 static uint32_t gl_clip_window(uint32_t *a)
 {
     g_clip_x0 = (int)a[0]; g_clip_y0 = (int)a[1];
@@ -1429,7 +1483,13 @@ static uint32_t gl_clip_window(uint32_t *a)
     if (g_clip_y1 > GLIDE_H) g_clip_y1 = GLIDE_H;
     if (!gl_ensure_context()) return 0;
     glEnable(GL_SCISSOR_TEST);
-    scissor_virtual(g_clip_x0, g_clip_y0, g_clip_x1, g_clip_y1);
+    scissor_clip();
+    if (g_ext && g_clip_x0 == 0 && g_clip_x1 == GLIDE_W &&
+        (g_view_y0 != g_clip_y0 || g_view_y1 != g_clip_y1)) {
+        g_view_y0 = g_clip_y0;
+        g_view_y1 = g_clip_y1;
+        if (g_mask_ready) aux_upload_mask();
+    }
     LOGI("glide: clip window %u,%u .. %u,%u", a[0], a[1], a[2], a[3]);
     return 0;
 }
@@ -1604,6 +1664,9 @@ static void aux_upload_mask(void)
         mask[i] = g_auxbuf[i] == 0 ? 255 : 0;      /* 255 = masked off */
         zero += g_auxbuf[i] == 0;
     }
+    if (g_ext && g_view_y0 >= 0 && !g_cockpit_cur) /* Hor+: see scissor_clip */
+        for (i = 0; i < GLIDE_W * GLIDE_H; i++)
+            if (i / GLIDE_W < g_view_y0 || i / GLIDE_W >= g_view_y1) mask[i] = 255;
 
     /* Stamped into the stencil at the frame buffer's own resolution, by a
      * full-screen quad that only survives the alpha test where masked. */
@@ -1612,6 +1675,13 @@ static void aux_upload_mask(void)
                  GL_UNSIGNED_BYTE, mask);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    {   /* a 16:9 cockpit brings its own mask: its alpha, over its own span */
+        float qx0 = 0.0f, qx1 = (float)GLIDE_W;
+        if (g_cockpit_cur) {
+            glBindTexture(GL_TEXTURE_2D, g_cockpit_cur);
+            qx0 = GLIDE_W * 0.5f - g_cockpit_hw;
+            qx1 = GLIDE_W * 0.5f + g_cockpit_hw;
+        }
 
     if (g_prog) p_glUseProgram(0);
     glDisable(GL_SCISSOR_TEST);
@@ -1630,11 +1700,12 @@ static void aux_upload_mask(void)
     glEnable(GL_TEXTURE_2D);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
     glBegin(GL_QUADS);
-        glTexCoord2f(0, 0); glVertex3f(0,       0,       0);
-        glTexCoord2f(1, 0); glVertex3f(GLIDE_W, 0,       0);
-        glTexCoord2f(1, 1); glVertex3f(GLIDE_W, GLIDE_H, 0);
-        glTexCoord2f(0, 1); glVertex3f(0,       GLIDE_H, 0);
+        glTexCoord2f(0, 0); glVertex3f(qx0, 0,       0);
+        glTexCoord2f(1, 0); glVertex3f(qx1, 0,       0);
+        glTexCoord2f(1, 1); glVertex3f(qx1, GLIDE_H, 0);
+        glTexCoord2f(0, 1); glVertex3f(qx0, GLIDE_H, 0);
     glEnd();
+    }
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_ALPHA_TEST);
@@ -1727,8 +1798,8 @@ static void present(void)
     GLuint src = resolve_fbo();
 
     SDL_GL_GetDrawableSize(video_window(), &dw, &dh);
-    if ((long)dw * 3 > (long)dh * 4) { vh = dh; vw = dh * 4 / 3; }
-    else                             { vw = dw; vh = dw * 3 / 4; }
+    if ((long)dw * g_fbh > (long)dh * g_fbw) { vh = dh; vw = (int)((long)dh * g_fbw / g_fbh); }
+    else                                     { vw = dw; vh = (int)((long)dw * g_fbh / g_fbw); }
     vx = (dw - vw) / 2;
     vy = (dh - vh) / 2;
 
@@ -1802,6 +1873,19 @@ static uint32_t gl_buffer_swap(uint32_t *a)
         }
         script_shot_done();
     }
+    /* A frame without 3D (menus, briefings) leaves the Hor+ columns
+     * holding the last scene; they belong to no 2D the game draws, unless
+     * a 16:9 cockpit is up, which is drawn once and owns them. */
+    if (g_ext && !g_frame_started && !g_cockpit_cur) {
+        glDisable(GL_SCISSOR_TEST);
+        glEnable(GL_SCISSOR_TEST);
+        glClearColor(0, 0, 0, 1);
+        scissor_virtual(-g_ext, 0, 0, GLIDE_H);
+        glClear(GL_COLOR_BUFFER_BIT);
+        scissor_virtual(GLIDE_W, 0, GLIDE_W + g_ext, GLIDE_H);
+        glClear(GL_COLOR_BUFFER_BIT);
+        scissor_clip();
+    }
     present();
 
     /* End of frame -- deliberately not grBufferClear. This game calls
@@ -1819,7 +1903,8 @@ static uint32_t gl_buffer_swap(uint32_t *a)
  * are drawn into the frame buffer at full resolution instead. Returns 0 if
  * there is none, and the caller draws the original. */
 #define HD2D_CACHE 4096
-static struct { uint64_t key; GLuint tex, wide; int missing, seen; } g_hd2d[HD2D_CACHE];
+static struct { uint64_t key; GLuint tex, wide, cockpit; float cockpit_hw;
+                int missing, seen; } g_hd2d[HD2D_CACHE];
 
 /* Widescreen cockpit art (g_wide_cur, see present): one texture per
  * full-screen image that has a <hd>/wide/ version. */
@@ -1846,6 +1931,14 @@ static void wide_select(GLuint tex)
     g_wide_cur = tex;
     for (i = 0; i < 16; i++)
         if (g_wide_size[i].tex == tex) { g_wide_w = g_wide_size[i].w; g_wide_h = g_wide_size[i].h; }
+}
+
+static void cockpit_select(GLuint tex, float hw)
+{
+    if (tex == g_cockpit_cur) return;
+    g_cockpit_cur = tex;
+    g_cockpit_hw = hw;
+    if (g_mask_ready) aux_upload_mask();       /* the mask follows the art */
 }
 
 /* A screen rectangle that keeps showing new pictures is a live display (the
@@ -1892,8 +1985,11 @@ static int hd_image_draw(const uint32_t *rgba, int x, int y, int w, int h)
              * different picture every frame and would flood the dump. */
             if (++g_hd2d[slot].seen == 3 && hd_dump("2d", name, w, h, rgba))
                 LOGI("hd: dumped image %s at %d,%d", name, x, y);
-            if (w == GLIDE_W && h == GLIDE_H) wide_select(g_hd2d[slot].wide);
-            if (g_hd2d[slot].missing) return 0;
+            if (w == GLIDE_W && h == GLIDE_H) {
+                wide_select(g_hd2d[slot].wide);
+                cockpit_select(g_hd2d[slot].cockpit, g_hd2d[slot].cockpit_hw);
+            }
+            if (g_hd2d[slot].missing && !g_hd2d[slot].cockpit) return 0;
             tex = g_hd2d[slot].tex;
             break;
         }
@@ -1923,13 +2019,31 @@ static int hd_image_draw(const uint32_t *rgba, int x, int y, int w, int h)
                     }
                 }
                 wide_select(g_hd2d[slot].wide);
+                wp = g_ext && g_hd_dir[0] ? hd_load("cockpit", name, &ww, &wh) : NULL;
+                if (wp) {
+                    g_hd2d[slot].cockpit = hd_texture(wp, ww, wh);
+                    g_hd2d[slot].cockpit_hw = GLIDE_H * 0.5f * ww / wh;
+                    free(wp);
+                    LOGI("hd: 16:9 cockpit for %s (%dx%d)", name, ww, wh);
+                }
+                cockpit_select(g_hd2d[slot].cockpit, g_hd2d[slot].cockpit_hw);
             }
-            if (!px) { g_hd2d[slot].missing = 1; return 0; }
+            if (!px) {
+                g_hd2d[slot].missing = 1;
+                if (!g_hd2d[slot].cockpit) return 0;
+                break;
+            }
             tex = hd_texture(px, iw, ih);
             free(px);
             g_hd2d[slot].tex = tex;
             break;
         }
+    }
+    {   float qx0 = (float)x, qx1 = (float)(x + w);
+    if (w == GLIDE_W && h == GLIDE_H && g_cockpit_cur) {
+        tex = g_cockpit_cur;
+        qx0 = GLIDE_W * 0.5f - g_cockpit_hw;
+        qx1 = GLIDE_W * 0.5f + g_cockpit_hw;
     }
     if (!tex) return 0;
 
@@ -1946,11 +2060,12 @@ static int hd_image_draw(const uint32_t *rgba, int x, int y, int w, int h)
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
     glBegin(GL_QUADS);
-        glTexCoord2f(0, 0); glVertex3f((float)x,       (float)y,       0);
-        glTexCoord2f(1, 0); glVertex3f((float)(x + w), (float)y,       0);
-        glTexCoord2f(1, 1); glVertex3f((float)(x + w), (float)(y + h), 0);
-        glTexCoord2f(0, 1); glVertex3f((float)x,       (float)(y + h), 0);
+        glTexCoord2f(0, 0); glVertex3f(qx0, (float)y,       0);
+        glTexCoord2f(1, 0); glVertex3f(qx1, (float)y,       0);
+        glTexCoord2f(1, 1); glVertex3f(qx1, (float)(y + h), 0);
+        glTexCoord2f(0, 1); glVertex3f(qx0, (float)(y + h), 0);
     glEnd();
+    }
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glDisable(GL_BLEND);
     glEnable(GL_SCISSOR_TEST);
@@ -2104,6 +2219,63 @@ static __declspec(naked) void glide_common(void)
     }
 }
 
+/* Hor+ in the game itself. FIGHT3 clips every polygon in 3D against four
+ * planes through the view's screen bounds (view+0x1C4: x0, y0, x1, y1; the
+ * clipper is orig 0xEFC10), and derives the focal length from the full 640
+ * width once per mission, before taking the cockpit window's margins off
+ * those bounds (orig 0x60D29..0x60D52). Widening x0/x1 right after that, at
+ * orig 0x60D58, keeps the focal length -- the 4:3 picture is unchanged --
+ * and lets the scene through into the Hor+ columns. */
+#define HPLUS_SITE 0x00060D58u
+static void __cdecl hplus_view(uint8_t *view)
+{
+    float *b = (float *)(view + 0x1C4);
+    int e = hplus_ext();
+    LOGI("hplus: view bounds %.2f,%.2f .. %.2f,%.2f, centre %.1f,%.1f, f %.1f",
+         b[0], b[1], b[2], b[3], *(float *)(view + 0x1B0),
+         *(float *)(view + 0x1B8), *(float *)(view + 0x1A4));
+    if (!e) return;
+    b[0] = -0.5f - (float)e;
+    b[2] = (float)GLIDE_W - 0.5f + (float)e;
+    /* and the full height: the bounds are relative to the view's top row,
+     * which is not known yet at this point, so a whole frame either way */
+    b[1] = -0.5f - (float)GLIDE_H;
+    b[3] = (float)GLIDE_H * 2.0f - 0.5f;
+}
+
+static void hplus_install(void)
+{
+    static const uint8_t before[6] = { 0xD9, 0x98, 0xCC, 0x01, 0x00, 0x00 };
+    uint8_t *p = (uint8_t *)gp(HPLUS_SITE), *w;
+    int32_t rel;
+    if (memcmp(p - 6, before, 6) || p[0] != 0xB8 || p[5] != 0xE8) {
+        LOGW("hplus: orig 0x%08X is not the expected code; no Hor+", HPLUS_SITE);
+        return;
+    }
+    w = (uint8_t *)VirtualAlloc(NULL, 64, MEM_RESERVE | MEM_COMMIT,
+                                PAGE_EXECUTE_READWRITE);
+    if (!w) return;
+    {   uint8_t *slot = w;
+        *w++ = 0x60;                                   /* pushad            */
+        *w++ = 0x9C;                                   /* pushfd            */
+        *w++ = 0x50;                                   /* push eax (view)   */
+        *w++ = 0xE8;
+        rel = (int32_t)((uint8_t *)(void *)hplus_view - (w + 4));
+        memcpy(w, &rel, 4); w += 4;
+        *w++ = 0x83; *w++ = 0xC4; *w++ = 0x04;         /* add esp,4         */
+        *w++ = 0x9D;                                   /* popfd             */
+        *w++ = 0x61;                                   /* popad             */
+        memcpy(w, p, 5); w += 5;                       /* mov eax, imm32    */
+        *w++ = 0xE9;
+        rel = (int32_t)((p + 5) - (w + 4));
+        memcpy(w, &rel, 4);
+        p[0] = 0xE9;
+        rel = (int32_t)(slot - (p + 5));
+        memcpy(p + 1, &rel, 4);
+    }
+    LOGI("hplus: view-bounds hook at orig 0x%08X", HPLUS_SITE);
+}
+
 void glide_install(void)
 {
     uint8_t  *thunk;
@@ -2172,6 +2344,7 @@ void glide_install(void)
         memcpy(stub + 1, &rel, 4);
     }
 
+    hplus_install();
     for (i = 0; i < g_nimp; i++) if (g_imp[i].fn) impl++;
     LOGI("glide: %u imports redirected (%u implemented, %u stubbed);"
          " GLIDE2X.OVL is never loaded", g_nimp, impl, g_nimp - impl);
