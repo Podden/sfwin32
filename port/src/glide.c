@@ -398,6 +398,44 @@ static int hplus_ext(void)
     return g_ext;
 }
 int g_msaa = 4;                        /* --msaa N                          */
+
+/* --fx LIST: what this renderer adds to the game's own look, all of it
+ * computed, none of it shipped: the water absorbing light with distance
+ * (red first), caustics on surfaces facing up, the boat's headlight, and
+ * ambient occlusion and bloom over the finished view.
+ * Each needs the camera (objprobe_camera), so each pixel of the 3D view can
+ * be put back where it is in the world. The game's lighting stays as the
+ * base; these come on top. */
+#define FX_FOG      1
+#define FX_CAUSTICS 2
+#define FX_LIGHT    4
+#define FX_TRI      (FX_FOG | FX_CAUSTICS | FX_LIGHT)   /* in the triangle shader */
+#define FX_SSAO     32                                 /* passes, see post_run   */
+#define FX_BLOOM    64
+#define FX_ALL      (FX_TRI | FX_SSAO | FX_BLOOM)
+int g_fx = FX_ALL;
+static int g_blend_on, g_blend_add;     /* the game's blend, see gl_alpha_blend */
+static GLenum g_blend_src = GL_ONE, g_blend_dst = GL_ZERO;
+static void post_maybe(void);
+
+int glide_fx_parse(const char *list)
+{
+    static const struct { const char *name; int bit; } k[] = {
+        { "none", 0 }, { "all", FX_ALL }, { "fog", FX_FOG },
+        { "caustics", FX_CAUSTICS }, { "light", FX_LIGHT },
+        { "ssao", FX_SSAO }, { "bloom", FX_BLOOM } };
+    char buf[128], *t, *ctx = NULL;
+    int fx = 0, i;
+    strncpy(buf, list, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    for (t = strtok_s(buf, ", ", &ctx); t; t = strtok_s(NULL, ", ", &ctx)) {
+        for (i = 0; i < (int)(sizeof k / sizeof k[0]) && _stricmp(t, k[i].name); i++) {}
+        if (i == (int)(sizeof k / sizeof k[0])) LOGW("fx: unknown effect '%s'", t);
+        else fx |= k[i].bit;
+    }
+    LOGI("fx: %s -> 0x%X", list, fx);
+    return fx;
+}
 int g_smooth2d;                        /* --smooth2d: bilinear 2D overlays  */
 
 #define GL_FRAMEBUFFER_          0x8D40
@@ -498,8 +536,10 @@ static void glide_unpack(uint32_t c, float *r, float *g, float *b)
  */
 
 static const char *g_vs_src =
+    "varying vec2 vScreen;\n"
     "void main()\n"
     "{\n"
+    "    vScreen         = gl_Vertex.xy;\n"
     "    gl_Position     = ftransform();\n"
     "    gl_TexCoord[0]  = gl_MultiTexCoord0;\n"
     "    gl_FrontColor   = gl_Color;\n"
@@ -514,6 +554,38 @@ static const char *g_fs_src =
     "uniform vec3  uFogColor;\n"
     "uniform float uWFar;\n"
     "uniform int   uBackdrop;\n"
+    /* --fx (see FX_*): the camera, so a fragment can be put back into the
+     * world. uProj = fx, fy, cx, cy in screen units, uRange = near, far;
+     * camera space is x right, y depth, z up, and uCamInv takes it to the
+     * world. */
+    "uniform int   uFx;\n"
+    "uniform vec4  uProj;\n"
+    "uniform vec2  uRange;\n"
+    "uniform mat3  uCamInv;\n"
+    "uniform vec3  uCamPos;\n"
+    "uniform vec3  uWater;\n"
+    "uniform float uTime;\n"
+    "varying vec2  vScreen;\n"
+    "bool fx(int b) { return mod(floor(float(uFx) / float(b)), 2.0) >= 1.0; }\n"
+    "vec2 hash2(vec2 c)\n"
+    "{\n"
+    "    return fract(sin(vec2(dot(c, vec2(127.1, 311.7)), dot(c, vec2(269.5, 183.3)))) * 43758.5453);\n"
+    "}\n"
+    /* Caustics as the edges of drifting cells: bright where a point is about
+     * as near to its second-nearest cell centre as to its nearest. */
+    "float caustic(vec2 p, float t)\n"
+    "{\n"
+    "    vec2 c = floor(p), f = fract(p);\n"
+    "    float d1 = 8.0, d2 = 8.0;\n"
+    "    for (int j = -1; j <= 1; j++)\n"
+    "    for (int i = -1; i <= 1; i++) {\n"
+    "        vec2 g = vec2(float(i), float(j)), h = hash2(c + g);\n"
+    "        vec2 o = 0.5 + 0.4 * sin(t * (0.5 + 0.5 * h) + 6.2831 * h);\n"
+    "        float d = length(g + o - f);\n"
+    "        if (d < d1) { d2 = d1; d1 = d; } else if (d < d2) d2 = d;\n"
+    "    }\n"
+    "    return 1.0 - smoothstep(0.0, 0.3, d2 - d1);\n"
+    "}\n"
     "void main()\n"
     "{\n"
     "    float oow = gl_TexCoord[0].q;\n"
@@ -532,6 +604,31 @@ static const char *g_fs_src =
     "        vec4 t = texture2DProj(uTex, gl_TexCoord[0]);\n"
     "        if (uAlphaTest != 0 && t.a < 0.5) discard;\n"
     "        c = uTexMode == 2 ? t : t * gl_Color;\n"
+    "    }\n"
+    "    if (uFx != 0) {\n"
+    "        vec3 albedo = uTexMode == 0 ? gl_Color.rgb : texture2DProj(uTex, gl_TexCoord[0]).rgb;\n"
+    "        float y = uRange.x + (w - 1.0) * (uRange.y - uRange.x) / 65535.0;\n"
+    "        vec3 pc = vec3((vScreen.x - uProj.z) * y / uProj.x, y, (vScreen.y - uProj.w) * y / uProj.y);\n"
+    "        float d = length(pc);\n"
+    "        vec3 n = normalize(cross(dFdx(pc), dFdy(pc)));\n"
+    "        if (dot(n, pc) > 0.0) n = -n;\n"
+    "        vec3 add = vec3(0.0);\n"
+    "        if (fx(4)) {\n"            /* headlight, from the camera */
+    "            float spot = smoothstep(0.75, 0.96, y / d);\n"
+    "            float att  = 1.0 / (1.0 + (d * d) / (1400.0 * 1400.0));\n"
+    "            add += vec3(0.80, 0.92, 1.00) * spot * att * (0.25 + 0.75 * max(dot(n, -pc / d), 0.0));\n"
+    "        }\n"
+    "        if (fx(2)) {\n"            /* caustics, from above */
+    "            vec3 pw = uCamPos + uCamInv * pc;\n"
+    "            float up = max((uCamInv * n).z, 0.0);\n"
+    "            float k = 0.6 * caustic(pw.xy / 95.0, uTime) + 0.4 * caustic(pw.xy / 61.0 + 7.3, 1.3 * uTime);\n"
+    "            add += vec3(0.30, 0.45, 0.55) * k * k * up * (1.0 - smoothstep(0.30, 0.65, d / uRange.y));\n"
+    "        }\n"
+    "        if (!fx(8)) c.rgb += albedo * add;\n"   /* 8: blended */
+    "        if (fx(1)) {\n"            /* absorption, red first */
+    "            vec3 T = exp(-vec3(2.4, 1.3, 0.9) * d / uRange.y);\n"
+    "            c.rgb = fx(16) ? c.rgb * T : c.rgb * T + uWater * (1.0 - T);\n"
+    "        }\n"
     "    }\n"
     "    if (uFog != 0) c.rgb = mix(c.rgb, uFogColor, gl_FogFragCoord);\n"
     "    gl_FragColor = c;\n"
@@ -561,10 +658,17 @@ static GLint  (APIENTRY *p_glGetUniformLocation)(GLuint, const GLchar_ *);
 static void   (APIENTRY *p_glUniform1i)(GLint, GLint);
 static void   (APIENTRY *p_glUniform1f)(GLint, GLfloat);
 static void   (APIENTRY *p_glUniform3f)(GLint, GLfloat, GLfloat, GLfloat);
+static void   (APIENTRY *p_glUniform2f)(GLint, GLfloat, GLfloat);
+static void   (APIENTRY *p_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
+static void   (APIENTRY *p_glUniformMatrix3fv)(GLint, GLsizei, GLboolean, const GLfloat *);
+static void   (APIENTRY *p_glActiveTexture)(GLenum);
+#define GL_TEXTURE0_ 0x84C0
+#define GL_TEXTURE1_ 0x84C1
 
 static GLuint g_prog;
 static GLint  g_u_texmode, g_u_alphatest, g_u_fog, g_u_fogcolor, g_u_wfar;
 static GLint  g_u_backdrop;
+static GLint  g_u_fx, g_u_proj, g_u_range, g_u_caminv, g_u_campos, g_u_water, g_u_time;
 
 static GLuint shader_build(GLenum type, const char *src)
 {
@@ -621,6 +725,12 @@ static void shader_init(void)
     p_glUniform3f     = (void (APIENTRY *)(GLint, GLfloat, GLfloat, GLfloat))
                             SDL_GL_GetProcAddress("glUniform3f");
 
+    *(void **)&p_glUniform2f = SDL_GL_GetProcAddress("glUniform2f");
+    *(void **)&p_glUniform4f = SDL_GL_GetProcAddress("glUniform4f");
+    *(void **)&p_glUniformMatrix3fv = SDL_GL_GetProcAddress("glUniformMatrix3fv");
+    *(void **)&p_glActiveTexture = SDL_GL_GetProcAddress("glActiveTexture");
+    if (!p_glUniform2f || !p_glUniform4f || !p_glUniformMatrix3fv) g_fx = 0;
+
     if (!p_glCreateShader || !p_glUseProgram || !p_glGetUniformLocation) {
         LOGW("glide: no GLSL; depth stays hyperbolic in the fixed pipeline");
         return;
@@ -643,6 +753,13 @@ static void shader_init(void)
     g_u_fogcolor  = p_glGetUniformLocation(g_prog, "uFogColor");
     g_u_wfar      = p_glGetUniformLocation(g_prog, "uWFar");
     g_u_backdrop  = p_glGetUniformLocation(g_prog, "uBackdrop");
+    g_u_fx        = p_glGetUniformLocation(g_prog, "uFx");
+    g_u_proj      = p_glGetUniformLocation(g_prog, "uProj");
+    g_u_range     = p_glGetUniformLocation(g_prog, "uRange");
+    g_u_caminv    = p_glGetUniformLocation(g_prog, "uCamInv");
+    g_u_campos    = p_glGetUniformLocation(g_prog, "uCamPos");
+    g_u_water     = p_glGetUniformLocation(g_prog, "uWater");
+    g_u_time      = p_glGetUniformLocation(g_prog, "uTime");
     LOGI("glide: w-buffer shader active; depth is linear in w to %.0f",
          (double)G_WFAR);
 }
@@ -1118,6 +1235,7 @@ static void lfb_flush(void)
             if (c[x] != s[x]) { if (x < x0) x0 = x; if (x > x1) x1 = x; }
     }
     if (x1 < 0) return;
+    post_maybe();
 
     /* one pixel of margin, so a filtered upload samples current neighbours */
     if (x0 > 0) x0--;
@@ -1203,6 +1321,356 @@ static int triangle_tile(const float *const v[3], const texcache_ent *e)
     if (s0 < qx * 128.0f - 0.05f || s1 > qx * 128.0f + 128.05f ||
         t0 < qy * 128.0f - 0.05f || t1 > qy * 128.0f + 128.05f) return -1;
     return qy * 2 + qx;
+}
+
+/* ---- --fx ssao, bloom: passes over the finished 3D view ------------------
+ *
+ * Run once a frame, at the first 2D the game draws after its main 3D view
+ * (post_maybe), so the HUD and the cockpit never go through them. Both read
+ * the depth the w-buffer shader wrote, which is linear in w: with the camera
+ * that is a position in camera space for every pixel.
+ *
+ *   SSAO   a disc of samples around each pixel, at a radius fixed in the
+ *          world, counted where they rise above the surface's own plane;
+ *          half resolution, blurred, multiplied in.
+ *   bloom  what is bright, at a quarter of the resolution, blurred twice
+ *          and added.
+ *
+ * Only pixels the 3D view drew take part (depth below the clear value), and
+ * the composite keeps to the cockpit stencil, so the cockpit neither darkens
+ * nor glows into the scene. */
+
+static GLuint g_pp_fbo, g_pp_depth_fbo, g_pp_depth, g_pp_tex[4];
+static int    g_pp_w2, g_pp_h2, g_pp_w4, g_pp_h4;
+static GLuint g_pp_ao, g_pp_blur, g_pp_bright;
+static int    g_pp_failed;
+static float  g_cam_proj[6];               /* fx_bits' camera, for the passes */
+static int    g_post_3d;
+static uint32_t g_post_frame = 0xFFFFFFFFu;
+
+#define GL_DEPTH_COMPONENT_       0x1902
+#define GL_DEPTH_STENCIL_        0x84F9
+#define GL_UNSIGNED_INT_24_8_    0x84FA
+#define GL_DEPTH_ATTACHMENT_     0x8D00
+
+static const char *g_pp_vs =
+    "void main() { gl_Position = ftransform(); gl_TexCoord[0] = gl_MultiTexCoord0; }\n";
+
+/* camera-space position of a pixel; uv over the whole frame buffer */
+#define PP_VIEWPOS \
+    "uniform sampler2D uDepth;\n" \
+    "uniform vec4  uProj;\n" \
+    "uniform vec2  uRange;\n" \
+    "uniform float uExt;\n" \
+    "vec3 viewpos(vec2 uv, out float dz)\n" \
+    "{\n" \
+    "    dz = texture2D(uDepth, uv).r;\n" \
+    "    float y = uRange.x + (dz * 65536.0 - 1.0) * (uRange.y - uRange.x) / 65535.0;\n" \
+    "    vec2 s = vec2(uv.x * (640.0 + 2.0 * uExt) - uExt, (1.0 - uv.y) * 480.0);\n" \
+    "    return vec3((s.x - uProj.z) * y / uProj.x, y, (s.y - uProj.w) * y / uProj.y);\n" \
+    "}\n"
+
+static const char *g_pp_ao_fs =
+    PP_VIEWPOS
+    "uniform vec2 uTexel;\n"                   /* one full-resolution pixel in uv */
+    "void main()\n"
+    "{\n"
+    "    vec2 uv = gl_TexCoord[0].xy;\n"
+    "    float dz, dq, occ = 0.0;\n"
+    "    vec3 p = viewpos(uv, dz);\n"
+    "    if (dz >= 0.9999) { gl_FragColor = vec4(1.0); return; }\n"
+    "    vec3 n = normalize(cross(viewpos(uv + vec2(uTexel.x, 0.0), dq) - p,\n"
+    "                             viewpos(uv + vec2(0.0, uTexel.y), dq) - p));\n"
+    "    if (dot(n, p) > 0.0) n = -n;\n"
+    "    float R = 40.0 + 0.08 * p.y;\n"           /* world units; a boat is ~200 */
+    "    float rad = R * uProj.x / p.y;\n"         /* ... in 640-space pixels */
+    "    float a0 = 6.2831 * fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);\n"
+    "    for (int i = 0; i < 12; i++) {\n"
+    "        float t = (float(i) + 0.5) / 12.0;\n"
+    "        float a = a0 + float(i) * 2.39996;\n"
+    "        vec2 o = vec2(cos(a), sin(a)) * rad * sqrt(t);\n"
+    "        vec3 q = viewpos(uv + o / vec2(640.0 + 2.0 * uExt, 480.0), dq);\n"
+    "        vec3 v = q - p;\n"
+    "        float l = length(v) + 0.001;\n"
+    "        occ += max(dot(v / l, n) - 0.10, 0.0) * (1.0 - smoothstep(R, 2.0 * R, l));\n"
+    "    }\n"
+    "    gl_FragColor = vec4(vec3(clamp(1.0 - 2.2 * occ / 12.0, 0.0, 1.0)), 1.0);\n"
+    "}\n";
+
+static const char *g_pp_blur_fs =
+    "uniform sampler2D uSrc;\n"
+    "uniform sampler2D uDepth;\n"
+    "uniform vec2 uDir;\n"                     /* one source texel along the axis */
+    "uniform int  uBilat;\n"                   /* weigh by depth: AO, not bloom */
+    "vec4 tap(vec2 uv, float k, float zc, inout float sum)\n"
+    "{\n"
+    "    if (uBilat != 0) k *= exp(-abs(texture2D(uDepth, uv).r - zc) / (0.02 * zc));\n"
+    "    sum += k;\n"
+    "    return texture2D(uSrc, uv) * k;\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "    vec2 uv = gl_TexCoord[0].xy;\n"
+    "    float zc = texture2D(uDepth, uv).r, sum = 0.0;\n"
+    "    vec4 c = tap(uv, 0.227, zc, sum);\n"
+    "    c += tap(uv + 1.385 * uDir, 0.316, zc, sum) + tap(uv - 1.385 * uDir, 0.316, zc, sum);\n"
+    "    c += tap(uv + 3.231 * uDir, 0.070, zc, sum) + tap(uv - 3.231 * uDir, 0.070, zc, sum);\n"
+    "    gl_FragColor = c / sum;\n"
+    "}\n";
+
+static const char *g_pp_bright_fs =
+    "uniform sampler2D uColor;\n"
+    "uniform sampler2D uDepth;\n"
+    "void main()\n"
+    "{\n"
+    "    vec2 uv = gl_TexCoord[0].xy;\n"
+    "    vec3 c = texture2D(uColor, uv).rgb;\n"
+    "    if (texture2D(uDepth, uv).r >= 0.9999) c = vec3(0.0);\n"
+    "    float l = max(c.r, max(c.g, c.b));\n"
+    "    gl_FragColor = vec4(c * smoothstep(0.70, 1.00, l), 1.0);\n"
+    "}\n";
+
+static GLuint pp_program(const char *fs_src)
+{
+    GLuint vs = shader_build(GL_VERTEX_SHADER, g_pp_vs);
+    GLuint fs = shader_build(GL_FRAGMENT_SHADER, fs_src);
+    GLuint pr;
+    GLint ok = 0;
+    if (!vs || !fs) return 0;
+    pr = p_glCreateProgram();
+    p_glAttachShader(pr, vs);
+    p_glAttachShader(pr, fs);
+    p_glLinkProgram(pr);
+    p_glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+    return ok ? pr : 0;
+}
+
+static GLuint pp_texture(int w, int h)
+{
+    GLuint t;
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8_, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return t;
+}
+
+static int pp_init(void)
+{
+    if (g_pp_fbo) return 1;
+    if (g_pp_failed || !g_prog) return 0;
+    g_pp_failed = 1;
+    g_pp_ao = pp_program(g_pp_ao_fs);
+    g_pp_blur = pp_program(g_pp_blur_fs);
+    g_pp_bright = pp_program(g_pp_bright_fs);
+    if (!g_pp_ao || !g_pp_blur || !g_pp_bright) { LOGE("fx: post shaders failed"); return 0; }
+
+    /* the depth, resolved: a texture the passes can read */
+    glGenTextures(1, &g_pp_depth);
+    glBindTexture(GL_TEXTURE_2D, g_pp_depth);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8_, g_fbw, g_fbh, 0,
+                 GL_DEPTH_STENCIL_, GL_UNSIGNED_INT_24_8_, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    p_glGenFramebuffers(1, &g_pp_depth_fbo);
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, g_pp_depth_fbo);
+    p_glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_DEPTH_STENCIL_ATTACHMENT_, GL_TEXTURE_2D,
+                             g_pp_depth, 0);
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER_) != GL_FRAMEBUFFER_COMPLETE_) {
+        LOGE("fx: depth target incomplete");
+        p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
+        return 0;
+    }
+
+    g_pp_w2 = g_fbw / 2; g_pp_h2 = g_fbh / 2;
+    g_pp_w4 = g_fbw / 4; g_pp_h4 = g_fbh / 4;
+    g_pp_tex[0] = pp_texture(g_pp_w2, g_pp_h2);   /* AO           */
+    g_pp_tex[1] = pp_texture(g_pp_w2, g_pp_h2);   /* AO, blurring */
+    g_pp_tex[2] = pp_texture(g_pp_w4, g_pp_h4);   /* bloom        */
+    g_pp_tex[3] = pp_texture(g_pp_w4, g_pp_h4);   /* bloom, blurring */
+    p_glGenFramebuffers(1, &g_pp_fbo);
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
+    g_pp_failed = 0;
+    LOGI("fx: post passes ready (%dx%d)", g_fbw, g_fbh);
+    return 1;
+}
+
+/* A quad over the whole of 640x480 space (Hor+ columns included), texture
+ * coordinates 0..1 with v up, as textures rendered by GL are stored. */
+static void pp_quad(void)
+{
+    float x0 = (float)-g_ext, x1 = (float)(GLIDE_W + g_ext);
+    glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex3f(x0, (float)GLIDE_H, 0);
+        glTexCoord2f(1, 0); glVertex3f(x1, (float)GLIDE_H, 0);
+        glTexCoord2f(1, 1); glVertex3f(x1, 0,              0);
+        glTexCoord2f(0, 1); glVertex3f(x0, 0,              0);
+    glEnd();
+}
+
+/* Draw `prog` (0: fixed function, texture `src`) into texture `dst` of w x h. */
+static void pp_pass(GLuint prog, GLuint dst, int w, int h)
+{
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, g_pp_fbo);
+    p_glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D, dst, 0);
+    glViewport(0, 0, w, h);
+    p_glUseProgram(prog);
+    pp_quad();
+}
+
+static void pp_blur(GLuint a, GLuint tmp, int w, int h, int bilat)
+{
+    p_glUseProgram(g_pp_blur);
+    p_glUniform1i(p_glGetUniformLocation(g_pp_blur, "uSrc"), 0);
+    p_glUniform1i(p_glGetUniformLocation(g_pp_blur, "uDepth"), 1);
+    p_glUniform1i(p_glGetUniformLocation(g_pp_blur, "uBilat"), bilat);
+    p_glActiveTexture(GL_TEXTURE1_);
+    glBindTexture(GL_TEXTURE_2D, g_pp_depth);
+    p_glActiveTexture(GL_TEXTURE0_);
+    glBindTexture(GL_TEXTURE_2D, a);
+    p_glUniform2f(p_glGetUniformLocation(g_pp_blur, "uDir"), 1.0f / w, 0.0f);
+    pp_pass(g_pp_blur, tmp, w, h);
+    glBindTexture(GL_TEXTURE_2D, tmp);
+    p_glUniform2f(p_glGetUniformLocation(g_pp_blur, "uDir"), 0.0f, 1.0f / h);
+    pp_pass(g_pp_blur, a, w, h);
+}
+
+static void post_run(void)
+{
+    GLuint src;
+    int ssao = (g_fx & FX_SSAO) != 0, bloom = (g_fx & FX_BLOOM) != 0;
+    if (!pp_init() || !p_glActiveTexture) return;
+
+    src = resolve_fbo();                          /* colour, into g_fbo_tex */
+    p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_ms ? g_fbo_ms : g_fbo);
+    p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_pp_depth_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBlitFramebuffer(0, 0, g_fbw, g_fbh, 0, 0, g_fbw, g_fbh,
+                        GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    (void)src;
+
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_FOG);
+    glEnable(GL_TEXTURE_2D);
+    glColor4f(1, 1, 1, 1);
+
+    if (ssao) {
+        p_glUseProgram(g_pp_ao);
+        p_glUniform1i(p_glGetUniformLocation(g_pp_ao, "uDepth"), 0);
+        p_glUniform4f(p_glGetUniformLocation(g_pp_ao, "uProj"),
+                      g_cam_proj[0], g_cam_proj[1], g_cam_proj[2], g_cam_proj[3]);
+        p_glUniform2f(p_glGetUniformLocation(g_pp_ao, "uRange"), g_cam_proj[4], g_cam_proj[5]);
+        p_glUniform1f(p_glGetUniformLocation(g_pp_ao, "uExt"), (float)g_ext);
+        p_glUniform2f(p_glGetUniformLocation(g_pp_ao, "uTexel"), 1.0f / g_fbw, 1.0f / g_fbh);
+        glBindTexture(GL_TEXTURE_2D, g_pp_depth);
+        pp_pass(g_pp_ao, g_pp_tex[0], g_pp_w2, g_pp_h2);
+        pp_blur(g_pp_tex[0], g_pp_tex[1], g_pp_w2, g_pp_h2, 1);
+    }
+    if (bloom) {
+        p_glUseProgram(g_pp_bright);
+        p_glUniform1i(p_glGetUniformLocation(g_pp_bright, "uColor"), 0);
+        p_glUniform1i(p_glGetUniformLocation(g_pp_bright, "uDepth"), 1);
+        p_glActiveTexture(GL_TEXTURE1_);
+        glBindTexture(GL_TEXTURE_2D, g_pp_depth);
+        p_glActiveTexture(GL_TEXTURE0_);
+        glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
+        pp_pass(g_pp_bright, g_pp_tex[2], g_pp_w4, g_pp_h4);
+        pp_blur(g_pp_tex[2], g_pp_tex[3], g_pp_w4, g_pp_h4, 0);
+        pp_blur(g_pp_tex[2], g_pp_tex[3], g_pp_w4, g_pp_h4, 0);
+    }
+
+    /* composite into the scene, off the cockpit */
+    p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
+    glViewport(0, 0, g_fbw, g_fbh);
+    p_glUseProgram(0);
+    if (g_mask_ready) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_EQUAL, 0, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    }
+    glEnable(GL_BLEND);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    if (ssao) {
+        glBlendFunc(GL_ZERO, GL_SRC_COLOR);
+        glBindTexture(GL_TEXTURE_2D, g_pp_tex[0]);
+        pp_quad();
+    }
+    if (bloom) {
+        glBlendFunc(GL_ONE, GL_ONE);
+        glColor4f(0.7f, 0.7f, 0.7f, 1.0f);
+        glBindTexture(GL_TEXTURE_2D, g_pp_tex[2]);
+        pp_quad();
+        glColor4f(1, 1, 1, 1);
+    }
+
+    /* back to the game's state: its blend is re-applied by the next
+     * grAlphaBlendFunction, everything else per triangle */
+    glBlendFunc(g_blend_src, g_blend_dst);
+    if (!g_blend_on) glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glEnable(GL_SCISSOR_TEST);
+    scissor_clip();
+    g_vram_valid = 0;
+}
+
+/* At the first 2D after the frame's main 3D view: see the section above. */
+static void post_maybe(void)
+{
+    if (!g_post_3d || g_post_frame == g_glide_frame ||
+        !(g_fx & (FX_SSAO | FX_BLOOM)))
+        return;
+    g_post_3d = 0;
+    g_post_frame = g_glide_frame;
+    post_run();
+}
+
+/* --fx for the triangle about to be drawn: the FX_* bits it gets, with the
+ * camera uploaded once a frame. Only the main 3D view qualifies -- not the
+ * backdrop, not the 60x60 target monitor, which has a view of its own. Bit 8
+ * marks blended geometry (no added light), bit 16 additive (absorbed to
+ * black rather than to the water's colour). */
+static float g_water[3] = { 0.0f, 0.05f, 0.25f };
+
+static int fx_bits(int bias_mode)
+{
+    static uint32_t frame = 0xFFFFFFFFu;
+    static int ok;
+    float proj[6], C[9], pos[3];
+    int fx;
+    if (!g_fx || !g_prog || bias_mode || !g_depth_mode || g_depth_func == 7 ||
+        g_clip_x1 - g_clip_x0 < 320)
+        return 0;
+    if (frame != g_glide_frame) {
+        frame = g_glide_frame;
+        ok = objprobe_camera(proj, C, pos);
+        if (ok) {
+            memcpy(g_cam_proj, proj, sizeof g_cam_proj);
+            p_glUniform4f(g_u_proj, proj[0], proj[1], proj[2], proj[3]);
+            p_glUniform2f(g_u_range, proj[4], proj[5]);
+            p_glUniformMatrix3fv(g_u_caminv, 1, GL_FALSE, C);   /* C row-major = C^T */
+            p_glUniform3f(g_u_campos, pos[0], pos[1], pos[2]);
+            p_glUniform3f(g_u_water, g_water[0], g_water[1], g_water[2]);
+            p_glUniform1f(g_u_time, (float)SDL_GetTicks() * 0.001f);
+        }
+    }
+    if (!ok) return 0;
+    g_post_3d = 1;
+    fx = g_fx & FX_TRI;
+    if (!g_mask_ready || g_letterbox) fx &= ~FX_LIGHT;   /* outside views: the camera is not the boat */
+    if (g_blend_on) fx |= 8;
+    if (g_blend_add) fx |= 16;
+    return fx;
 }
 
 static uint32_t gl_draw_triangle(uint32_t *a)
@@ -1403,6 +1871,10 @@ static uint32_t gl_draw_triangle(uint32_t *a)
                       (mode && g_glidedebug != 16) ? 1 : 0);
         p_glUniform1f(g_u_wfar, G_WFAR);
         p_glUniform1i(g_u_backdrop, bias_mode ? 1 : 0);
+        /* the water's colour is the backdrop's: what fades out must fade to it */
+        if (bias_mode && (g_cc_local == 1 || g_cc_other == 2))
+            glide_unpack(g_const_color, &g_water[0], &g_water[1], &g_water[2]);
+        p_glUniform1i(g_u_fx, fx_bits(bias_mode));
         if (g_fog_mode == 2 && g_fog_valid) {
             float fr, fg, fb;
             glide_unpack(g_fog_color, &fr, &fg, &fb);
@@ -1670,10 +2142,14 @@ static uint32_t gl_constant_color(uint32_t *a) { g_const_color = a[0]; return 0;
 static uint32_t gl_alpha_blend(uint32_t *a)
 {
     if (!gl_ensure_context()) return 0;
+    g_blend_on = !(a[0] == 4 && a[1] == 0);
+    g_blend_add = g_blend_on && a[1] == 4;               /* dst ONE */
     if (a[0] == 4 && a[1] == 0) glDisable(GL_BLEND);    /* ONE, ZERO */
     else {
+        g_blend_src = blend_gl((int)a[0]);
+        g_blend_dst = blend_gl((int)a[1]);
         glEnable(GL_BLEND);
-        glBlendFunc(blend_gl((int)a[0]), blend_gl((int)a[1]));
+        glBlendFunc(g_blend_src, g_blend_dst);
     }
     return 0;
 }
@@ -1838,6 +2314,7 @@ static uint32_t gl_lfb_lock(uint32_t *a)
     }
 
     if (!g_vram) return 0;
+    post_maybe();
     lfb_flush();
     lfb_sync_from_gl();
     g_lfb_pending = 1;
@@ -1953,6 +2430,7 @@ static void shot_from_fbo(const char *path)
 static uint32_t gl_buffer_swap(uint32_t *a)
 {
     (void)a;
+    post_maybe();
     g_glide_frame++;
     hdtext_frame();
     if (!gl_ensure_context()) return 0;
@@ -2189,6 +2667,7 @@ static uint32_t gl_lfb_write_region(uint32_t *a)
     if (x >= GLIDE_W || y >= GLIDE_H) return 0;
     if (w > GLIDE_W - x) w = GLIDE_W - x;
     if (h > GLIDE_H - y) h = GLIDE_H - y;
+    post_maybe();
     lfb_flush();               /* earlier CPU writes lie under this one */
 
     for (r = 0; r < h; r++) {

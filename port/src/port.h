@@ -293,6 +293,9 @@ void objprobe_install(void);
 void objprobe_tri(const float *const v[3]);
 void glide_tri_rgb(const float p[3][6]);
 extern char g_objreplace[32];
+int objprobe_camera(float proj[6], float C[9], float pos[3]);
+extern int g_fx;                 /* glide.c: FX_* effects on top of the game's look */
+int glide_fx_parse(const char *list);
 extern uint32_t g_objprobe_frame;
 extern int g_glidedebug;
 extern int g_dumpsec;

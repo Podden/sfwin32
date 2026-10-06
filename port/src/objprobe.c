@@ -2,7 +2,8 @@
  * 0x8EBD0: eax = model, edx = position, ebx = rotation, ecx = camera) and
  * logs what it is handed -- the first few distinct models, and every model of
  * the frame a script's "callers" command picks, with the triangles each one
- * draws. --objreplace NAME then draws one MOD itself instead of the game. */
+ * draws. --objreplace NAME then draws one MOD itself instead of the game.
+ * glide.c's --fx keeps the hook for the camera alone (objprobe_camera). */
 
 #include "port.h"
 
@@ -56,6 +57,7 @@ static void dump(const char *what, uint32_t p, int n)
 }
 
 static uint32_t g_cur_model;              /* the model being drawn, for objprobe_tri */
+static uint32_t g_view_ctx;               /* the view it is drawn with                */
 uint32_t g_objprobe_frame;                /* script "callers": the frame to log      */
 
 static void floats(const char *what, uint32_t p, int n)
@@ -220,6 +222,8 @@ static int __cdecl obj_seen(uint32_t model, uint32_t edx, uint32_t ebx, uint32_t
     static int nseen;
     int i;
     g_cur_model = model;
+    g_view_ctx = ctx;
+    if (!g_objprobe) return 0;                   /* hooked for glide.c's --fx only */
     if (g_nrf && replaced(model) && in_img(edx, 12) && in_img(ebx, 36) && in_img(ctx, 0x1C4)) {
         draw_replacement(model, (const float *)(uintptr_t)edx, (const float *)(uintptr_t)ebx,
                          (const uint8_t *)(uintptr_t)ctx);
@@ -247,6 +251,27 @@ static int __cdecl obj_seen(uint32_t model, uint32_t edx, uint32_t ebx, uint32_t
     dump("ctx", ctx, 80);
     if (in_img(ctx, 4)) dump("ctx.vtbl", *(uint32_t *)(uintptr_t)ctx, 16);
     return 0;
+}
+
+/* glide.c's --fx: the camera the game is drawing with, read live from the
+ * view the model render was last handed. proj = fx, fy, cx, cy (window origin
+ * included, so in grDrawTriangle's own coordinates), near, far; C maps world
+ * to camera (x right, y depth, z up), pos is the camera in the world. 0 until
+ * a model has been drawn. */
+int objprobe_camera(float proj[6], float C[9], float pos[3])
+{
+    const uint8_t *v = (const uint8_t *)(uintptr_t)g_view_ctx;
+    if (!g_view_ctx || !in_img(g_view_ctx, 0x1C4)) return 0;
+    memcpy(&proj[0], v + 0x1A4, 4);
+    memcpy(&proj[1], v + 0x1AC, 4);
+    memcpy(&proj[2], v + 0x1B0, 4);
+    memcpy(&proj[3], v + 0x1B8, 4);
+    memcpy(&proj[4], v + 0x1BC, 8);
+    proj[2] += (float)*(int32_t *)(uintptr_t)(WIN_X + g_img.delta);
+    proj[3] += (float)*(int32_t *)(uintptr_t)(WIN_X + 4 + g_img.delta);
+    memcpy(C, v + 0x74, 36);
+    memcpy(pos, v + 0x104, 12);
+    return proj[0] != 0.0f && proj[1] != 0.0f && proj[5] > proj[4];
 }
 
 /* glide.c: every triangle of the logged frame, tagged with the model drawn last */
@@ -293,7 +318,7 @@ static void hook(uint8_t *p)
 void objprobe_install(void)
 {
     uint8_t *p;
-    if (!g_objprobe) return;
+    if (!g_objprobe && !g_fx) return;
     p = (uint8_t *)(uintptr_t)(SITE + g_img.delta);
     if (memcmp(p, k_entry, HOOK_LEN)) { LOGW("objprobe: 0x%X is not the expected code", SITE); return; }
     if (g_objreplace[0]) load_replacement();

@@ -512,6 +512,8 @@ int main(int argc, char **argv)
             strncpy(g_objreplace, argv[++i], sizeof g_objreplace - 1);
             g_objprobe = 1;
         }
+        else if (!strcmp(argv[i], "--fx") && i + 1 < argc)
+            g_fx = glide_fx_parse(argv[++i]);
         else if (!strcmp(argv[i], "--glidecallers") && i + 1 < argc)
             g_glidecallers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--glide") && i + 1 < argc)
