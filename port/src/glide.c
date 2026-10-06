@@ -158,6 +158,8 @@ static uint32_t gl_query_hardware(uint32_t *a)
     return 1;           /* FXTRUE                         */
 }
 
+static void terrain_check(void);
+
 static uint32_t gl_win_open(uint32_t *a)
 {
     /* (hWnd, resolution, refresh, format, origin, nColBuf, nAuxBuf). Only
@@ -165,6 +167,7 @@ static uint32_t gl_win_open(uint32_t *a)
     g_color_fmt = (int)a[3];
     LOGI("glide: grSstWinOpen res=%u fmt=%u origin=%u col=%u aux=%u",
          a[1], a[3], a[4], a[5], a[6]);
+    terrain_check();                          /* and empty for the new mission */
     video_set_linear_mode(GLIDE_W, GLIDE_H, 16);
     return 1;
 }
@@ -271,6 +274,7 @@ typedef struct {
     uint32_t key;        /* 0 = empty */
     GLuint   tex;
     GLuint   tile[4];    /* the four quadrants, each its own texture */
+    int      seabed, other;   /* terrain_tris: corners on the seabed grid or not */
 } texcache_ent;
 
 static SDL_GLContext g_glctx;
@@ -335,6 +339,7 @@ static uint32_t g_fog_color;
 static uint8_t  g_fog_table[GR_FOG_TABLE_SIZE];
 static float    g_fog_w[GR_FOG_TABLE_SIZE];
 static void (APIENTRY *p_glFogCoordf)(GLfloat);
+static void (APIENTRY *p_glMultiTexCoord4f)(GLenum, GLfloat, GLfloat, GLfloat, GLfloat);
 /* ------------------------------------------------------- frame buffer
  *
  * The Glide frame buffer is an offscreen FBO at g_fbw x g_fbh -- 640x480
@@ -412,10 +417,11 @@ int g_msaa = 4;                        /* --msaa N                          */
 #define FX_CAUSTICS 2
 #define FX_LIGHT    4
 #define FX_BUMP     128                    /* relief for LIGHT and CAUSTICS */
+#define FX_TERRAIN  256                    /* smooth seabed, see terrain_tris */
 #define FX_TRI      (FX_FOG | FX_CAUSTICS | FX_LIGHT | FX_BUMP)   /* triangle shader */
 #define FX_SSAO     32                                 /* passes, see post_run   */
 #define FX_BLOOM    64
-#define FX_ALL      (FX_TRI | FX_SSAO | FX_BLOOM)
+#define FX_ALL      (FX_TRI | FX_SSAO | FX_BLOOM | FX_TERRAIN)
 int g_fx = FX_ALL;
 static int g_blend_on, g_blend_add;     /* the game's blend, see gl_alpha_blend */
 static GLenum g_blend_src = GL_ONE, g_blend_dst = GL_ZERO;
@@ -426,7 +432,8 @@ int glide_fx_parse(const char *list)
     static const struct { const char *name; int bit; } k[] = {
         { "none", 0 }, { "all", FX_ALL }, { "fog", FX_FOG },
         { "caustics", FX_CAUSTICS }, { "light", FX_LIGHT },
-        { "ssao", FX_SSAO }, { "bloom", FX_BLOOM }, { "bump", FX_BUMP } };
+        { "ssao", FX_SSAO }, { "bloom", FX_BLOOM }, { "bump", FX_BUMP },
+        { "terrain", FX_TERRAIN } };
     char buf[128], *t, *ctx = NULL;
     int fx = 0, i;
     strncpy(buf, list, sizeof buf - 1);
@@ -440,12 +447,21 @@ int glide_fx_parse(const char *list)
     return fx;
 }
 
-/* Ctrl+Alt+1..6 (video.c): one effect on or off, n < 0 all of them */
+static void terrain_check(void)
+{
+    if (!terrain_selftest()) {
+        LOGW("terrain: self-test failed, --fx terrain is off");
+        g_fx &= ~FX_TERRAIN;
+    }
+}
+
+/* Ctrl+Alt+1..7 (video.c): one effect on or off, n < 0 all of them */
 void glide_fx_toggle(int n)
 {
     static const struct { const char *name; int bit; } k[] = {
         { "fog", FX_FOG }, { "caustics", FX_CAUSTICS }, { "light", FX_LIGHT },
-        { "bump", FX_BUMP }, { "ssao", FX_SSAO }, { "bloom", FX_BLOOM } };
+        { "bump", FX_BUMP }, { "ssao", FX_SSAO }, { "bloom", FX_BLOOM },
+        { "terrain", FX_TERRAIN } };
     if (n < 0) g_fx = g_fx ? 0 : FX_ALL;
     else if (n < (int)(sizeof k / sizeof k[0])) g_fx ^= k[n].bit;
     else return;
@@ -557,6 +573,7 @@ static const char *g_vs_src =
     "    vScreen         = gl_Vertex.xy;\n"
     "    gl_Position     = ftransform();\n"
     "    gl_TexCoord[0]  = gl_MultiTexCoord0;\n"
+    "    gl_TexCoord[1]  = gl_MultiTexCoord1;\n"
     "    gl_FrontColor   = gl_Color;\n"
     "    gl_FogFragCoord = gl_FogCoord;\n"
     "}\n";
@@ -626,6 +643,9 @@ static const char *g_fs_src =
     "        vec3 pc = vec3((vScreen.x - uProj.z) * y / uProj.x, y, (vScreen.y - uProj.w) * y / uProj.y);\n"
     "        float d = length(pc);\n"
     "        vec3 n = normalize(cross(dFdx(pc), dFdy(pc)));\n"
+    /* the smooth seabed's own normal (terrain_tris), times oow like the
+     * texture coordinates so that it interpolates in perspective */
+    "        if (gl_TexCoord[1].w > 0.0) n = normalize(gl_TexCoord[1].xyz / gl_TexCoord[1].w);\n"
     "        if (dot(n, pc) > 0.0) n = -n;\n"
     "        if (fx(128) && uTexMode != 0) {\n"     /* relief: dark is deep */
     "            float h = dot(albedo, vec3(0.30, 0.59, 0.11)) * 6.0;\n"
@@ -1011,6 +1031,7 @@ static int gl_ensure_context(void)
      * of GL's built-in curves. glFogCoordf is GL 1.4, hence the lookup. */
     p_glFogCoordf = (void (APIENTRY *)(GLfloat))
                         SDL_GL_GetProcAddress("glFogCoordf");
+    *(void **)&p_glMultiTexCoord4f = SDL_GL_GetProcAddress("glMultiTexCoord4f");
     if (!p_glFogCoordf)
         LOGW("glide: no glFogCoordf; fog will not be applied");
     else {
@@ -1123,6 +1144,7 @@ static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
 
     g_texcache[slot].key = key;
     g_texcache[slot].tex = id;
+    g_texcache[slot].seabed = g_texcache[slot].other = 0;
     return &g_texcache[slot];
 }
 
@@ -1383,6 +1405,8 @@ static int    g_pp_w2, g_pp_h2, g_pp_w4, g_pp_h4;
 static GLuint g_pp_ao, g_pp_blur, g_pp_bright;
 static int    g_pp_failed;
 static float  g_cam_proj[6];               /* fx_bits' camera, for the passes */
+static float  g_cam_C[9], g_cam_pos[3];    /* ... world to camera, and where it is */
+static int    g_fx_cam;                    /* that camera is this triangle's view */
 static int    g_post_3d;
 static uint32_t g_post_frame = 0xFFFFFFFFu;
 
@@ -1713,6 +1737,7 @@ static int fx_bits(int bias_mode)
     static int ok;
     float proj[6], C[9], pos[3];
     int fx;
+    g_fx_cam = 0;
     if (!g_fx || !g_prog || bias_mode || !g_depth_mode || g_depth_func == 7 ||
         g_clip_x1 - g_clip_x0 < 320)
         return 0;
@@ -1721,6 +1746,8 @@ static int fx_bits(int bias_mode)
         ok = objprobe_camera(proj, C, pos);
         if (ok) {
             memcpy(g_cam_proj, proj, sizeof g_cam_proj);
+            memcpy(g_cam_C, C, sizeof g_cam_C);
+            memcpy(g_cam_pos, pos, sizeof g_cam_pos);
             p_glUniform4f(g_u_proj, proj[0], proj[1], proj[2], proj[3]);
             p_glUniform2f(g_u_range, proj[4], proj[5]);
             p_glUniformMatrix3fv(g_u_caminv, 1, GL_FALSE, C);   /* C row-major = C^T */
@@ -1730,6 +1757,7 @@ static int fx_bits(int bias_mode)
         }
     }
     if (!ok) return 0;
+    g_fx_cam = 1;
     g_post_3d = 1;
     fx = g_fx & FX_TRI;
     if (!g_mask_ready || g_letterbox) fx &= ~FX_LIGHT;   /* outside views: the camera is not the boat */
@@ -1738,10 +1766,14 @@ static int fx_bits(int bias_mode)
     return fx;
 }
 
+static void emit_vertex(const float *p, int tile, int bias_mode, const float *n);
+static int terrain_tris(const float *const v[3], int tile, texcache_ent *e);
+
 static uint32_t gl_draw_triangle(uint32_t *a)
 {
     const float *v[3];
     int i, bias_mode, tile = -1, fx = 0, pre = 0;
+    texcache_ent *te = NULL;
 
     g_tris++;
     {   /* Rough area, which is all a fill-rate sample needs. */
@@ -1897,6 +1929,7 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         glEnable(GL_TEXTURE_2D);
         e = tex_upload(g_tex_data, g_tex_size, key);
         tile = triangle_tile(v, e);
+        te = e;
         glBindTexture(GL_TEXTURE_2D, tile >= 0 ? e->tile[tile] : e->tex);
         glEnable(GL_ALPHA_TEST);
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE,
@@ -1964,9 +1997,23 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         else
             p_glBlendFuncSeparate(g_blend_src, g_blend_dst, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
     }
-    glBegin(GL_TRIANGLES);
-    for (i = 0; i < 3; i++) {
-        const float *p = v[i];
+    if (!(tile >= 0 && g_fx_cam && (g_fx & FX_TERRAIN) && terrain_tris(v, tile, te))) {
+        glBegin(GL_TRIANGLES);
+        for (i = 0; i < 3; i++) emit_vertex(v[i], tile, bias_mode, NULL);
+        glEnd();
+    }
+    if (g_prog && p_glBlendFuncSeparate) {
+        glBlendFunc(g_blend_src, g_blend_dst);
+        if (!g_blend_on) glDisable(GL_BLEND);
+    }
+    return 0;
+}
+
+/* One vertex as Glide has it. n: a camera-space normal for the effects, or
+ * NULL for the face's own (the shader's derivatives). */
+static void emit_vertex(const float *p, int tile, int bias_mode, const float *n)
+{
+    {
         float oow = p[VOOW];
         float w   = oow > 0.0f ? 1.0f / oow : G_WFAR;
         /* Hyperbolic in w, i.e. linear in oow -- see G_WNEAR/G_WFAR above.
@@ -2010,15 +2057,102 @@ static uint32_t gl_draw_triangle(uint32_t *a)
                        p[VY] <= (float)g_clip_y0 ? 0.0f :
                        p[VY] >= (float)g_clip_y1 ? (float)GLIDE_H : p[VY],
                        1.0f - z * 2.0f);
-        else
+        else {
+            if (p_glMultiTexCoord4f) {
+                if (n) p_glMultiTexCoord4f(GL_TEXTURE1_, n[0] * oow, n[1] * oow, n[2] * oow, oow);
+                else   p_glMultiTexCoord4f(GL_TEXTURE1_, 0.0f, 0.0f, 0.0f, 0.0f);
+            }
             glVertex3f(p[VX], p[VY], 1.0f - z * 2.0f);
+        }
     }
+}
+
+/* --fx terrain: the seabed through terrain.c's smooth surface. Each of the
+ * game's flat triangles is cut into TSUB x TSUB, every point lifted onto
+ * the surface and projected again with the frame's camera; the texture and
+ * colour stay those of the flat triangle at the same place. Every terrain
+ * triangle is cut the same way, so the points along a shared edge are the
+ * same from both sides and nothing opens up between them. Where a cell's
+ * corners are not known yet the point stays on the flat triangle. */
+#define TSUB 4
+static int terrain_tris(const float *const v[3], int tile, texcache_ent *e)
+{
+    float W[3][3], s[3], t[3], fn[3], e1[3], e2[3], q[TSUB + 1][TSUB + 1][12];
+    float nc[TSUB + 1][TSUB + 1][3], l;
+    const float *P = g_cam_proj, *C = g_cam_C;
+    int i, a, b, k;
+    for (i = 0; i < 3; i++) {
+        float oow = v[i][VOOW], w = 1.0f / oow;
+        float y = P[4] + (w - 1.0f) * (P[5] - P[4]) / 65535.0f, c[3];
+        c[0] = (v[i][VX] - P[2]) * y / P[0];
+        c[1] = y;
+        c[2] = (v[i][VY] - P[3]) * y / P[1];
+        for (k = 0; k < 3; k++)
+            W[i][k] = g_cam_pos[k] + C[k] * c[0] + C[3 + k] * c[1] + C[6 + k] * c[2];
+        s[i] = v[i][VSOW] / oow;
+        t[i] = v[i][VTOW] / oow;
+    }
+    /* Seabed or not: ship and station atlases are cut into quadrants too.
+     * On the seabed a vertex at a tile's corner is a corner of the 512 grid;
+     * anything else is a model, whose texture is then left alone. */
+    for (i = 0; i < 3; i++) {
+        float ms = fmodf(s[i] + 0.05f, 128.0f), mt = fmodf(t[i] + 0.05f, 128.0f);
+        float gx = fabsf(W[i][0] - 512.0f * floorf(W[i][0] / 512.0f + 0.5f));
+        float gy = fabsf(W[i][1] - 512.0f * floorf(W[i][1] / 512.0f + 0.5f));
+        if (ms > 0.1f || mt > 0.1f) continue;
+        if (gx < 4.0f && gy < 4.0f) e->seabed++;
+        else e->other++;
+    }
+    if (e->seabed < 16 || e->other * 20 > e->seabed) return 0;
+    for (i = 0; i < 3; i++) terrain_note(W[i]);
+    for (k = 0; k < 3; k++) { e1[k] = W[1][k] - W[0][k]; e2[k] = W[2][k] - W[0][k]; }
+    fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    if (fn[2] < 0.0f) fn[0] = -fn[0], fn[1] = -fn[1], fn[2] = -fn[2];    /* up */
+    for (a = 0; a <= TSUB; a++)
+        for (b = 0; b + a <= TSUB; b++) {
+            float l1 = (float)a / TSUB, l2 = (float)b / TSUB, l0 = 1.0f - l1 - l2;
+            float X[3], nw[3], c[3], z, dx, dy, y, w, oow;
+            for (k = 0; k < 3; k++) X[k] = l0 * W[0][k] + l1 * W[1][k] + l2 * W[2][k];
+            if (terrain_eval(X[0], X[1], &z, &dx, &dy)) {
+                X[2] = z;
+                nw[0] = -dx; nw[1] = -dy; nw[2] = 1.0f;
+            } else
+                memcpy(nw, fn, sizeof nw);
+            for (k = 0; k < 3; k++)
+                c[k] = C[3 * k] * (X[0] - g_cam_pos[0]) + C[3 * k + 1] * (X[1] - g_cam_pos[1])
+                     + C[3 * k + 2] * (X[2] - g_cam_pos[2]);
+            for (k = 0; k < 3; k++)
+                nc[a][b][k] = C[3 * k] * nw[0] + C[3 * k + 1] * nw[1] + C[3 * k + 2] * nw[2];
+            l = sqrtf(nc[a][b][0] * nc[a][b][0] + nc[a][b][1] * nc[a][b][1] + nc[a][b][2] * nc[a][b][2]);
+            for (k = 0; k < 3; k++) nc[a][b][k] /= l > 0.0f ? l : 1.0f;
+            y = c[1] > P[4] + 0.5f ? c[1] : P[4] + 0.5f;      /* lifted past the near plane */
+            w = 1.0f + (y - P[4]) * 65535.0f / (P[5] - P[4]);
+            oow = 1.0f / w;
+            memset(q[a][b], 0, sizeof q[a][b]);
+            q[a][b][VX] = P[2] + P[0] * c[0] / y;
+            q[a][b][VY] = P[3] + P[1] * c[2] / y;
+            q[a][b][VOOW] = oow;
+            q[a][b][VSOW] = (l0 * s[0] + l1 * s[1] + l2 * s[2]) * oow;
+            q[a][b][VTOW] = (l0 * t[0] + l1 * t[1] + l2 * t[2]) * oow;
+            for (k = VR; k <= VB; k++)
+                q[a][b][k] = l0 * v[0][k] + l1 * v[1][k] + l2 * v[2][k];
+        }
+    glBegin(GL_TRIANGLES);
+    for (a = 0; a < TSUB; a++)
+        for (b = 0; b + a < TSUB; b++) {
+            emit_vertex(q[a][b], tile, 0, nc[a][b]);
+            emit_vertex(q[a + 1][b], tile, 0, nc[a + 1][b]);
+            emit_vertex(q[a][b + 1], tile, 0, nc[a][b + 1]);
+            if (a + b + 1 < TSUB) {
+                emit_vertex(q[a + 1][b], tile, 0, nc[a + 1][b]);
+                emit_vertex(q[a + 1][b + 1], tile, 0, nc[a + 1][b + 1]);
+                emit_vertex(q[a][b + 1], tile, 0, nc[a][b + 1]);
+            }
+        }
     glEnd();
-    if (g_prog && p_glBlendFuncSeparate) {
-        glBlendFunc(g_blend_src, g_blend_dst);
-        if (!g_blend_on) glDisable(GL_BLEND);
-    }
-    return 0;
+    return 1;
 }
 
 /* objprobe.c's replacement models: one Gouraud triangle in screen space

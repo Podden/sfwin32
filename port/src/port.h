@@ -300,6 +300,11 @@ int objprobe_camera(float proj[6], float C[9], float pos[3]);
 extern int g_fx;                 /* glide.c: FX_* effects on top of the game's look */
 int glide_fx_parse(const char *list);
 void glide_fx_toggle(int n);
+/* terrain.c: the seabed's height field, for --fx terrain */
+void terrain_reset(void);
+void terrain_note(const float p[3]);
+int  terrain_eval(float x, float y, float *z, float *dzdx, float *dzdy);
+int  terrain_selftest(void);
 extern uint32_t g_objprobe_frame;
 extern int g_glidedebug;
 extern int g_dumpsec;
