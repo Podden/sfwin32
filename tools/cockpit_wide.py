@@ -58,7 +58,10 @@ PROMPT = (
 # draws live content into them (monitors, radars, weapon display), so they
 # must stay exactly in place. Read off the four cockpits by eye.
 INSTRUMENTS = {
-    "d419d4a2": [(60, 290, 580, 480), (245, 0, 395, 72)],                  # green
+    # green: the old frame's struts reach into the console rect beside both
+    # radars and would end there as stubs, so the sides start lower
+    "d419d4a2": [(110, 290, 530, 480), (60, 348, 110, 480), (530, 348, 580, 480),
+                 (245, 0, 395, 104)],
     "a216526a": [(0, 0, 150, 112), (138, 58, 242, 172), (398, 58, 502, 172),
                  (488, 0, 640, 112), (192, 298, 444, 480)],              # red
     "ba8f8010": [(0, 0, 112, 112), (528, 0, 640, 112), (268, 0, 402, 56),

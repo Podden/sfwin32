@@ -605,8 +605,8 @@ static const char *g_fs_src =
     "        c = gl_Color;\n"
     "    } else {\n"
     "        vec4 t = texture2DProj(uTex, gl_TexCoord[0]);\n"
-    "        if (uAlphaTest != 0 && t.a < 0.5) discard;\n"
     "        c = uTexMode == 2 ? t : t * gl_Color;\n"
+    "        if (uAlphaTest != 0 && c.a <= 0.5) discard;\n"   /* GL's GREATER 0.5 */
     "    }\n"
     "    if (uFx != 0) {\n"
     "        vec3 albedo = uTexMode == 0 ? gl_Color.rgb : texture2DProj(uTex, gl_TexCoord[0]).rgb;\n"
@@ -638,11 +638,13 @@ static const char *g_fs_src =
     "        if (!fx(8)) c.rgb += albedo * add;\n"   /* 8: blended */
     "        if (fx(1)) {\n"            /* absorption, red first */
     "            vec3 T = exp(-vec3(2.4, 1.3, 0.9) * d / uRange.y);\n"
-    "            c.rgb = fx(16) ? c.rgb * T : c.rgb * T + uWater * (1.0 - T);\n"
+    "            c.rgb = fx(16) ? c.rgb * sqrt(T) : c.rgb * T + uWater * (1.0 - T);\n"
     "        }\n"
     "    }\n"
     "    if (uFog != 0) c.rgb = mix(c.rgb, uFogColor, gl_FogFragCoord);\n"
-    "    gl_FragColor = c;\n"
+    /* alpha: emission for the bloom pass (post_run), summed by the additive
+     * blend; nothing else reads the frame buffer's alpha */
+    "    gl_FragColor = vec4(c.rgb, fx(16) ? max(c.r, max(c.g, c.b)) : 0.0);\n"
     "}\n";
 
 #ifndef GL_FRAGMENT_SHADER
@@ -1446,10 +1448,11 @@ static const char *g_pp_bright_fs =
     "void main()\n"
     "{\n"
     "    vec2 uv = gl_TexCoord[0].xy;\n"
-    "    vec3 c = texture2D(uColor, uv).rgb;\n"
+    "    vec4 s = texture2D(uColor, uv);\n"
+    "    vec3 c = s.rgb;\n"
     "    if (texture2D(uDepth, uv).r >= 0.9999) c = vec3(0.0);\n"
     "    float l = max(c.r, max(c.g, c.b));\n"
-    "    gl_FragColor = vec4(c * smoothstep(0.70, 1.00, l), 1.0);\n"
+    "    gl_FragColor = vec4(c * max(smoothstep(0.70, 1.00, l), 3.0 * s.a), 1.0);\n"
     "}\n";
 
 static GLuint pp_program(const char *fs_src)
@@ -1467,12 +1470,14 @@ static GLuint pp_program(const char *fs_src)
     return ok ? pr : 0;
 }
 
-static GLuint pp_texture(int w, int h)
+#define GL_RGBA16F_ 0x881A
+
+static GLuint pp_texture(int w, int h, GLint fmt)
 {
     GLuint t;
     glGenTextures(1, &t);
     glBindTexture(GL_TEXTURE_2D, t);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8_, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, fmt, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1513,10 +1518,10 @@ static int pp_init(void)
 
     g_pp_w2 = g_fbw / 2; g_pp_h2 = g_fbh / 2;
     g_pp_w4 = g_fbw / 4; g_pp_h4 = g_fbh / 4;
-    g_pp_tex[0] = pp_texture(g_pp_w2, g_pp_h2);   /* AO           */
-    g_pp_tex[1] = pp_texture(g_pp_w2, g_pp_h2);   /* AO, blurring */
-    g_pp_tex[2] = pp_texture(g_pp_w4, g_pp_h4);   /* bloom        */
-    g_pp_tex[3] = pp_texture(g_pp_w4, g_pp_h4);   /* bloom, blurring */
+    g_pp_tex[0] = pp_texture(g_pp_w2, g_pp_h2, GL_RGBA8_);    /* AO           */
+    g_pp_tex[1] = pp_texture(g_pp_w2, g_pp_h2, GL_RGBA8_);    /* AO, blurring */
+    g_pp_tex[2] = pp_texture(g_pp_w4, g_pp_h4, GL_RGBA16F_);  /* bloom        */
+    g_pp_tex[3] = pp_texture(g_pp_w4, g_pp_h4, GL_RGBA16F_);  /* bloom, blurring */
     p_glGenFramebuffers(1, &g_pp_fbo);
     p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
     g_pp_failed = 0;
@@ -1547,7 +1552,7 @@ static void pp_pass(GLuint prog, GLuint dst, int w, int h)
     pp_quad();
 }
 
-static void pp_blur(GLuint a, GLuint tmp, int w, int h, int bilat)
+static void pp_blur(GLuint a, GLuint tmp, int w, int h, int bilat, float step)
 {
     p_glUseProgram(g_pp_blur);
     p_glUniform1i(p_glGetUniformLocation(g_pp_blur, "uSrc"), 0);
@@ -1557,10 +1562,10 @@ static void pp_blur(GLuint a, GLuint tmp, int w, int h, int bilat)
     glBindTexture(GL_TEXTURE_2D, g_pp_depth);
     p_glActiveTexture(GL_TEXTURE0_);
     glBindTexture(GL_TEXTURE_2D, a);
-    p_glUniform2f(p_glGetUniformLocation(g_pp_blur, "uDir"), 1.0f / w, 0.0f);
+    p_glUniform2f(p_glGetUniformLocation(g_pp_blur, "uDir"), step / w, 0.0f);
     pp_pass(g_pp_blur, tmp, w, h);
     glBindTexture(GL_TEXTURE_2D, tmp);
-    p_glUniform2f(p_glGetUniformLocation(g_pp_blur, "uDir"), 0.0f, 1.0f / h);
+    p_glUniform2f(p_glGetUniformLocation(g_pp_blur, "uDir"), 0.0f, step / h);
     pp_pass(g_pp_blur, a, w, h);
 }
 
@@ -1614,7 +1619,7 @@ static void post_run(void)
         p_glUniform2f(p_glGetUniformLocation(g_pp_ao, "uTexel"), 1.0f / g_fbw, 1.0f / g_fbh);
         glBindTexture(GL_TEXTURE_2D, g_pp_depth);
         pp_pass(g_pp_ao, g_pp_tex[0], g_pp_w2, g_pp_h2);
-        pp_blur(g_pp_tex[0], g_pp_tex[1], g_pp_w2, g_pp_h2, 1);
+        pp_blur(g_pp_tex[0], g_pp_tex[1], g_pp_w2, g_pp_h2, 1, 1.0f);
     }
     if (bloom) {
         p_glUseProgram(g_pp_bright);
@@ -1625,8 +1630,8 @@ static void post_run(void)
         p_glActiveTexture(GL_TEXTURE0_);
         glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
         pp_pass(g_pp_bright, g_pp_tex[2], g_pp_w4, g_pp_h4);
-        pp_blur(g_pp_tex[2], g_pp_tex[3], g_pp_w4, g_pp_h4, 0);
-        pp_blur(g_pp_tex[2], g_pp_tex[3], g_pp_w4, g_pp_h4, 0);
+        pp_blur(g_pp_tex[2], g_pp_tex[3], g_pp_w4, g_pp_h4, 0, 1.0f);
+        pp_blur(g_pp_tex[2], g_pp_tex[3], g_pp_w4, g_pp_h4, 0, 2.5f);
     }
 
     /* composite into the scene, off the cockpit */
@@ -1901,6 +1906,7 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         if (g_cc_other == 1 && g_tex_bound && g_pal_valid)
             mode = (g_cc_factor == 8) ? 2 : 1;
         p_glUseProgram(g_prog);
+        glDisable(GL_ALPHA_TEST);          /* the shader keys, see uAlphaTest */
         p_glUniform1i(g_u_texmode, mode);
         /* --glidedebug 16: no alpha test. If the leak disappears, terrain
          * fragments are being keyed away -- they then write neither colour
