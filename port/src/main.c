@@ -28,6 +28,8 @@ typedef enum { MODE_FIGHT, MODE_DESKTOP, MODE_FIGHT3 } game_mode;
 static game_mode g_mode = MODE_FIGHT;
 static const char *g_script_path;       /* --script FILE                   */
 static int g_chain_index;               /* which child of --chain this is  */
+int main_is_desktop(void) { return g_mode == MODE_DESKTOP; }
+
 static const char *mode_name(void)
 {
     return g_mode == MODE_DESKTOP ? "desktop"
@@ -488,6 +490,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dumpkeys")) g_dump_keys = 1;
         else if (!strcmp(argv[i], "--autokeys") && i + 1 < argc)
             g_autokeys = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--virtualpad")) g_virtual_pad = 1;
         else if (!strcmp(argv[i], "--cblit") && i + 1 < argc)
             g_cblit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cflush") && i + 1 < argc)

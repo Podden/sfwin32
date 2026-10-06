@@ -714,18 +714,17 @@ int ioport_in(uint16_t port, int width, uint32_t *out)
         return 1;
     case 0x201:
         g_joy_reads++;
-        /* Game port, no joystick attached.
+        /* Game port: the joystick pad.c makes of a game controller.
          *
          * An axis is read by strobing 0x201 to fire the four one-shots, then
          * polling until the matching bit falls; the number of iterations *is*
          * the axis value. Bits 4-7 are the buttons, active low.
          *
-         * Returning the low bits clear says "the pulse already ended", so
-         * every axis reads as zero -- a stick pegged into the bottom-left
-         * corner, which the game dutifully flew into. With nothing plugged in
-         * the one-shots never fire at all and the bits stay high, so the poll
-         * loop hits its own timeout and the axis is discarded. */
-        *out = 0xFF;
+         * Returning the low bits clear at once says "the pulse already
+         * ended", so every axis reads as zero -- a stick pegged into the
+         * bottom-left corner, which the game dutifully flew into. pad.c holds
+         * them for the counts the game's calibration expects. */
+        *out = pad_port_in();
         return 1;
     default:
         todo_hit("in", port, 0);
@@ -753,6 +752,9 @@ int ioport_out(uint16_t port, int width, uint32_t val)
         g_dac_index = val & 0xFF;
         g_dac_phase = 0;
         return 1;
+    case 0x201:                             /* joystick strobe */
+        pad_port_out(val);
+        return 1;
     case 0x60:                              /* keyboard command -> ACK */
     case 0x64:
         g_kbd_reply = 0xFA;
@@ -762,7 +764,6 @@ int ioport_out(uint16_t port, int width, uint32_t val)
     case 0x21: case 0xA1:                   /* PIC masks */
     case 0x40: case 0x41: case 0x42: case 0x43:   /* PIT */
     case 0x61:                              /* speaker */
-    case 0x201:                             /* joystick strobe */
     case 0x3C0: case 0x3C2: case 0x3C4: case 0x3C5:   /* VGA attr / seq */
     case 0x3CE: case 0x3CF:                 /* VGA graphics controller */
     case 0x3D4: case 0x3D5:                 /* VGA CRTC */

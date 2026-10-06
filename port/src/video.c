@@ -210,6 +210,7 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
         InterlockedExchange(&g_vid_ready, -1);
         return 1;
     }
+    pad_init();                 /* before the game looks for its joystick */
     /* The 3dfx build renders through OpenGL, so its window needs a GL-capable
      * pixel format and no SDL_Renderer -- the two cannot own the same window.
      * The context itself is created later, on the game thread, because that is
@@ -344,6 +345,9 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                     t += 2;                    /* the range we map is 2-byte */
                 }
             }
+            else if (e.type >= SDL_CONTROLLERAXISMOTION &&
+                     e.type <= SDL_CONTROLLERDEVICEREMAPPED)
+                pad_event(&e);
             else if (e.type == SDL_MOUSEMOTION) {
                 /* Logical-size scaling is on, so these deltas are already in
                  * the game's pixels. */
@@ -369,6 +373,7 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                  * normal during play and must not drop held keys. */
                 if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
                     e.window.event == SDL_WINDOWEVENT_MINIMIZED) {
+                    pad_release_all();
                     release_all_keys("focus loss");
                     mouse_sdl_release_all();
                 }
@@ -422,6 +427,7 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                 t_key = now;
             }
         }
+        pad_tick();
         script_tick();
         render_frame();
         SDL_Delay(16);
@@ -747,26 +753,41 @@ static const keymap_ent g_keymap[] = {
 };
 #define NKEYMAP ((int)(sizeof g_keymap / sizeof g_keymap[0]))
 
-/* Which keys we have reported as held. The game's ISR keeps a key-state array
- * and only clears a key on its break code, so a make without a matching break
- * leaves it down forever. */
+/* Which keys we have reported as held, and by whom: bit 0 the keyboard (and
+ * scripts), bit 1 the game controller -- a key both hold stays down until
+ * both let go. The game's ISR keeps a key-state array and only clears a key
+ * on its break code, so a make without a matching break leaves it down
+ * forever. */
 static uint8_t g_key_down[SDL_NUM_SCANCODES];
 
 /* Queue a key event as the controller would report it: the 0xE0 prefix first
  * where applicable, then make code, or break code with bit 7 set. */
-static void queue_key(SDL_Scancode sc, int pressed)
+static void queue_key_by(SDL_Scancode sc, int pressed, uint8_t who)
 {
     int i;
+    uint8_t now;
     if (sc < 0 || sc >= SDL_NUM_SCANCODES) return;
     for (i = 0; i < NKEYMAP; i++) {
         if (g_keymap[i].sdl != sc) continue;
-        if (pressed == g_key_down[sc]) return;      /* no redundant edges */
+        now = pressed ? (uint8_t)(g_key_down[sc] | who) : (uint8_t)(g_key_down[sc] & ~who);
+        if (!now == !g_key_down[sc]) {               /* no redundant edges */
+            g_key_down[sc] = now;
+            return;
+        }
         if (g_keymap[i].ext) kbd_push_scancode(0xE0);
-        kbd_push_scancode(pressed ? g_keymap[i].code
-                                  : (uint8_t)(g_keymap[i].code | 0x80));
-        g_key_down[sc] = (uint8_t)pressed;
+        kbd_push_scancode(now ? g_keymap[i].code
+                              : (uint8_t)(g_keymap[i].code | 0x80));
+        g_key_down[sc] = now;
         return;
     }
+}
+
+static void queue_key(SDL_Scancode sc, int pressed) { queue_key_by(sc, pressed, 1); }
+
+/* pad.c: a key held by the game controller */
+void video_pad_key(int sdl_scancode, int pressed)
+{
+    queue_key_by((SDL_Scancode)sdl_scancode, pressed, 2);
 }
 
 /* Losing focus swallows the key-up: alt-tab away mid-turn and the game steers
@@ -777,7 +798,7 @@ static void release_all_keys(const char *why)
     int sc, n = 0;
     for (sc = 0; sc < SDL_NUM_SCANCODES; sc++) {
         if (!g_key_down[sc]) continue;
-        queue_key((SDL_Scancode)sc, 0);
+        queue_key_by((SDL_Scancode)sc, 0, 0xFF);
         n++;
     }
     if (n) LOGI("input: released %d held key(s) on %s", n, why);

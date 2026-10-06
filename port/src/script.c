@@ -184,6 +184,8 @@ void script_tick(void)
             g_shot_deadline = now + 3000;
             InterlockedExchange(&g_shot_pending, 1);
             return;
+        } else if (!strcmp(cmd, "pad")) {       /* pad axis leftx -1..1 | pad button a 0|1 */
+            pad_script(arg);
         } else if (!strcmp(cmd, "fx")) {        /* fx none|all|fog,caustics,light */
             g_fx = glide_fx_parse(arg);
         } else if (!strcmp(cmd, "callers")) {

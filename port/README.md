@@ -36,9 +36,37 @@ port\build\Release\fightport.exe --assets D:\Schleichfahrt\Schleichfahrt\SF
 | `--watch A` | poll a global at an original address and log every change |
 | `--dumpkeys` | every 2 s, log which scancodes the game believes are held, and the exact game port read count |
 | `--trace` | log every DOS/DPMI call |
+| `--virtualpad` | attach a virtual game controller for test scripts (`pad` command) |
 
 Everything is written to `fightport.log` next to the executable. `F12` or
 closing the window quits.
+
+### Game controller
+
+Any controller SDL knows (Xbox, PlayStation, Switch Pro) works when it is
+plugged in before the game starts; `pad.c` turns it into the game's own
+game-port joystick, so the left stick steers through the original analog
+code and its `JOYSTICK.CFG` calibration. With a controller attached, fight
+steers by joystick and the arrow keys are fed into that stick. Without one
+nothing changes.
+
+| controller | in a mission | in the station |
+|---|---|---|
+| left stick | steer | mouse pointer |
+| RT / LT | guns (Space) / torpedo (Tab) | |
+| RB / LB | next object (T) / next attacker (J) | |
+| A | booster (Q) | left click |
+| B | buzzer (D) | Escape |
+| X | next torpedo (Return) | right click |
+| Y | lock on what is ahead (L) | Return |
+| D-pad up / down | full ahead (A) / reverse (Y on a German keyboard) | arrow keys |
+| D-pad left / right | torpedo lure (G) / next nav point (N) | arrow keys |
+| View / Menu | briefing (B) / Escape | — / Escape |
+| L3 / R3 | sonar (R) / chase camera (keypad 0) | |
+
+The keys follow the original's Thrustmaster FLCS profile (`DEV\SF.M50` on the
+CD). `--virtualpad` attaches a virtual controller that test scripts drive with
+`pad axis leftx -1..1` and `pad button a 0|1`.
 
 ## How it works
 

@@ -30,6 +30,7 @@ add_executable(fightport
   src/hd.c
   src/media.c
   src/terrain.c
+  src/pad.c
 )
 
 target_include_directories(fightport PRIVATE src "${SDL2_ROOT}/include")

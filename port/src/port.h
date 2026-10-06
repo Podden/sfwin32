@@ -165,6 +165,20 @@ void video_pump(void);            /* SDL events -> keyboard/quit           */
 int  video_want_quit(void);
 void video_request_quit(void);
 void video_script_key(int sdl_scancode, int pressed);
+void video_pad_key(int sdl_scancode, int pressed);
+int  main_is_desktop(void);
+
+/* pad.c: a game controller as the game port joystick, plus keys */
+extern int g_virtual_pad;
+union SDL_Event;
+void pad_init(void);
+void pad_event(const union SDL_Event *e);
+void pad_tick(void);
+void pad_release_all(void);
+void pad_script(const char *arg);
+int  pad_selftest(void);
+uint8_t pad_port_in(void);
+void pad_port_out(uint32_t val);
 
 /* --script: unattended input and screenshots, see script.c */
 void script_load(const char *path, const char *mode, int index);
