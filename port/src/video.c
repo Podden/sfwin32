@@ -281,8 +281,8 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                     }
                     continue;
                 }
-                /* Ctrl+Alt+1..7 switch one effect each (fog, caustics, light,
-                 * bump, ssao, bloom, terrain), Ctrl+Alt+0 all of them: to
+                /* Ctrl+Alt+1..9 switch one effect each (fog, caustics, light,
+                 * bump, ssao, bloom, terrain, beam, glow), Ctrl+Alt+0 all: to
                  * tell on the spot which one an artefact comes from. */
                 if ((e.key.keysym.mod & KMOD_CTRL) && (e.key.keysym.mod & KMOD_ALT) &&
                     e.key.keysym.scancode >= SDL_SCANCODE_1 &&

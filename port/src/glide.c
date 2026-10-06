@@ -277,6 +277,7 @@ typedef struct {
     GLuint   tile[4];    /* the four quadrants, each its own texture */
     int      seabed, other;   /* terrain_tris: corners on the seabed grid or not */
     unsigned used;       /* frame last drawn, for eviction */
+    GLuint   emit;       /* <hd>/emit/ mask, 0: none (FX_GLOW) */
 } texcache_ent;
 
 static SDL_GLContext g_glctx;
@@ -423,7 +424,9 @@ int g_msaa = 4;                        /* --msaa N                          */
 #define FX_TRI      (FX_FOG | FX_CAUSTICS | FX_LIGHT | FX_BUMP)   /* triangle shader */
 #define FX_SSAO     32                                 /* passes, see post_run   */
 #define FX_BLOOM    64
-#define FX_ALL      (FX_TRI | FX_SSAO | FX_BLOOM | FX_TERRAIN)
+#define FX_BEAM     512                    /* the headlight's cone in the water */
+#define FX_GLOW     1024                   /* lights' halo in the water, with BLOOM */
+#define FX_ALL      (FX_TRI | FX_SSAO | FX_BLOOM | FX_TERRAIN | FX_BEAM | FX_GLOW)
 int g_fx = FX_ALL;
 static int g_blend_on, g_blend_add;     /* the game's blend, see gl_alpha_blend */
 static GLenum g_blend_src = GL_ONE, g_blend_dst = GL_ZERO;
@@ -435,7 +438,7 @@ int glide_fx_parse(const char *list)
         { "none", 0 }, { "all", FX_ALL }, { "fog", FX_FOG },
         { "caustics", FX_CAUSTICS }, { "light", FX_LIGHT },
         { "ssao", FX_SSAO }, { "bloom", FX_BLOOM }, { "bump", FX_BUMP },
-        { "terrain", FX_TERRAIN } };
+        { "terrain", FX_TERRAIN }, { "beam", FX_BEAM }, { "glow", FX_GLOW } };
     char buf[128], *t, *ctx = NULL;
     int fx = 0, i;
     strncpy(buf, list, sizeof buf - 1);
@@ -457,13 +460,13 @@ static void terrain_check(void)
     }
 }
 
-/* Ctrl+Alt+1..7 (video.c): one effect on or off, n < 0 all of them */
+/* Ctrl+Alt+1..9 (video.c): one effect on or off, n < 0 all of them */
 void glide_fx_toggle(int n)
 {
     static const struct { const char *name; int bit; } k[] = {
         { "fog", FX_FOG }, { "caustics", FX_CAUSTICS }, { "light", FX_LIGHT },
         { "bump", FX_BUMP }, { "ssao", FX_SSAO }, { "bloom", FX_BLOOM },
-        { "terrain", FX_TERRAIN } };
+        { "terrain", FX_TERRAIN }, { "beam", FX_BEAM }, { "glow", FX_GLOW } };
     if (n < 0) g_fx = g_fx ? 0 : FX_ALL;
     else if (n < (int)(sizeof k / sizeof k[0])) g_fx ^= k[n].bit;
     else return;
@@ -603,6 +606,11 @@ static const char *g_fs_src =
     "uniform vec3  uCamPos;\n"
     "uniform vec3  uWater;\n"
     "uniform float uTime;\n"
+    /* FX_GLOW: which texels are lights, and where this triangle's texture
+     * coordinates are in the atlas the mask covers (a quadrant's own
+     * texture: half the size, offset) */
+    "uniform sampler2D uEmit;\n"
+    "uniform vec3  uEmitT;\n"
     "varying vec2  vScreen;\n"
     "bool fx(int b) { return mod(floor(float(uFx) / float(b)), 2.0) >= 1.0; }\n"
     "vec2 hash2(vec2 c)\n"
@@ -643,6 +651,11 @@ static const char *g_fs_src =
     "        c = uTexMode == 2 ? t : t * gl_Color;\n"
     "        if (uAlphaTest != 0 && c.a <= 0.5) discard;\n"   /* GL's GREATER 0.5 */
     "    }\n"
+    "    float win = 0.0;\n"
+    "    if (uFx != 0 && fx(64)) {\n"
+    "        vec4 tc = gl_TexCoord[0];\n"
+    "        win = texture2DProj(uEmit, vec4(tc.xy * uEmitT.x + uEmitT.yz * tc.w, 0.0, tc.w)).r;\n"
+    "    }\n"
     "    if (uFx != 0) {\n"
     "        vec3 albedo = uTexMode == 0 ? gl_Color.rgb : texture2DProj(uTex, gl_TexCoord[0]).rgb;\n"
     "        float y = uRange.x + (w - 1.0) * (uRange.y - uRange.x) / 65535.0;\n"
@@ -674,8 +687,10 @@ static const char *g_fs_src =
     "            add += vec3(0.30, 0.45, 0.55) * k * k * up * (1.0 - smoothstep(0.30, 0.65, d / uRange.y));\n"
     "        }\n"
     "        if (!fx(8)) c.rgb += albedo * add;\n"   /* 8: blended */
+    "        c.rgb = mix(c.rgb, albedo * 1.4, win);\n"
     "        if (fx(1)) {\n"            /* absorption, red first */
     "            vec3 T = exp(-vec3(2.4, 1.3, 0.9) * d / uRange.y);\n"
+    "            T = mix(T, sqrt(T), win);\n"
     "            c.rgb = fx(16) ? c.rgb * sqrt(T) : c.rgb * T + uWater * (1.0 - T);\n"
     "        }\n"
     "    }\n"
@@ -686,9 +701,13 @@ static const char *g_fs_src =
     "    if (uFx != 0 && fx(16)) {\n"
     "        float f = uFog != 0 ? gl_FogFragCoord : 0.0;\n"
     "        if (fx(32)) c.rgb *= c.a;\n"      /* its SRC_ALPHA, folded in */
-    "        e = smoothstep(0.45, 0.95, max(c.r, max(c.g, c.b))) * (1.0 - f * f);\n"
+    "        e = smoothstep(0.45, 0.95, max(c.r, max(c.g, c.b))) * (1.0 - f * f * f * f);\n"
     "        c.rgb *= 1.0 - f * f * f;\n"
-    "    } else if (uFog != 0) c.rgb = mix(c.rgb, uFogColor, gl_FogFragCoord);\n"
+    "    } else {\n"
+    "        float f = uFog != 0 ? gl_FogFragCoord : 0.0;\n"
+    "        if (uFog != 0) c.rgb = mix(c.rgb, uFogColor, f * mix(1.0, f, win));\n"
+    "        if (uFx != 0 && fx(64)) e = 0.4 * win * (1.0 - f * f * f * f);\n"   /* only opaque gets 64 */
+    "    }\n"
     "    gl_FragColor = vec4(c.rgb, e);\n"
     "}\n";
 
@@ -723,11 +742,13 @@ static void   (APIENTRY *p_glActiveTexture)(GLenum);
 static void   (APIENTRY *p_glBlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
 #define GL_TEXTURE0_ 0x84C0
 #define GL_TEXTURE1_ 0x84C1
+#define GL_TEXTURE2_ 0x84C2
 
 static GLuint g_prog;
 static GLint  g_u_texmode, g_u_alphatest, g_u_fog, g_u_fogcolor, g_u_wfar;
 static GLint  g_u_backdrop;
 static GLint  g_u_fx, g_u_proj, g_u_range, g_u_caminv, g_u_campos, g_u_water, g_u_time;
+static GLint  g_u_emitt;
 
 static GLuint shader_build(GLenum type, const char *src)
 {
@@ -820,6 +841,10 @@ static void shader_init(void)
     g_u_campos    = p_glGetUniformLocation(g_prog, "uCamPos");
     g_u_water     = p_glGetUniformLocation(g_prog, "uWater");
     g_u_time      = p_glGetUniformLocation(g_prog, "uTime");
+    g_u_emitt     = p_glGetUniformLocation(g_prog, "uEmitT");
+    p_glUseProgram(g_prog);
+    p_glUniform1i(p_glGetUniformLocation(g_prog, "uEmit"), 2);
+    p_glUseProgram(0);
     LOGI("glide: w-buffer shader active; depth is linear in w to %.0f",
          (double)G_WFAR);
 }
@@ -1121,6 +1146,14 @@ static void tex_make_tiles(texcache_ent *e, GLuint src, const uint32_t *px,
     glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
 }
 
+static void emit_upload(texcache_ent *e, const uint32_t *px, int w, int h)
+{
+    if (!e->emit) glGenTextures(1, &e->emit);
+    glBindTexture(GL_TEXTURE_2D, e->emit);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    tex_params(GL_REPEAT);
+}
+
 /* HD replacements are decoded off the drawing thread: WIC takes 15-25 ms
  * for a 1024x1024 PNG, a dropped frame each time something new comes into
  * view. The original texture is drawn until the buffer swap after the
@@ -1131,9 +1164,9 @@ static void tex_make_tiles(texcache_ent *e, GLuint src, const uint32_t *px,
 #define HDWORKERS 3
 typedef struct {
     uint32_t  key, slot;
-    int       size, w, h;
+    int       size, w, h, ew, eh;
     char      name[48], dname[24];
-    uint32_t *px;
+    uint32_t *px, *em;        /* the texture, its emission mask */
 } hd_job;
 static hd_job   g_hdq[HDQ], g_hdd[HDQ];       /* requested, decoded */
 static unsigned g_hdq_r, g_hdq_w, g_hdd_r, g_hdd_w, g_hd_inflight;
@@ -1153,9 +1186,10 @@ static DWORD WINAPI hd_worker(LPVOID arg)
         ReleaseSRWLockExclusive(&g_hd_lock);
         if ((j.px = hd_load("tex", j.name, &j.w, &j.h)) == NULL)
             j.px = hd_load("tex", j.dname, &j.w, &j.h);
+        j.em = hd_load("emit", j.dname, &j.ew, &j.eh);
         AcquireSRWLockExclusive(&g_hd_lock);
-        if (j.px) g_hdd[g_hdd_w++ % HDQ] = j;
-        else      g_hd_inflight--;
+        if (j.px || j.em) g_hdd[g_hdd_w++ % HDQ] = j;
+        else              g_hd_inflight--;
         ReleaseSRWLockExclusive(&g_hd_lock);
     }
 }
@@ -1201,14 +1235,16 @@ static void hd_drain(void)
     g_hd_inflight--;
     ReleaseSRWLockExclusive(&g_hd_lock);
     e = &g_texcache[j.slot];
-    if (e->key == j.key) {
+    if (e->key == j.key && j.px) {
         glBindTexture(GL_TEXTURE_2D, e->tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, j.w, j.h, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, j.px);
         tex_params(GL_REPEAT);
         if (j.size == 256) tex_make_tiles(e, e->tex, j.px, j.w, j.h);
     }
+    if (e->key == j.key && j.em) emit_upload(e, j.em, j.ew, j.eh);
     free(j.px);
+    free(j.em);
 }
 
 static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
@@ -1231,6 +1267,10 @@ static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
         if (g_texcache[s].used < g_texcache[slot].used) slot = s;
     }
     g_tex_miss++;
+    if (g_texcache[slot].emit) {              /* the old texture's lights */
+        glDeleteTextures(1, &g_texcache[slot].emit);
+        g_texcache[slot].emit = 0;
+    }
 
     if (n > 256 * 256) n = 256 * 256;
     for (i = 0; i < n; i++) {
@@ -1252,13 +1292,14 @@ static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
         char name[48], dname[24];
         uint64_t dh = hd_hash(data, (size_t)n, 0);
         uint32_t *hd = NULL;
-        int hw = 0, hh = 0;
+        int hw = 0, hh = 0, queued;
         _snprintf(dname, sizeof dname, "%016llx", (unsigned long long)dh);
         _snprintf(name, sizeof name, "%s_%08x%s", dname, g_pal_hash,
                   g_chroma_on ? "k" : "");
         if (hd_dump("tex", name, size, size, rgba))
             LOGI("hd: dumped texture %s (%dx%d)", name, size, size);
-        if (g_hd_dir[0] && !hd_request(key, slot, size, name, dname) &&
+        queued = g_hd_dir[0] && hd_request(key, slot, size, name, dname);
+        if (g_hd_dir[0] && !queued &&
             ((hd = hd_load("tex", name, &hw, &hh)) != NULL ||
              (hd = hd_load("tex", dname, &hw, &hh)) != NULL)) {
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, hw, hh, 0,
@@ -1274,6 +1315,11 @@ static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
                          GL_RGBA, GL_UNSIGNED_BYTE, rgba);
             tex_params(GL_REPEAT);
             if (size == 256) tex_make_tiles(&g_texcache[slot], id, rgba, size, size);
+        }
+        if (g_hd_dir[0] && !queued) {
+            uint32_t *em = hd_load("emit", dname, &hw, &hh);
+            if (em) emit_upload(&g_texcache[slot], em, hw, hh);
+            free(em);
         }
     }
 
@@ -1536,9 +1582,9 @@ static int triangle_tile(const float *const v[3], const texcache_ent *e)
  * the composite keeps to the cockpit stencil, so the cockpit neither darkens
  * nor glows into the scene. */
 
-static GLuint g_pp_fbo, g_pp_depth_fbo, g_pp_depth, g_pp_tex[4], g_pp_fogtex;
-static int    g_pp_w2, g_pp_h2, g_pp_w4, g_pp_h4;
-static GLuint g_pp_ao, g_pp_blur, g_pp_bright;
+static GLuint g_pp_fbo, g_pp_depth_fbo, g_pp_depth, g_pp_tex[8], g_pp_fogtex;
+static int    g_pp_w2, g_pp_h2, g_pp_w4, g_pp_h4, g_pp_w16, g_pp_h16;
+static GLuint g_pp_ao, g_pp_blur, g_pp_bright, g_pp_beam;
 static int    g_pp_failed;
 static float  g_cam_proj[6];               /* fx_bits' camera, for the passes */
 static float  g_cam_C[9], g_cam_pos[3];    /* ... world to camera, and where it is */
@@ -1636,6 +1682,41 @@ static const char *g_pp_bright_fs =
     "    gl_FragColor = vec4(c * max(smoothstep(0.70, 1.00, l), 6.0 * s.a), 1.0);\n"
     "}\n";
 
+/* The headlight seen in the water: light scattered toward the eye along
+ * each view ray, from a lamp under the nose, inside its cone, out to the
+ * surface the ray hits. Both legs, lamp to point and point to eye, are
+ * absorbed as FX_FOG absorbs (red first), so the beam is blue-green and
+ * runs out where the water closes in. Half resolution, 24 jittered steps,
+ * blurred afterwards. */
+static const char *g_pp_beam_fs =
+    PP_VIEWPOS
+    "uniform vec3 uLamp;\n"                    /* the right one, camera space */
+    "uniform float uFocus;\n"                  /* both aim at (0, uFocus, 0) */
+    "void main()\n"
+    "{\n"
+    "    vec2 uv = gl_TexCoord[0].xy;\n"
+    "    float dz;\n"
+    "    vec3 p = viewpos(uv, dz);\n"
+    "    vec3 r = normalize(p);\n"
+    "    float t0 = 60.0, tmax = min(dz >= 0.9999 ? uRange.y : length(p), 2400.0);\n"
+    "    vec3 k = vec3(2.4, 1.3, 0.9) / uRange.y;\n"
+    "    float j = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));\n"
+    "    float dt = max(tmax - t0, 0.0) / 24.0;\n"
+    "    vec3 sum = vec3(0.0);\n"
+    "    for (int s = 0; s < 2; s++) {\n"
+    "        vec3 L = vec3(s == 0 ? uLamp.x : -uLamp.x, uLamp.yz);\n"
+    "        vec3 D = normalize(vec3(0.0, uFocus, 0.0) - L);\n"
+    "        for (int i = 0; i < 24; i++) {\n"
+    "            float t = t0 + (float(i) + j) * dt;\n"
+    "            vec3 q = r * t - L;\n"
+    "            float l = length(q);\n"
+    "            float spot = smoothstep(0.90, 0.995, dot(q, D) / l);\n"
+    "            sum += spot * spot / (1.0 + l * l / (400.0 * 400.0)) * exp(-k * (t + l));\n"
+    "        }\n"
+    "    }\n"
+    "    gl_FragColor = vec4(vec3(0.55, 0.80, 1.00) * sum * dt / 3500.0, 1.0);\n"
+    "}\n";
+
 static GLuint pp_program(const char *fs_src)
 {
     GLuint vs = shader_build(GL_VERTEX_SHADER, g_pp_vs);
@@ -1674,7 +1755,8 @@ static int pp_init(void)
     g_pp_ao = pp_program(g_pp_ao_fs);
     g_pp_blur = pp_program(g_pp_blur_fs);
     g_pp_bright = pp_program(g_pp_bright_fs);
-    if (!g_pp_ao || !g_pp_blur || !g_pp_bright) { LOGE("fx: post shaders failed"); return 0; }
+    g_pp_beam = pp_program(g_pp_beam_fs);
+    if (!g_pp_ao || !g_pp_blur || !g_pp_bright || !g_pp_beam) { LOGE("fx: post shaders failed"); return 0; }
 
     /* the depth, resolved: a texture the passes can read */
     glGenTextures(1, &g_pp_depth);
@@ -1699,10 +1781,15 @@ static int pp_init(void)
 
     g_pp_w2 = g_fbw / 2; g_pp_h2 = g_fbh / 2;
     g_pp_w4 = g_fbw / 4; g_pp_h4 = g_fbh / 4;
+    g_pp_w16 = g_fbw / 16; g_pp_h16 = g_fbh / 16;
     g_pp_tex[0] = pp_texture(g_pp_w2, g_pp_h2, GL_RGBA8_);    /* AO           */
     g_pp_tex[1] = pp_texture(g_pp_w2, g_pp_h2, GL_RGBA8_);    /* AO, blurring */
     g_pp_tex[2] = pp_texture(g_pp_w4, g_pp_h4, GL_RGBA16F_);  /* bloom        */
     g_pp_tex[3] = pp_texture(g_pp_w4, g_pp_h4, GL_RGBA16F_);  /* bloom, blurring */
+    g_pp_tex[4] = pp_texture(g_pp_w2, g_pp_h2, GL_RGBA16F_);  /* beam         */
+    g_pp_tex[5] = pp_texture(g_pp_w2, g_pp_h2, GL_RGBA16F_);  /* beam, blurring */
+    g_pp_tex[6] = pp_texture(g_pp_w16, g_pp_h16, GL_RGBA16F_); /* halo         */
+    g_pp_tex[7] = pp_texture(g_pp_w16, g_pp_h16, GL_RGBA16F_); /* halo, blurring */
     p_glGenFramebuffers(1, &g_pp_fbo);
     p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
     g_pp_failed = 0;
@@ -1753,6 +1840,9 @@ static void pp_blur(GLuint a, GLuint tmp, int w, int h, int bilat, float step)
 static void post_run(void)
 {
     int ssao = (g_fx & FX_SSAO) != 0, bloom = (g_fx & FX_BLOOM) != 0;
+    /* the lamp is the boat's: not in outside views (see fx_bits) */
+    int beam = (g_fx & FX_BEAM) && g_mask_ready && !g_letterbox;
+    int halo = bloom && (g_fx & FX_GLOW);
     if (!pp_init() || !p_glActiveTexture) return;
 
     resolve_fbo();                                /* colour, into g_fbo_tex */
@@ -1802,6 +1892,19 @@ static void post_run(void)
         pp_pass(g_pp_ao, g_pp_tex[0], g_pp_w2, g_pp_h2);
         pp_blur(g_pp_tex[0], g_pp_tex[1], g_pp_w2, g_pp_h2, 1, 1.0f);
     }
+    if (beam) {
+        p_glUseProgram(g_pp_beam);
+        p_glUniform1i(p_glGetUniformLocation(g_pp_beam, "uDepth"), 0);
+        p_glUniform4f(p_glGetUniformLocation(g_pp_beam, "uProj"),
+                      g_cam_proj[0], g_cam_proj[1], g_cam_proj[2], g_cam_proj[3]);
+        p_glUniform2f(p_glGetUniformLocation(g_pp_beam, "uRange"), g_cam_proj[4], g_cam_proj[5]);
+        p_glUniform1f(p_glGetUniformLocation(g_pp_beam, "uExt"), (float)g_ext);
+        p_glUniform3f(p_glGetUniformLocation(g_pp_beam, "uLamp"), 35.0f, 0.0f, -18.0f);
+        p_glUniform1f(p_glGetUniformLocation(g_pp_beam, "uFocus"), 900.0f);
+        glBindTexture(GL_TEXTURE_2D, g_pp_depth);
+        pp_pass(g_pp_beam, g_pp_tex[4], g_pp_w2, g_pp_h2);
+        pp_blur(g_pp_tex[4], g_pp_tex[5], g_pp_w2, g_pp_h2, 1, 1.5f);
+    }
     if (bloom) {
         p_glUseProgram(g_pp_bright);
         p_glUniform1i(p_glGetUniformLocation(g_pp_bright, "uColor"), 0);
@@ -1813,6 +1916,16 @@ static void post_run(void)
         pp_pass(g_pp_bright, g_pp_tex[2], g_pp_w4, g_pp_h4);
         pp_blur(g_pp_tex[2], g_pp_tex[3], g_pp_w4, g_pp_h4, 0, 1.0f);
         pp_blur(g_pp_tex[2], g_pp_tex[3], g_pp_w4, g_pp_h4, 0, 2.5f);
+    }
+    if (halo) {
+        /* The light the water scatters around a light: the bloom again,
+         * a quarter of its resolution and four times as wide, so a light
+         * the fog has all but swallowed still shows as a glow. */
+        p_glUseProgram(0);
+        glBindTexture(GL_TEXTURE_2D, g_pp_tex[2]);
+        pp_pass(0, g_pp_tex[6], g_pp_w16, g_pp_h16);
+        pp_blur(g_pp_tex[6], g_pp_tex[7], g_pp_w16, g_pp_h16, 0, 1.0f);
+        pp_blur(g_pp_tex[6], g_pp_tex[7], g_pp_w16, g_pp_h16, 0, 2.5f);
     }
 
     /* composite into the scene, off the cockpit */
@@ -1831,10 +1944,22 @@ static void post_run(void)
         glBindTexture(GL_TEXTURE_2D, g_pp_tex[0]);
         pp_quad();
     }
+    if (beam) {
+        glBlendFunc(GL_ONE, GL_ONE);
+        glBindTexture(GL_TEXTURE_2D, g_pp_tex[4]);
+        pp_quad();
+    }
     if (bloom) {
         glBlendFunc(GL_ONE, GL_ONE);
         glColor4f(0.7f, 0.7f, 0.7f, 1.0f);
         glBindTexture(GL_TEXTURE_2D, g_pp_tex[2]);
+        pp_quad();
+        glColor4f(1, 1, 1, 1);
+    }
+    if (halo) {
+        glBlendFunc(GL_ONE, GL_ONE);
+        glColor4f(0.6f, 0.6f, 0.6f, 1.0f);
+        glBindTexture(GL_TEXTURE_2D, g_pp_tex[6]);
         pp_quad();
         glColor4f(1, 1, 1, 1);
     }
@@ -1853,7 +1978,7 @@ static void post_run(void)
 static void post_maybe(void)
 {
     if (!g_post_3d || g_post_frame == g_glide_frame ||
-        !(g_fx & (FX_SSAO | FX_BLOOM)))
+        !(g_fx & (FX_SSAO | FX_BLOOM | FX_BEAM)))
         return;
     g_post_3d = 0;
     g_post_frame = g_glide_frame;
@@ -2110,6 +2235,15 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         if (bias_mode && (g_cc_local == 1 || g_cc_other == 2))
             glide_unpack(g_const_color, &g_water[0], &g_water[1], &g_water[2]);
         fx = fx_bits(bias_mode);
+        if (fx && te && te->emit && !g_blend_on && (g_fx & FX_GLOW) &&
+            !(te->seabed >= 16 && te->other * 20 <= te->seabed)) {
+            fx |= 64;
+            p_glActiveTexture(GL_TEXTURE2_);
+            glBindTexture(GL_TEXTURE_2D, te->emit);
+            p_glActiveTexture(GL_TEXTURE0_);
+            if (tile >= 0) p_glUniform3f(g_u_emitt, 0.5f, (tile & 1) * 0.5f, (tile >> 1) * 0.5f);
+            else           p_glUniform3f(g_u_emitt, 1.0f, 0.0f, 0.0f);
+        }
         pre = (fx & 16) && g_blend_src == GL_SRC_ALPHA;
         p_glUniform1i(g_u_fx, fx | (pre ? 32 : 0));
         if (g_fog_mode == 2 && g_fog_valid) {
@@ -2126,8 +2260,8 @@ static uint32_t gl_draw_triangle(uint32_t *a)
      * else drawn over it covers it (opaque: blending ONE, ZERO). */
     if (g_prog && p_glBlendFuncSeparate) {
         glEnable(GL_BLEND);
-        if (!g_blend_on)
-            p_glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ZERO, GL_ZERO);
+        if (!g_blend_on)        /* a light's emission, see FX_GLOW */
+            p_glBlendFuncSeparate(GL_ONE, GL_ZERO, (fx & 64) ? GL_ONE : GL_ZERO, GL_ZERO);
         else if (fx & 16)
             p_glBlendFuncSeparate(pre ? GL_ONE : g_blend_src, g_blend_dst, GL_ONE, GL_ONE);
         else
