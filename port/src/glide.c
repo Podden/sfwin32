@@ -401,15 +401,17 @@ int g_msaa = 4;                        /* --msaa N                          */
 
 /* --fx LIST: what this renderer adds to the game's own look, all of it
  * computed, none of it shipped: the water absorbing light with distance
- * (red first), caustics on surfaces facing up, the boat's headlight, and
- * ambient occlusion and bloom over the finished view.
+ * (red first), caustics on surfaces facing up, the boat's headlight, relief
+ * for both taken from the texture's own brightness, and ambient occlusion
+ * and bloom over the finished view.
  * Each needs the camera (objprobe_camera), so each pixel of the 3D view can
  * be put back where it is in the world. The game's lighting stays as the
  * base; these come on top. */
 #define FX_FOG      1
 #define FX_CAUSTICS 2
 #define FX_LIGHT    4
-#define FX_TRI      (FX_FOG | FX_CAUSTICS | FX_LIGHT)   /* in the triangle shader */
+#define FX_BUMP     128                    /* relief for LIGHT and CAUSTICS */
+#define FX_TRI      (FX_FOG | FX_CAUSTICS | FX_LIGHT | FX_BUMP)   /* triangle shader */
 #define FX_SSAO     32                                 /* passes, see post_run   */
 #define FX_BLOOM    64
 #define FX_ALL      (FX_TRI | FX_SSAO | FX_BLOOM)
@@ -423,7 +425,7 @@ int glide_fx_parse(const char *list)
     static const struct { const char *name; int bit; } k[] = {
         { "none", 0 }, { "all", FX_ALL }, { "fog", FX_FOG },
         { "caustics", FX_CAUSTICS }, { "light", FX_LIGHT },
-        { "ssao", FX_SSAO }, { "bloom", FX_BLOOM } };
+        { "ssao", FX_SSAO }, { "bloom", FX_BLOOM }, { "bump", FX_BUMP } };
     char buf[128], *t, *ctx = NULL;
     int fx = 0, i;
     strncpy(buf, list, sizeof buf - 1);
@@ -612,6 +614,14 @@ static const char *g_fs_src =
     "        float d = length(pc);\n"
     "        vec3 n = normalize(cross(dFdx(pc), dFdy(pc)));\n"
     "        if (dot(n, pc) > 0.0) n = -n;\n"
+    "        if (fx(128) && uTexMode != 0) {\n"     /* relief: dark is deep */
+    "            float h = dot(albedo, vec3(0.30, 0.59, 0.11)) * 6.0;\n"
+    "            vec3 dpx = dFdx(pc), dpy = dFdy(pc);\n"
+    "            vec3 r1 = cross(dpy, n), r2 = cross(n, dpx);\n"
+    "            float det = dot(dpx, r1);\n"
+    "            vec3 g = sign(det) * (dFdx(h) * r1 + dFdy(h) * r2);\n"
+    "            n = normalize(abs(det) * n - g);\n"
+    "        }\n"
     "        vec3 add = vec3(0.0);\n"
     "        if (fx(4)) {\n"            /* headlight, from the camera */
     "            float spot = smoothstep(0.75, 0.96, y / d);\n"
@@ -1544,17 +1554,15 @@ static void pp_blur(GLuint a, GLuint tmp, int w, int h, int bilat)
 
 static void post_run(void)
 {
-    GLuint src;
     int ssao = (g_fx & FX_SSAO) != 0, bloom = (g_fx & FX_BLOOM) != 0;
     if (!pp_init() || !p_glActiveTexture) return;
 
-    src = resolve_fbo();                          /* colour, into g_fbo_tex */
+    resolve_fbo();                                /* colour, into g_fbo_tex */
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_ms ? g_fbo_ms : g_fbo);
     p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_pp_depth_fbo);
     glDisable(GL_SCISSOR_TEST);
     p_glBlitFramebuffer(0, 0, g_fbw, g_fbh, 0, 0, g_fbw, g_fbh,
                         GL_DEPTH_BUFFER_BIT, GL_NEAREST);
-    (void)src;
 
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
