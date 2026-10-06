@@ -426,7 +426,8 @@ int g_msaa = 4;                        /* --msaa N                          */
 #define FX_BLOOM    64
 #define FX_BEAM     512                    /* the headlight's cone in the water */
 #define FX_GLOW     1024                   /* lights' halo in the water, with BLOOM */
-#define FX_ALL      (FX_TRI | FX_SSAO | FX_BLOOM | FX_TERRAIN | FX_BEAM | FX_GLOW)
+#define FX_HUD      2048                   /* smooth 2D outlines, see overlay_draw */
+#define FX_ALL      (FX_TRI | FX_SSAO | FX_BLOOM | FX_TERRAIN | FX_BEAM | FX_GLOW | FX_HUD)
 int g_fx = FX_ALL;
 static int g_blend_on, g_blend_add;     /* the game's blend, see gl_alpha_blend */
 static GLenum g_blend_src = GL_ONE, g_blend_dst = GL_ZERO;
@@ -438,7 +439,8 @@ int glide_fx_parse(const char *list)
         { "none", 0 }, { "all", FX_ALL }, { "fog", FX_FOG },
         { "caustics", FX_CAUSTICS }, { "light", FX_LIGHT },
         { "ssao", FX_SSAO }, { "bloom", FX_BLOOM }, { "bump", FX_BUMP },
-        { "terrain", FX_TERRAIN }, { "beam", FX_BEAM }, { "glow", FX_GLOW } };
+        { "terrain", FX_TERRAIN }, { "beam", FX_BEAM }, { "glow", FX_GLOW },
+        { "hud", FX_HUD } };
     char buf[128], *t, *ctx = NULL;
     int fx = 0, i;
     strncpy(buf, list, sizeof buf - 1);
@@ -460,13 +462,14 @@ static void terrain_check(void)
     }
 }
 
-/* Ctrl+Alt+1..9 (video.c): one effect on or off, n < 0 all of them */
+/* Ctrl+Alt+1..9 and - (video.c): one effect on or off, n < 0 all of them */
 void glide_fx_toggle(int n)
 {
     static const struct { const char *name; int bit; } k[] = {
         { "fog", FX_FOG }, { "caustics", FX_CAUSTICS }, { "light", FX_LIGHT },
         { "bump", FX_BUMP }, { "ssao", FX_SSAO }, { "bloom", FX_BLOOM },
-        { "terrain", FX_TERRAIN }, { "beam", FX_BEAM }, { "glow", FX_GLOW } };
+        { "terrain", FX_TERRAIN }, { "beam", FX_BEAM }, { "glow", FX_GLOW },
+        { "hud", FX_HUD } };
     if (n < 0) g_fx = g_fx ? 0 : FX_ALL;
     else if (n < (int)(sizeof k / sizeof k[0])) g_fx ^= k[n].bit;
     else return;
@@ -1366,14 +1369,52 @@ static GLuint resolve_fbo(void)
 /* Draw a rectangle of 640x480-space pixels into the frame buffer. `px` is
  * 0xAABBGGRR, `stride` in pixels; alpha 0 leaves the frame buffer as it was.
  * Plain fixed-function blit: no depth, no stencil, no fog, no clip. */
+/* --fx hud: the game's 2D drawn over the 3D (HUD lines, symbols, markers)
+ * at the frame buffer's resolution rather than 640x480's. Its coverage --
+ * the pixels the game changed -- is treated like a distance field: sampled
+ * bilinearly and cut at one half, a staircase becomes a smooth contour, a
+ * one-pixel diagonal a continuous line, while straight edges stay where
+ * they were. The colour stays the nearest texel's, so what lies inside an
+ * outline keeps its pixels exactly; only where the contour now covers a
+ * texel the game left untouched does it take its neighbours' colour. */
+static const char *g_ov_fs =
+    "uniform sampler2D uOv;\n"
+    "uniform vec2 uSize;\n"
+    "uniform vec4 uRect;\n"                    /* what was uploaded, in texels */
+    "vec4 pm(vec2 t)\n"
+    "{\n"
+    "    vec4 c = texture2D(uOv, clamp(t, uRect.xy + 0.5, uRect.zw - 0.5) / uSize);\n"
+    "    return vec4(c.rgb * c.a, c.a);\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "    vec2 p = gl_TexCoord[0].xy * uSize - 0.5, i = floor(p) + 0.5, f = fract(p);\n"
+    "    vec4 m = mix(mix(pm(i), pm(i + vec2(1.0, 0.0)), f.x),\n"
+    "                 mix(pm(i + vec2(0.0, 1.0)), pm(i + vec2(1.0, 1.0)), f.x), f.y);\n"
+    "    float w = max(fwidth(m.a) * 0.7, 0.02);\n"
+    "    float cov = smoothstep(0.5 - w, 0.5 + w, m.a);\n"
+    "    vec4 n = texture2D(uOv, gl_TexCoord[0].xy);\n"
+    "    gl_FragColor = vec4(n.a > 0.0 ? n.rgb : m.rgb / max(m.a, 0.0001), cov);\n"
+    "}\n";
+static GLuint pp_program(const char *fs_src);
+
 static void overlay_draw(const uint32_t *px, int stride, int x, int y, int w,
                          int h, int filter_linear)
 {
+    static GLuint ov;
+    static int ov_tried;
     GLint f = filter_linear ? GL_LINEAR : GL_NEAREST;
     float u0 = x / (float)GLIDE_W, v0 = y / (float)GLIDE_H;
     float u1 = (x + w) / (float)GLIDE_W, v1 = (y + h) / (float)GLIDE_H;
+    int smooth;
 
     if (w <= 0 || h <= 0) return;
+    if (g_prog && !ov_tried) {
+        ov_tried = 1;
+        if ((ov = pp_program(g_ov_fs)) == 0) LOGW("fx: hud shader failed");
+    }
+    /* full images keep their bilinear filtering, the rest is pixel art */
+    smooth = ov && !filter_linear && (g_fx & FX_HUD);
     if (g_prog) p_glUseProgram(0);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -1394,12 +1435,21 @@ static void overlay_draw(const uint32_t *px, int stride, int x, int y, int w,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
     glColor4f(1, 1, 1, 1);
+    if (smooth) {
+        /* only what was just uploaded: the rest of the texture is stale */
+        p_glUseProgram(ov);
+        p_glUniform1i(p_glGetUniformLocation(ov, "uOv"), 0);
+        p_glUniform2f(p_glGetUniformLocation(ov, "uSize"), (float)GLIDE_W, (float)GLIDE_H);
+        p_glUniform4f(p_glGetUniformLocation(ov, "uRect"), (float)x, (float)y,
+                      (float)(x + w), (float)(y + h));
+    }
     glBegin(GL_QUADS);
         glTexCoord2f(u0, v0); glVertex3f((float)x,       (float)y,       0);
         glTexCoord2f(u1, v0); glVertex3f((float)(x + w), (float)y,       0);
         glTexCoord2f(u1, v1); glVertex3f((float)(x + w), (float)(y + h), 0);
         glTexCoord2f(u0, v1); glVertex3f((float)x,       (float)(y + h), 0);
     glEnd();
+    if (smooth) p_glUseProgram(0);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glDisable(GL_BLEND);
     glEnable(GL_SCISSOR_TEST);

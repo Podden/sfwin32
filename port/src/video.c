@@ -281,14 +281,17 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                     }
                     continue;
                 }
-                /* Ctrl+Alt+1..9 switch one effect each (fog, caustics, light,
-                 * bump, ssao, bloom, terrain, beam, glow), Ctrl+Alt+0 all: to
-                 * tell on the spot which one an artefact comes from. */
+                /* Ctrl+Alt+1..9 and the key right of 0 switch one effect each
+                 * (fog, caustics, light, bump, ssao, bloom, terrain, beam,
+                 * glow, hud), Ctrl+Alt+0 all: to tell on the spot which one an
+                 * artefact comes from. */
                 if ((e.key.keysym.mod & KMOD_CTRL) && (e.key.keysym.mod & KMOD_ALT) &&
-                    e.key.keysym.scancode >= SDL_SCANCODE_1 &&
-                    e.key.keysym.scancode <= SDL_SCANCODE_0) {
+                    ((e.key.keysym.scancode >= SDL_SCANCODE_1 &&
+                      e.key.keysym.scancode <= SDL_SCANCODE_0) ||
+                     e.key.keysym.scancode == SDL_SCANCODE_MINUS)) {
                     if (e.type == SDL_KEYDOWN && !e.key.repeat)
                         glide_fx_toggle(e.key.keysym.scancode == SDL_SCANCODE_0 ? -1 :
+                                        e.key.keysym.scancode == SDL_SCANCODE_MINUS ? 9 :
                                         e.key.keysym.scancode - SDL_SCANCODE_1);
                     continue;
                 }
