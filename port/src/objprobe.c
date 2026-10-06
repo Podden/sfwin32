@@ -58,6 +58,7 @@ static void dump(const char *what, uint32_t p, int n)
 
 static uint32_t g_cur_model;              /* the model being drawn, for objprobe_tri */
 static uint32_t g_view_ctx;               /* the view it is drawn with                */
+static uint32_t g_view_ctx_skipped;       /* last monitor view, logged once            */
 uint32_t g_objprobe_frame;                /* script "callers": the frame to log      */
 
 static void floats(const char *what, uint32_t p, int n)
@@ -222,7 +223,16 @@ static int __cdecl obj_seen(uint32_t model, uint32_t edx, uint32_t ebx, uint32_t
     static int nseen;
     int i;
     g_cur_model = model;
-    g_view_ctx = ctx;
+    /* the 3D view's camera only: the target and NAV monitors draw their
+     * model with a view of their own (fx ~59 against ~490), and the frame's
+     * effects would then put every pixel back with the monitor's camera */
+    if (in_img(ctx, 0x1C4) && *(const float *)(uintptr_t)(ctx + 0x1A4) >= 150.0f)
+        g_view_ctx = ctx;
+    else if (ctx != g_view_ctx_skipped && in_img(ctx, 0x1C4)) {
+        g_view_ctx_skipped = ctx;
+        LOGI("objprobe: view ctx o%07X (fx %.0f) is not the 3D view", orig(ctx),
+             (double)*(const float *)(uintptr_t)(ctx + 0x1A4));
+    }
     if (!g_objprobe) return 0;                   /* hooked for glide.c's --fx only */
     if (g_nrf && replaced(model) && in_img(edx, 12) && in_img(ebx, 36) && in_img(ctx, 0x1C4)) {
         draw_replacement(model, (const float *)(uintptr_t)edx, (const float *)(uintptr_t)ebx,
@@ -271,7 +281,7 @@ int objprobe_camera(float proj[6], float C[9], float pos[3])
     proj[3] += (float)*(int32_t *)(uintptr_t)(WIN_X + 4 + g_img.delta);
     memcpy(C, v + 0x74, 36);
     memcpy(pos, v + 0x104, 12);
-    return proj[0] != 0.0f && proj[1] != 0.0f && proj[5] > proj[4];
+    return proj[0] >= 150.0f && proj[1] != 0.0f && proj[5] > proj[4];
 }
 
 /* glide.c: every triangle of the logged frame, tagged with the model drawn last */
