@@ -79,8 +79,9 @@ int hd_dump(const char *kind, const char *name, int w, int h,
 /* Decode DIR/<kind>/<name>.png into malloc'd 0xAABBGGRR pixels. */
 uint32_t *hd_load(const char *kind, const char *name, int *w, int *h)
 {
-    static IWICImagingFactory *fac;
-    static int init_failed;
+    /* per thread: glide.c decodes textures on worker threads */
+    static __declspec(thread) IWICImagingFactory *fac;
+    static __declspec(thread) int init_failed;
     wchar_t wpath[MAX_PATH * 2];
     char path[MAX_PATH * 2];
     IWICBitmapDecoder *dec = NULL;
@@ -88,6 +89,7 @@ uint32_t *hd_load(const char *kind, const char *name, int *w, int *h)
     IWICBitmapSource *conv = NULL;
     uint32_t *px = NULL;
     UINT uw = 0, uh = 0;
+    LARGE_INTEGER t0, t1, f;
 
     if (!g_hd_dir[0] || init_failed) return NULL;
     _snprintf(path, sizeof path, "%s\\%s\\%s.png", g_hd_dir, kind, name);
@@ -105,6 +107,7 @@ uint32_t *hd_load(const char *kind, const char *name, int *w, int *h)
             return NULL;
         }
     }
+    QueryPerformanceCounter(&t0);
     MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH * 2);
     if (FAILED(IWICImagingFactory_CreateDecoderFromFilename(
             fac, wpath, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
@@ -123,7 +126,10 @@ uint32_t *hd_load(const char *kind, const char *name, int *w, int *h)
     } else {
         *w = (int)uw;
         *h = (int)uh;
-        LOGI("hd: loaded %s (%ux%u)", path, uw, uh);
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&f);
+        LOGI("hd: loaded %s (%ux%u, %.0f ms)", path, uw, uh,
+             (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
     }
     if (conv)  IWICBitmapSource_Release(conv);
     if (frame) IWICBitmapFrameDecode_Release(frame);

@@ -269,12 +269,14 @@ static uint32_t gl_glide_get_version(uint32_t *a)
 #endif
 
 #define TEXCACHE 1024
+#define TEXWAYS  8       /* a key lives in one of 8 slots from key % TEXCACHE */
 
 typedef struct {
     uint32_t key;        /* 0 = empty */
     GLuint   tex;
     GLuint   tile[4];    /* the four quadrants, each its own texture */
     int      seabed, other;   /* terrain_tris: corners on the seabed grid or not */
+    unsigned used;       /* frame last drawn, for eviction */
 } texcache_ent;
 
 static SDL_GLContext g_glctx;
@@ -501,6 +503,10 @@ static void (APIENTRY *p_glBlitFramebuffer)(GLint, GLint, GLint, GLint,
                                             GLint, GLint, GLint, GLint,
                                             GLbitfield, GLenum);
 static void (APIENTRY *p_glGenerateMipmap)(GLenum);
+static void (APIENTRY *p_glCopyImageSubData)(GLuint, GLenum, GLint, GLint,
+                                             GLint, GLint, GLuint, GLenum,
+                                             GLint, GLint, GLint, GLint,
+                                             GLsizei, GLsizei, GLsizei);
 static float g_max_aniso;
 
 /* Where everything is drawn: the multisampled target when MSAA is on. */
@@ -908,6 +914,7 @@ static int fbo_create(void)
         LOGE("glide: OpenGL 3.0 framebuffer objects are required");
         return 0;
     }
+    GLPROC(p_glCopyImageSubData, "glCopyImageSubData");    /* 4.3, optional */
     g_fbw = (GLIDE_W + 2 * hplus_ext()) * scale;
     g_fbh = GLIDE_H * scale;
 
@@ -1051,9 +1058,8 @@ static int gl_ensure_context(void)
  * texture data, the palette and the chroma key, because all three change
  * independently and any of them changes the pixels. */
 /* Mipmapped, anisotropic texture parameters for the bound texture. */
-static void tex_params(GLint wrap)
+static void tex_filter(GLint wrap)
 {
-    p_glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR_);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     if (g_max_aniso > 1.0f)
@@ -1062,17 +1068,45 @@ static void tex_params(GLint wrap)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
 }
 
+static void tex_params(GLint wrap)
+{
+    p_glGenerateMipmap(GL_TEXTURE_2D);
+    tex_filter(wrap);
+}
+
 /* The seabed is an atlas of four 128x128 tiles, one per terrain quad, laid
  * down rotated and mirrored. Sampled out of the atlas, every filter reaches
  * across a tile's edge into its neighbour -- bilinear by half a texel, and
  * each mip level and anisotropic tap twice as far as the last -- which draws
  * the tile grid across the whole seabed. Each quadrant therefore also gets a
  * texture of its own, clamped at its edges, for the triangles that stay
- * inside one (see draw_triangle). */
-static void tex_make_tiles(texcache_ent *e, const uint32_t *px, int w, int h)
+ * inside one (see draw_triangle).
+ *
+ * src is the atlas, already uploaded with its mipmaps. A 2x2 box filter never
+ * crosses the quadrant boundaries of a power-of-two atlas, so every mip level
+ * of a tile is that quadrant of the atlas's own: copied on the GPU, which is
+ * a fraction of uploading and filtering the tiles again. */
+static void tex_make_tiles(texcache_ent *e, GLuint src, const uint32_t *px,
+                           int w, int h)
 {
     int q;
     if (!e->tile[0]) glGenTextures(4, e->tile);
+    if (p_glCopyImageSubData && w == h && w >= 2 && !(w & (w - 1))) {
+        for (q = 0; q < 4; q++) {
+            int lv, sz;
+            glBindTexture(GL_TEXTURE_2D, e->tile[q]);
+            for (lv = 0, sz = w / 2; sz >= 1; lv++, sz /= 2)
+                glTexImage2D(GL_TEXTURE_2D, lv, GL_RGBA8_, sz, sz, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            for (lv = 0, sz = w / 2; sz >= 1; lv++, sz /= 2)
+                p_glCopyImageSubData(src, GL_TEXTURE_2D, lv,
+                                     (q & 1) * sz, (q >> 1) * sz, 0,
+                                     e->tile[q], GL_TEXTURE_2D, lv, 0, 0, 0,
+                                     sz, sz, 1);
+            tex_filter(GL_CLAMP_TO_EDGE);
+        }
+        return;
+    }
     glPixelStorei(GL_UNPACK_ROW_LENGTH, w);
     for (q = 0; q < 4; q++) {
         glPixelStorei(GL_UNPACK_SKIP_PIXELS, (q & 1) * (w / 2));
@@ -1087,14 +1121,115 @@ static void tex_make_tiles(texcache_ent *e, const uint32_t *px, int w, int h)
     glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
 }
 
+/* HD replacements are decoded off the drawing thread: WIC takes 15-25 ms
+ * for a 1024x1024 PNG, a dropped frame each time something new comes into
+ * view. The original texture is drawn until the buffer swap after the
+ * decode, which uploads the replacement into the same texture. At most
+ * HDQ decodes are in flight (4 MB each, in a 32-bit process); beyond that
+ * tex_upload decodes itself, as it always did. */
+#define HDQ       16
+#define HDWORKERS 3
+typedef struct {
+    uint32_t  key, slot;
+    int       size, w, h;
+    char      name[48], dname[24];
+    uint32_t *px;
+} hd_job;
+static hd_job   g_hdq[HDQ], g_hdd[HDQ];       /* requested, decoded */
+static unsigned g_hdq_r, g_hdq_w, g_hdd_r, g_hdd_w, g_hd_inflight;
+static SRWLOCK  g_hd_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_hd_cv = CONDITION_VARIABLE_INIT;
+static int      g_hd_workers;                 /* started; -1: could not */
+
+static DWORD WINAPI hd_worker(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        hd_job j;
+        AcquireSRWLockExclusive(&g_hd_lock);
+        while (g_hdq_r == g_hdq_w)
+            SleepConditionVariableSRW(&g_hd_cv, &g_hd_lock, INFINITE, 0);
+        j = g_hdq[g_hdq_r++ % HDQ];
+        ReleaseSRWLockExclusive(&g_hd_lock);
+        if ((j.px = hd_load("tex", j.name, &j.w, &j.h)) == NULL)
+            j.px = hd_load("tex", j.dname, &j.w, &j.h);
+        AcquireSRWLockExclusive(&g_hd_lock);
+        if (j.px) g_hdd[g_hdd_w++ % HDQ] = j;
+        else      g_hd_inflight--;
+        ReleaseSRWLockExclusive(&g_hd_lock);
+    }
+}
+
+/* 0: no worker or none free, the caller decodes itself */
+static int hd_request(uint32_t key, uint32_t slot, int size,
+                      const char *name, const char *dname)
+{
+    int ok = 0;
+    AcquireSRWLockExclusive(&g_hd_lock);
+    if (!g_hd_workers) {
+        int i;
+        for (i = 0; i < HDWORKERS; i++) {
+            HANDLE t = CreateThread(NULL, 0, hd_worker, NULL, 0, NULL);
+            if (!t) break;
+            CloseHandle(t);
+        }
+        g_hd_workers = i ? i : -1;
+    }
+    if (g_hd_workers > 0 && g_hd_inflight < HDQ) {
+        hd_job *j = &g_hdq[g_hdq_w++ % HDQ];
+        j->key = key; j->slot = slot; j->size = size;
+        strcpy(j->name, name);
+        strcpy(j->dname, dname);
+        g_hd_inflight++;
+        ok = 1;
+    }
+    ReleaseSRWLockExclusive(&g_hd_lock);
+    if (ok) WakeConditionVariable(&g_hd_cv);
+    return ok;
+}
+
+/* At the buffer swap: upload what a worker decoded into the texture it was
+ * asked for, if it is still that one. One a frame: a 1024x1024 upload still
+ * costs this thread about 4 ms. */
+static void hd_drain(void)
+{
+    hd_job j;
+    texcache_ent *e;
+    AcquireSRWLockExclusive(&g_hd_lock);
+    if (g_hdd_r == g_hdd_w) { ReleaseSRWLockExclusive(&g_hd_lock); return; }
+    j = g_hdd[g_hdd_r++ % HDQ];
+    g_hd_inflight--;
+    ReleaseSRWLockExclusive(&g_hd_lock);
+    e = &g_texcache[j.slot];
+    if (e->key == j.key) {
+        glBindTexture(GL_TEXTURE_2D, e->tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, j.w, j.h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, j.px);
+        tex_params(GL_REPEAT);
+        if (j.size == 256) tex_make_tiles(e, e->tex, j.px, j.w, j.h);
+    }
+    free(j.px);
+}
+
 static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
 {
     static uint32_t rgba[256 * 256];
-    uint32_t slot = key % TEXCACHE;
+    uint32_t base = key % TEXCACHE, slot = base;
     int i, n = size * size;
     GLuint id;
 
-    if (g_texcache[slot].key == key) { g_tex_hit++; return &g_texcache[slot]; }
+    /* A slot of its own per key was not enough: two textures in use
+     * together that share key % TEXCACHE threw each other out on every
+     * draw, and each time the HD replacement was decoded again. */
+    for (i = 0; i < TEXWAYS; i++) {
+        texcache_ent *e = &g_texcache[(base + i) % TEXCACHE];
+        if (e->key == key) { e->used = g_glide_frame; g_tex_hit++; return e; }
+    }
+    for (i = 0; i < TEXWAYS; i++) {           /* empty, else least recently used */
+        uint32_t s = (base + i) % TEXCACHE;
+        if (!g_texcache[s].key) { slot = s; break; }
+        if (g_texcache[s].used < g_texcache[slot].used) slot = s;
+    }
     g_tex_miss++;
 
     if (n > 256 * 256) n = 256 * 256;
@@ -1123,7 +1258,7 @@ static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
                   g_chroma_on ? "k" : "");
         if (hd_dump("tex", name, size, size, rgba))
             LOGI("hd: dumped texture %s (%dx%d)", name, size, size);
-        if (g_hd_dir[0] &&
+        if (g_hd_dir[0] && !hd_request(key, slot, size, name, dname) &&
             ((hd = hd_load("tex", name, &hw, &hh)) != NULL ||
              (hd = hd_load("tex", dname, &hw, &hh)) != NULL)) {
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, hw, hh, 0,
@@ -1132,19 +1267,20 @@ static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
              * angle for its whole extent, which is exactly where plain
              * bilinear shimmers and smears. */
             tex_params(GL_REPEAT);
-            if (size == 256) tex_make_tiles(&g_texcache[slot], hd, hw, hh);
+            if (size == 256) tex_make_tiles(&g_texcache[slot], id, hd, hw, hh);
             free(hd);
         } else {
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0,
                          GL_RGBA, GL_UNSIGNED_BYTE, rgba);
             tex_params(GL_REPEAT);
-            if (size == 256) tex_make_tiles(&g_texcache[slot], rgba, size, size);
+            if (size == 256) tex_make_tiles(&g_texcache[slot], id, rgba, size, size);
         }
     }
 
     g_texcache[slot].key = key;
     g_texcache[slot].tex = id;
     g_texcache[slot].seabed = g_texcache[slot].other = 0;
+    g_texcache[slot].used = g_glide_frame;
     return &g_texcache[slot];
 }
 
@@ -2741,6 +2877,7 @@ static uint32_t gl_buffer_swap(uint32_t *a)
     hdtext_frame();
     if (!gl_ensure_context()) return 0;
     frame_present();
+    hd_drain();
 
     /* End of frame -- deliberately not grBufferClear. This game calls
      * grBufferClear exactly once for the entire run and clears each frame by
