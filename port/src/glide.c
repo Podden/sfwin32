@@ -439,6 +439,18 @@ int glide_fx_parse(const char *list)
     LOGI("fx: %s -> 0x%X", list, fx);
     return fx;
 }
+
+/* Ctrl+Alt+1..6 (video.c): one effect on or off, n < 0 all of them */
+void glide_fx_toggle(int n)
+{
+    static const struct { const char *name; int bit; } k[] = {
+        { "fog", FX_FOG }, { "caustics", FX_CAUSTICS }, { "light", FX_LIGHT },
+        { "bump", FX_BUMP }, { "ssao", FX_SSAO }, { "bloom", FX_BLOOM } };
+    if (n < 0) g_fx = g_fx ? 0 : FX_ALL;
+    else if (n < (int)(sizeof k / sizeof k[0])) g_fx ^= k[n].bit;
+    else return;
+    LOGI("fx: %s by hotkey -> 0x%X", n < 0 ? "all" : k[n].name, g_fx);
+}
 int g_smooth2d;                        /* --smooth2d: bilinear 2D overlays  */
 
 #define GL_FRAMEBUFFER_          0x8D40

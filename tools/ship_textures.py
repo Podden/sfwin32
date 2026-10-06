@@ -13,7 +13,7 @@ map  Reads every original model (VFX/MODULE/*.gltf), applies the node transforms
 up   For every dump of a scale>4 tier: copies the existing 4x file to
      runs/ships/backup_4x/ (once), then writes scale x original through
      Real-ESRGAN (via tools/upscale.py: bleed, hard 0/255 alpha). 8x is the
-     4x model on the original, then x2 on its result. Terrain atlases (S000/S001)
+     4x model twice (16x), Lanczos down to 8x. Terrain atlases (S000/S001)
      are not matched here and are never touched.
 
 Model size. The MOD format stores int16 coordinates, so everything up to ~260 units
@@ -155,12 +155,15 @@ def upscale(dump: Path, hd: Path, model: str) -> None:
             old = hd / "tex" / f"{s}.png"
             if old.exists() and not (BACKUP / old.name).exists():
                 shutil.copy2(old, BACKUP / old.name)
-        # 8x = the 4x model on the original, then x2 on that result
+        # 8x = the 4x model twice, then down to 8x. Not -s 2 on the second
+        # pass: the x4 models only do 4x, and ncnn then stitches its tiles
+        # back in the wrong places.
         esrgan(t / "in", t / "o1", model, 4)
-        esrgan(t / "o1", t / "o2", model, 2)
+        esrgan(t / "o1", t / "o2", model, 4)
         for r in rows:
             s = r["dumpstem"]
             up = Image.open(t / "o2" / f"{s}.png").convert("RGB")
+            up = up.resize((up.width // 2, up.height // 2), Image.LANCZOS)
             if s in alphas:
                 al = Image.fromarray(alphas[s]).resize(up.size, Image.LANCZOS)
                 up = up.convert("RGBA")

@@ -299,6 +299,7 @@ extern char g_objreplace[32];
 int objprobe_camera(float proj[6], float C[9], float pos[3]);
 extern int g_fx;                 /* glide.c: FX_* effects on top of the game's look */
 int glide_fx_parse(const char *list);
+void glide_fx_toggle(int n);
 extern uint32_t g_objprobe_frame;
 extern int g_glidedebug;
 extern int g_dumpsec;
