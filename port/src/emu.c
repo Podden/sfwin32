@@ -1772,6 +1772,36 @@ static void irq_deliver_pending(CONTEXT *c)
     }
 }
 
+/* Delivery at the return from a Glide call (glide.c, glide_common): the
+ * thread is about to resume game code at a known instruction on a clean
+ * stdcall frame, as good a point as a fault -- and a 3D frame makes
+ * thousands of them. Without it the render loop, which spends most of its
+ * time in our code, took ticks only at its rare faults and at the external
+ * path's lucky catches: in a fight IRQ0 fell to ~130 of 200 Hz, and the game,
+ * which keeps time by it, ran in slow motion. Returns the handler to enter
+ * (the caller pushes the frame) or 0. */
+uint32_t irq_take_at_call(uint32_t eip)
+{
+    uintptr_t lo = (uintptr_t)g_img.mem, hi = lo + g_img.code_size;
+    uint32_t handler;
+    int vec;
+
+    if (eip < lo || eip >= hi || eip_in_isr(eip) || shadow_dirty()) return 0;
+    if      (g_pend_irq1 > 0 && kbd_pending()) vec = 9;
+    else if (g_pend_irq0 > 0)                  vec = 8;
+    else return 0;
+    handler = dos_get_ivec(vec);
+    if (handler < lo || handler >= hi) return 0;
+    if (vec == 9) {
+        InterlockedDecrement(&g_pend_irq1);
+        InterlockedIncrement(&g_irq1_delivered);
+    } else {
+        InterlockedDecrement(&g_pend_irq0);
+        InterlockedIncrement(&g_ticks_delivered);
+    }
+    return handler;
+}
+
 /* irq_inject_external's stub: push the interrupt frame, enter the ISR.
  *   push dword [g_tr_eflags]; push dword [g_tr_cs]; push dword [g_tr_eip]
  *   jmp  dword [g_tr_handler] */

@@ -378,7 +378,8 @@ static int g_view_y0 = -1, g_view_y1;  /* rows of the game's 3D view (clip) */
 static GLuint g_cockpit_cur;
 static float  g_cockpit_hw;            /* half width, 640-space units       */
 /* The outside views put the 3D in a letterbox: a 640x480 frame that is black
- * but for two grey lines, with the bars stamped into the aux buffer. Under
+ * but for two grey lines (letterbox_select's test in gl_lfb_write_region),
+ * with the bars stamped into the aux buffer. Under
  * Hor+ that frame is not drawn and nothing is masked, so the 3D fills the
  * whole screen there as it does in the cockpit. */
 static int    g_letterbox;
@@ -1104,9 +1105,13 @@ static texcache_ent *tex_upload(const uint8_t *data, int size, uint32_t key)
 
 /* Depth starts fresh every frame. Within the frame the ordering is all this
  * game needs, and the stencil (the cockpit mask) is left alone. */
+static void back_replay(void);
+static int  back_defer(const uint32_t *a, int clear);
+
 static void frame_begin(void)
 {
     if (g_frame_started) return;
+    back_replay();
     g_frame_started = 1;
     glDisable(GL_SCISSOR_TEST);
     glDepthMask(GL_TRUE);
@@ -1350,7 +1355,7 @@ static int triangle_tile(const float *const v[3], const texcache_ent *e)
  * the composite keeps to the cockpit stencil, so the cockpit neither darkens
  * nor glows into the scene. */
 
-static GLuint g_pp_fbo, g_pp_depth_fbo, g_pp_depth, g_pp_tex[4];
+static GLuint g_pp_fbo, g_pp_depth_fbo, g_pp_depth, g_pp_tex[4], g_pp_fogtex;
 static int    g_pp_w2, g_pp_h2, g_pp_w4, g_pp_h4;
 static GLuint g_pp_ao, g_pp_blur, g_pp_bright;
 static int    g_pp_failed;
@@ -1383,6 +1388,8 @@ static const char *g_pp_vs =
 static const char *g_pp_ao_fs =
     PP_VIEWPOS
     "uniform vec2 uTexel;\n"                   /* one full-resolution pixel in uv */
+    "uniform sampler2D uFogT;\n"               /* the game's fog over depth */
+    "uniform int  uAbsorb;\n"                  /* the water's, FX_FOG */
     "void main()\n"
     "{\n"
     "    vec2 uv = gl_TexCoord[0].xy;\n"
@@ -1394,7 +1401,7 @@ static const char *g_pp_ao_fs =
     "    if (dot(n, p) > 0.0) n = -n;\n"
     "    float R = 40.0 + 0.08 * p.y;\n"           /* world units; a boat is ~200 */
     "    float rad = R * uProj.x / p.y;\n"         /* ... in 640-space pixels */
-    "    float a0 = 6.2831 * fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);\n"
+    "    float a0 = 6.2831 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));\n"
     "    for (int i = 0; i < 12; i++) {\n"
     "        float t = (float(i) + 0.5) / 12.0;\n"
     "        float a = a0 + float(i) * 2.39996;\n"
@@ -1404,7 +1411,12 @@ static const char *g_pp_ao_fs =
     "        float l = length(v) + 0.001;\n"
     "        occ += max(dot(v / l, n) - 0.10, 0.0) * (1.0 - smoothstep(R, 2.0 * R, l));\n"
     "    }\n"
-    "    gl_FragColor = vec4(vec3(clamp(1.0 - 2.2 * occ / 12.0, 0.0, 1.0)), 1.0);\n"
+    /* The AO multiplies the finished, fogged colour, so it keeps to what
+     * the fog and the water left of the surface: a ridge the fog has eaten
+     * must not come back as its dark outline. */
+    "    float vis = 1.0 - texture2D(uFogT, vec2(dz, 0.5)).a;\n"
+    "    if (uAbsorb != 0) vis *= exp(-1.3 * length(p) / uRange.y);\n"
+    "    gl_FragColor = vec4(vec3(mix(1.0, clamp(1.0 - 2.2 * occ / 12.0, 0.0, 1.0), vis)), 1.0);\n"
     "}\n";
 
 static const char *g_pp_blur_fs =
@@ -1574,7 +1586,26 @@ static void post_run(void)
     glColor4f(1, 1, 1, 1);
 
     if (ssao) {
+        GLubyte fog[256];
+        int i;
+        for (i = 0; i < 256; i++)              /* depth is w / G_WFAR */
+            fog[i] = g_fog_mode == 2 && g_fog_valid
+                   ? (GLubyte)(255.0f * fog_factor((i + 0.5f) * (G_WFAR / 256.0f))) : 0;
+        if (!g_pp_fogtex) {
+            glGenTextures(1, &g_pp_fogtex);
+            glBindTexture(GL_TEXTURE_2D, g_pp_fogtex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+        p_glActiveTexture(GL_TEXTURE1_);
+        glBindTexture(GL_TEXTURE_2D, g_pp_fogtex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, 256, 1, 0, GL_ALPHA, GL_UNSIGNED_BYTE, fog);
+        p_glActiveTexture(GL_TEXTURE0_);
         p_glUseProgram(g_pp_ao);
+        p_glUniform1i(p_glGetUniformLocation(g_pp_ao, "uFogT"), 1);
+        p_glUniform1i(p_glGetUniformLocation(g_pp_ao, "uAbsorb"), (g_fx & FX_FOG) != 0);
         p_glUniform1i(p_glGetUniformLocation(g_pp_ao, "uDepth"), 0);
         p_glUniform4f(p_glGetUniformLocation(g_pp_ao, "uProj"),
                       g_cam_proj[0], g_cam_proj[1], g_cam_proj[2], g_cam_proj[3]);
@@ -2169,6 +2200,7 @@ static void aux_upload_mask(void);
 static uint32_t gl_buffer_clear(uint32_t *a)
 {
     if (!gl_ensure_context()) return 0;
+    if (back_defer(a, 1)) return 0;
     glDepthMask(GL_TRUE);
     {   float cr, cg, cb;
         glide_unpack(a[0], &cr, &cg, &cb);
@@ -2198,6 +2230,24 @@ static uint32_t gl_buffer_clear(uint32_t *a)
     return 0;
 }
 
+
+/* A window wider than the 16:9 cockpit art: the columns beyond its edges
+ * are masked off (aux_upload_mask) and drawn black (hd_image_draw), so the
+ * scene does not run on past the cockpit. */
+static void beyond_art_quads(float qx0, float qx1)
+{
+    float e0 = (float)-g_ext, e1 = (float)(GLIDE_W + g_ext);
+    glBegin(GL_QUADS);
+    if (qx0 > e0) {
+        glVertex3f(e0, 0, 0);  glVertex3f(qx0, 0, 0);
+        glVertex3f(qx0, GLIDE_H, 0);  glVertex3f(e0, GLIDE_H, 0);
+    }
+    if (qx1 < e1) {
+        glVertex3f(qx1, 0, 0);  glVertex3f(e1, 0, 0);
+        glVertex3f(e1, GLIDE_H, 0);  glVertex3f(qx1, GLIDE_H, 0);
+    }
+    glEnd();
+}
 
 /* Turn the aux buffer the game wrote into a stencil mask.
  *
@@ -2283,6 +2333,12 @@ static void aux_upload_mask(void)
         glTexCoord2f(1, 1); glVertex3f(qx1, GLIDE_H, 0);
         glTexCoord2f(0, 1); glVertex3f(qx0, GLIDE_H, 0);
     glEnd();
+    if (g_cockpit_cur) {
+        glDisable(GL_ALPHA_TEST);
+        glDisable(GL_TEXTURE_2D);
+        beyond_art_quads(qx0, qx1);
+        glEnable(GL_TEXTURE_2D);
+    }
     }
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -2391,8 +2447,10 @@ static void present(void)
                         GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
     /* Cockpit sides, over the bars and faded into the frame's edges. Only
-     * while the cockpit mask is up: the outside views have no cockpit. */
-    if (g_wide_cur && g_mask_ready && dw > vw && g_wide_h) {
+     * while the cockpit mask is up: the outside views have no cockpit. And
+     * only for a 4:3 frame: under Hor+ the cockpit is in the frame already,
+     * and a window wider still would get a second one over it. */
+    if (g_wide_cur && g_mask_ready && dw > vw && g_wide_h && !g_ext) {
         int ww = (int)((long)vh * g_wide_w / g_wide_h);
         if (g_prog) p_glUseProgram(0);
         glViewport((dw - ww) / 2, vy, ww, vh);
@@ -2414,12 +2472,41 @@ static void present(void)
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
         glDisable(GL_BLEND);
         glViewport(0, 0, g_fbw, g_fbh);
-        if (g_wide_shot[0]) shot_window(g_wide_shot, dw, dh);
     }
+    if (g_wide_shot[0]) shot_window(g_wide_shot, dw, dh);
     g_wide_shot[0] = 0;
     SDL_GL_SwapWindow(video_window());
     p_glBindFramebuffer(GL_FRAMEBUFFER_, draw_fbo());
     glEnable(GL_SCISSOR_TEST);
+}
+
+/* The screenshot key also notes what the renderer was doing, as <shot>.txt. */
+static void shot_note(const char *bmp)
+{
+    char path[MAX_PATH + 16];
+    float proj[6], C[9], pos[3];
+    int ok = objprobe_camera(proj, C, pos), dw = 0, dh = 0;
+    size_t n = strlen(bmp);
+    FILE *f;
+    if (n < 4 || n + 1 > sizeof path) return;
+    memcpy(path, bmp, n - 4);
+    strcpy(path + n - 4, ".txt");
+    if (!(f = fopen(path, "w"))) return;
+    SDL_GL_GetDrawableSize(video_window(), &dw, &dh);
+    fprintf(f, "frame %u\nfx 0x%X\nwindow %dx%d\nframe buffer %dx%d, Hor+ %d\n",
+            g_glide_frame, g_fx, dw, dh, g_fbw, g_fbh, g_ext);
+    fprintf(f, "letterbox %d, mask %d, cockpit art %d, side art %d\n",
+            g_letterbox, g_mask_ready, g_cockpit_cur != 0, g_wide_cur != 0);
+    fprintf(f, "water %.3f %.3f %.3f\n", g_water[0], g_water[1], g_water[2]);
+    if (ok)
+        fprintf(f, "camera fx %.1f fy %.1f cx %.1f cy %.1f near %.1f far %.1f\n"
+                   "position %.1f %.1f %.1f\n"
+                   "matrix %.3f %.3f %.3f / %.3f %.3f %.3f / %.3f %.3f %.3f\n",
+                proj[0], proj[1], proj[2], proj[3], proj[4], proj[5], pos[0], pos[1], pos[2],
+                C[0], C[1], C[2], C[3], C[4], C[5], C[6], C[7], C[8]);
+    else
+        fprintf(f, "camera none\n");
+    fclose(f);
 }
 
 /* script "shot": the frame buffer at its own resolution, not the window. */
@@ -2435,19 +2522,16 @@ static void shot_from_fbo(const char *path)
     free(px);
 }
 
-static uint32_t gl_buffer_swap(uint32_t *a)
+/* Show the frame buffer as it stands: a buffer swap, or a write to the
+ * front buffer (see gl_lfb_write_region). */
+static void frame_present(void)
 {
-    (void)a;
-    post_maybe();
-    g_glide_frame++;
-    hdtext_frame();
-    if (!gl_ensure_context()) return 0;
-
     lfb_flush();
     if (script_shot_wanted()) {
         const char *p = script_shot_wanted();
         size_t n = strlen(p);
         shot_from_fbo(p);
+        if (script_shot_is_hotkey()) shot_note(p);
         if (n > 4 && n < sizeof g_wide_shot - 4) {
             memcpy(g_wide_shot, p, n - 4);                /* drop ".bmp" */
             strcpy(g_wide_shot + n - 4, "_win.bmp");
@@ -2468,6 +2552,17 @@ static uint32_t gl_buffer_swap(uint32_t *a)
         scissor_clip();
     }
     present();
+}
+
+static uint32_t gl_buffer_swap(uint32_t *a)
+{
+    (void)a;
+    back_replay();
+    post_maybe();
+    g_glide_frame++;
+    hdtext_frame();
+    if (!gl_ensure_context()) return 0;
+    frame_present();
 
     /* End of frame -- deliberately not grBufferClear. This game calls
      * grBufferClear exactly once for the entire run and clears each frame by
@@ -2655,6 +2750,14 @@ static int hd_image_draw(const uint32_t *rgba, int x, int y, int w, int h)
         glTexCoord2f(1, 1); glVertex3f(qx1, (float)(y + h), 0);
         glTexCoord2f(0, 1); glVertex3f(qx0, (float)(y + h), 0);
     glEnd();
+    if (tex == g_cockpit_cur) {
+        glDisable(GL_BLEND);
+        glDisable(GL_TEXTURE_2D);
+        glColor4f(0, 0, 0, 1);
+        beyond_art_quads(qx0, qx1);
+        glColor4f(1, 1, 1, 1);
+        glEnable(GL_TEXTURE_2D);
+    }
     }
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glDisable(GL_BLEND);
@@ -2664,6 +2767,58 @@ static int hd_image_draw(const uint32_t *rgba, int x, int y, int w, int h)
 
 /* (dst_buffer, dst_x, dst_y, src_format, w, h, src_stride, src_data). The
  * full-screen ones are the cockpit art and are drawn filtered. */
+/* There is one frame buffer here, the Voodoo has two. While the game shows a
+ * front-buffer image (the briefing, see the end of gl_lfb_write_region) it
+ * also prepares the next frame in the back buffer -- the briefing clears it
+ * and paints the plain cockpit there -- which here would land on the image
+ * on screen. Those clears and writes wait until the game swaps or starts its
+ * 3D.
+ * ponytail: back-buffer reads in the meantime see the front image; the game
+ * makes none. */
+#define BACKQ 8
+static struct { uint32_t a[8]; uint8_t *px; int clear; } g_backq[BACKQ];
+static int g_nbackq, g_front_shown;
+
+static uint32_t gl_lfb_write_region(uint32_t *a);
+
+static void back_replay(void)
+{
+    int i, n = g_nbackq;
+    g_front_shown = 0;
+    g_nbackq = 0;
+    for (i = 0; i < n; i++) {
+        if (g_backq[i].clear) gl_buffer_clear(g_backq[i].a);
+        else                  gl_lfb_write_region(g_backq[i].a);
+        free(g_backq[i].px);
+    }
+}
+
+/* a: grBufferClear's arguments if clear, else grLfbWriteRegion's */
+static int back_defer(const uint32_t *a, int clear)
+{
+    uint32_t w = a[4], h = a[5], r;
+    const uint8_t *src = (const uint8_t *)(uintptr_t)a[7];
+    uint8_t *px;
+    if (!g_front_shown) return 0;
+    if (!clear && (a[0] != 1 || !src || w > GLIDE_W || h > GLIDE_H)) return 0;
+    if (g_nbackq == BACKQ) { back_replay(); return 0; }
+    if (clear) {
+        memcpy(g_backq[g_nbackq].a, a, 3 * sizeof a[0]);
+        g_backq[g_nbackq].px = NULL;
+        g_backq[g_nbackq++].clear = 1;
+        return 1;
+    }
+    if (!(px = (uint8_t *)malloc((size_t)w * h * 2))) return 0;
+    for (r = 0; r < h; r++)
+        memcpy(px + (size_t)r * w * 2, src + (int32_t)r * (int32_t)a[6], w * 2);
+    memcpy(g_backq[g_nbackq].a, a, sizeof g_backq[0].a);
+    g_backq[g_nbackq].a[6] = w * 2;
+    g_backq[g_nbackq].a[7] = (uint32_t)(uintptr_t)px;
+    g_backq[g_nbackq].clear = 0;
+    g_backq[g_nbackq++].px = px;
+    return 1;
+}
+
 static uint32_t gl_lfb_write_region(uint32_t *a)
 {
     static uint32_t rgba[GLIDE_W * GLIDE_H];
@@ -2672,6 +2827,7 @@ static uint32_t gl_lfb_write_region(uint32_t *a)
     int32_t  stride = (int32_t)a[6];
 
     if (!src || !g_vram || !gl_ensure_context()) return 0;
+    if (back_defer(a, 0)) return 1;
     if (x >= GLIDE_W || y >= GLIDE_H) return 0;
     if (w > GLIDE_W - x) w = GLIDE_W - x;
     if (h > GLIDE_H - y) h = GLIDE_H - y;
@@ -2683,9 +2839,18 @@ static uint32_t gl_lfb_write_region(uint32_t *a)
         for (c = 0; c < w; c++) rgba[r * w + c] = rgb565_to_abgr(s[c], 0xFF000000u);
     }
     if (g_ext && w == GLIDE_W && h == GLIDE_H) {
-        uint32_t lit = 0;
-        for (r = 0; r < w * h; r++) lit += (rgba[r] & 0xFFFFFFu) != 0;
-        letterbox_select(lit < w * h / 100);
+        /* Lit only along a few full-width lines. Briefing text on black is
+         * as dark, but spread over many rows, and must be drawn. */
+        uint32_t rows = 0, lines = 0, n;
+        for (r = 0; r < h; r++) {
+            for (c = 0, n = 0; c < w; c++) n += (rgba[r * w + c] & 0xFFFFFFu) != 0;
+            rows += n != 0;
+            lines += n > w / 2;
+        }
+        if ((rows && rows <= 8 && lines == rows) != g_letterbox)
+            LOGI("glide: letterbox %s (%u lit rows, %u of them lines)",
+                 g_letterbox ? "off" : "on", rows, lines);
+        letterbox_select(rows && rows <= 8 && lines == rows);
         if (g_letterbox) {
             wide_select(0);
             cockpit_select(0, 0.0f);
@@ -2710,6 +2875,11 @@ static uint32_t gl_lfb_write_region(uint32_t *a)
             memcpy(g_lfb_snap + (size_t)(y + r) * GLIDE_W + x,
                    src + (int32_t)r * stride, w * 2);
         }
+
+    /* On the Voodoo a front-buffer write is on screen at once. The mission
+     * briefing is drawn that way, line by line, and then waits for a key
+     * without ever swapping -- shown only at a swap, it stayed black. */
+    if (a[0] == 0 && !g_frame_started) { frame_present(); g_front_shown = 1; }
     return 1;
 }
 
@@ -2805,7 +2975,11 @@ uint32_t __cdecl glide_call(uint32_t idx, uint32_t *args)
 }
 
 /* eax = import index on entry. Everything below the return address belongs to
- * the caller's stdcall frame, so the argument bytes are dropped here. */
+ * the caller's stdcall frame, so the argument bytes are dropped here. A
+ * pending hardware interrupt is taken on the way back (irq_take_at_call):
+ * its frame is pushed as if it had arrived at the return address. */
+static uint32_t g_irq_enter;            /* game thread only */
+
 static __declspec(naked) void glide_common(void)
 {
     __asm {
@@ -2819,6 +2993,12 @@ static __declspec(naked) void glide_common(void)
         push ebx
         call glide_call
         add  esp, 8
+        push eax                        /* the game's EAX, across this call */
+        push dword ptr [esp + 20]       /* the return address */
+        call irq_take_at_call
+        add  esp, 4
+        mov  dword ptr [g_irq_enter], eax
+        pop  eax
         mov  ecx, dword ptr [g_argbytes + ebx * 4]
         pop  ebp
         pop  edi
@@ -2826,7 +3006,14 @@ static __declspec(naked) void glide_common(void)
         pop  ebx
         pop  edx                        /* return address */
         add  esp, ecx                   /* callee cleanup, stdcall */
+        cmp  dword ptr [g_irq_enter], 0
+        jne  deliver_irq
         jmp  edx
+    deliver_irq:
+        pushfd                          /* the frame IRETD pops */
+        push cs
+        push edx
+        jmp  dword ptr [g_irq_enter]
     }
 }
 

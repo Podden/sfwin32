@@ -280,6 +280,12 @@ static DWORD WINAPI vid_thread_main(LPVOID arg)
                     }
                     continue;
                 }
+                /* Print Screen saves a screenshot (script_shot_hotkey) and is
+                 * not the game's either. */
+                if (e.key.keysym.scancode == SDL_SCANCODE_PRINTSCREEN) {
+                    if (e.type == SDL_KEYDOWN) script_shot_hotkey();
+                    continue;
+                }
                 LOGT("SDL key %s scancode=%d",
                      e.type == SDL_KEYDOWN ? "down" : "up",
                      (int)e.key.keysym.scancode);

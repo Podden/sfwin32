@@ -95,6 +95,7 @@ void emu_enter_game(void);
  * game thread at the rate the game programs into the PIT. */
 void timer_start(void);
 void timer_stats(uint32_t *delivered, uint32_t *skipped);
+uint32_t irq_take_at_call(uint32_t eip);
 void emu_request_exit(int code);
 
 /* Shadow segment registers. Win32 cannot honour a foreign selector, so every
@@ -171,6 +172,8 @@ void script_set_shot_dir(const char *dir);
 void script_tick(void);
 const char *script_shot_wanted(void);
 void script_shot_done(void);
+void script_shot_hotkey(void);
+int  script_shot_is_hotkey(void);
 int  write_bmp24(const char *path, int w, int h, const uint8_t *rows,
                  int stride);
 int  write_bmp_argb(const char *path, int w, int h, const uint32_t *px);

@@ -35,13 +35,39 @@ static char     g_shot_dir[MAX_PATH] = "shots";
 
 /* The renderer that owns the frame takes the shot: render_frame for the
  * software build, gl_buffer_swap for the 3dfx build. */
-static volatile LONG g_shot_pending;
+static volatile LONG g_shot_pending, g_shot_hotkey;
 static char          g_shot_path[MAX_PATH + 64];
 static Uint32        g_shot_deadline;
 
+/* NULL keeps the directory and only makes it absolute, which main does
+ * before the game chdirs into its assets. */
 void script_set_shot_dir(const char *dir)
 {
-    strncpy(g_shot_dir, dir, sizeof g_shot_dir - 1);
+    char full[MAX_PATH];
+    if (dir) strncpy(g_shot_dir, dir, sizeof g_shot_dir - 1);
+    if (GetFullPathNameA(g_shot_dir, sizeof full, full, NULL))
+        strncpy(g_shot_dir, full, sizeof g_shot_dir - 1);
+}
+
+/* The screenshot key (Print Screen, see video.c): a shot into the shot
+ * directory named by the time; the renderer adds the whole window and a
+ * note of its state beside it. */
+void script_shot_hotkey(void)
+{
+    SYSTEMTIME t;
+    if (g_shot_pending) return;
+    GetLocalTime(&t);
+    CreateDirectoryA(g_shot_dir, NULL);
+    _snprintf(g_shot_path, sizeof g_shot_path, "%s\\key-%04d%02d%02d-%02d%02d%02d.bmp", g_shot_dir,
+              t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    g_shot_deadline = SDL_GetTicks() + 3000;
+    InterlockedExchange(&g_shot_hotkey, 1);
+    InterlockedExchange(&g_shot_pending, 1);
+}
+
+int script_shot_is_hotkey(void)
+{
+    return g_shot_hotkey != 0;
 }
 
 static int section_matches(const char *hdr, const char *mode, int index)
@@ -251,6 +277,7 @@ const char *script_shot_wanted(void)
 void script_shot_done(void)
 {
     LOGI("script: saved %s", g_shot_path);
+    InterlockedExchange(&g_shot_hotkey, 0);
     InterlockedExchange(&g_shot_pending, 0);
 }
 

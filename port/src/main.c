@@ -588,6 +588,7 @@ int main(int argc, char **argv)
 
     /* The game opens its data with DOS-relative paths, so the asset directory
      * has to be the working directory. */
+    script_set_shot_dir(NULL);
     if (assets) {
         if (!SetCurrentDirectoryA(assets)) {
             LOGE("cannot chdir to '%s' (%lu)", assets, GetLastError());
