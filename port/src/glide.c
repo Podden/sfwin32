@@ -641,10 +641,17 @@ static const char *g_fs_src =
     "            c.rgb = fx(16) ? c.rgb * sqrt(T) : c.rgb * T + uWater * (1.0 - T);\n"
     "        }\n"
     "    }\n"
-    "    if (uFog != 0) c.rgb = mix(c.rgb, uFogColor, gl_FogFragCoord);\n"
-    /* alpha: emission for the bloom pass (post_run), summed by the additive
-     * blend; nothing else reads the frame buffer's alpha */
-    "    gl_FragColor = vec4(c.rgb, fx(16) ? max(c.r, max(c.g, c.b)) : 0.0);\n"
+    /* the frame buffer's alpha is emission for the bloom (post_run, and the
+     * blend set up in gl_draw_triangle). Additive light fades out in the
+     * fog rather than turning into fog, and glows further than it shows. */
+    "    float e = c.a;\n"
+    "    if (uFx != 0 && fx(16)) {\n"
+    "        float f = uFog != 0 ? gl_FogFragCoord : 0.0;\n"
+    "        if (fx(32)) c.rgb *= c.a;\n"      /* its SRC_ALPHA, folded in */
+    "        e = smoothstep(0.45, 0.95, max(c.r, max(c.g, c.b))) * (1.0 - f * f);\n"
+    "        c.rgb *= 1.0 - f * f * f;\n"
+    "    } else if (uFog != 0) c.rgb = mix(c.rgb, uFogColor, gl_FogFragCoord);\n"
+    "    gl_FragColor = vec4(c.rgb, e);\n"
     "}\n";
 
 #ifndef GL_FRAGMENT_SHADER
@@ -675,6 +682,7 @@ static void   (APIENTRY *p_glUniform2f)(GLint, GLfloat, GLfloat);
 static void   (APIENTRY *p_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 static void   (APIENTRY *p_glUniformMatrix3fv)(GLint, GLsizei, GLboolean, const GLfloat *);
 static void   (APIENTRY *p_glActiveTexture)(GLenum);
+static void   (APIENTRY *p_glBlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
 #define GL_TEXTURE0_ 0x84C0
 #define GL_TEXTURE1_ 0x84C1
 
@@ -742,6 +750,7 @@ static void shader_init(void)
     *(void **)&p_glUniform4f = SDL_GL_GetProcAddress("glUniform4f");
     *(void **)&p_glUniformMatrix3fv = SDL_GL_GetProcAddress("glUniformMatrix3fv");
     *(void **)&p_glActiveTexture = SDL_GL_GetProcAddress("glActiveTexture");
+    *(void **)&p_glBlendFuncSeparate = SDL_GL_GetProcAddress("glBlendFuncSeparate");
     if (!p_glUniform2f || !p_glUniform4f || !p_glUniformMatrix3fv) g_fx = 0;
 
     if (!p_glCreateShader || !p_glUseProgram || !p_glGetUniformLocation) {
@@ -1452,7 +1461,7 @@ static const char *g_pp_bright_fs =
     "    vec3 c = s.rgb;\n"
     "    if (texture2D(uDepth, uv).r >= 0.9999) c = vec3(0.0);\n"
     "    float l = max(c.r, max(c.g, c.b));\n"
-    "    gl_FragColor = vec4(c * max(smoothstep(0.70, 1.00, l), 3.0 * s.a), 1.0);\n"
+    "    gl_FragColor = vec4(c * max(smoothstep(0.70, 1.00, l), 6.0 * s.a), 1.0);\n"
     "}\n";
 
 static GLuint pp_program(const char *fs_src)
@@ -1720,7 +1729,7 @@ static int fx_bits(int bias_mode)
 static uint32_t gl_draw_triangle(uint32_t *a)
 {
     const float *v[3];
-    int i, bias_mode, tile = -1;
+    int i, bias_mode, tile = -1, fx = 0, pre = 0;
 
     g_tris++;
     {   /* Rough area, which is all a fill-rate sample needs. */
@@ -1919,7 +1928,9 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         /* the water's colour is the backdrop's: what fades out must fade to it */
         if (bias_mode && (g_cc_local == 1 || g_cc_other == 2))
             glide_unpack(g_const_color, &g_water[0], &g_water[1], &g_water[2]);
-        p_glUniform1i(g_u_fx, fx_bits(bias_mode));
+        fx = fx_bits(bias_mode);
+        pre = (fx & 16) && g_blend_src == GL_SRC_ALPHA;
+        p_glUniform1i(g_u_fx, fx | (pre ? 32 : 0));
         if (g_fog_mode == 2 && g_fog_valid) {
             float fr, fg, fb;
             glide_unpack(g_fog_color, &fr, &fg, &fb);
@@ -1930,6 +1941,17 @@ static uint32_t gl_draw_triangle(uint32_t *a)
         }
     }
 
+    /* Alpha: additive light with the effects on adds its emission, anything
+     * else drawn over it covers it (opaque: blending ONE, ZERO). */
+    if (g_prog && p_glBlendFuncSeparate) {
+        glEnable(GL_BLEND);
+        if (!g_blend_on)
+            p_glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ZERO, GL_ZERO);
+        else if (fx & 16)
+            p_glBlendFuncSeparate(pre ? GL_ONE : g_blend_src, g_blend_dst, GL_ONE, GL_ONE);
+        else
+            p_glBlendFuncSeparate(g_blend_src, g_blend_dst, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+    }
     glBegin(GL_TRIANGLES);
     for (i = 0; i < 3; i++) {
         const float *p = v[i];
@@ -1980,6 +2002,10 @@ static uint32_t gl_draw_triangle(uint32_t *a)
             glVertex3f(p[VX], p[VY], 1.0f - z * 2.0f);
     }
     glEnd();
+    if (g_prog && p_glBlendFuncSeparate) {
+        glBlendFunc(g_blend_src, g_blend_dst);
+        if (!g_blend_on) glDisable(GL_BLEND);
+    }
     return 0;
 }
 

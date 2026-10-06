@@ -1,6 +1,13 @@
-"""New 16:9 cockpits with a much larger window, for fightport's Hor+ mode.
+"""New 16:9 cockpits for fightport's Hor+ mode.
 
     uv run --with numpy --with scipy --with pillow python tools/cockpit_wide.py [--only NAME,..] [--force]
+        [--style original|panorama]
+
+--style original (default): the whole 4:3 cockpit stays as it is -- struts,
+ring, instruments -- and only the new sides are painted, with the window
+carried into them wherever the old one met the 4:3 edge. --style panorama is
+the first attempt, described below: a much larger window, which loses each
+cockpit's own frame.
 
 Under Hor+ the game renders 3D across the whole 16:9 frame, so a cockpit no
 longer has to frame a 4:3 view. Per bright cockpit image in <dump>/2d:
@@ -53,6 +60,20 @@ PROMPT = (
     "people, no watermark, no border."
 )
 
+PROMPT_ORIGINAL = (
+    "Image 1 is the cockpit view of a deep-sea combat submarine in a 1990s CG game (Archimedean "
+    "Dynasty), being widened from 4:3 to 16:9. The detailed middle part is the original cockpit and "
+    "is final. The flat MAGENTA areas are the cockpit's window. The flat GREY areas at the left and "
+    "right are new: paint them as the continuation of exactly this cockpit -- carry its frame, "
+    "struts, arches and armour plates outward to the screen edges with the same shapes, materials, "
+    "colours, wear and dim lighting, so that it looks like the same cockpit seen on a wider screen. "
+    "Add nothing the original does not have: no gauges, dials, switches, levers, brass, steampunk "
+    "details, extra pipes or cables. Paint over every grey pixel, up to the screen edges: no flat "
+    "grey may remain anywhere. Keep the middle part unchanged and in place. Keep every magenta "
+    "pixel exactly flat pure magenta #FF00FF -- do not draw anything into the window, no glass, no "
+    "reflections, no view outside. No text, no people, no watermark, no border."
+)
+
 
 # Where each cockpit's instruments are (x0, y0, x1, y1 in 640x480): the game
 # draws live content into them (monitors, radars, weapon display), so they
@@ -101,6 +122,27 @@ def layout(o: np.ndarray, rects) -> tuple[np.ndarray, np.ndarray]:
     old[:, x0:x0 + 640] = ~art
     win |= old & (yy < bot) & ~ndimage.binary_dilation(keep, iterations=10)
     return keep, win
+
+
+def layout_original(o: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(keep, window) like layout(), but all of the old art is kept: the
+    sides are new, with a window where the old one ran into the 4:3 edge."""
+    w169 = 480 * 16 // 9
+    x0 = (w169 - 640) // 2
+    art = o.sum(2) > 0
+    keep = np.zeros((480, w169), bool)
+    win = np.zeros((480, w169), bool)
+    keep[:, x0:x0 + 640] = art
+    win[:, x0:x0 + 640] = ~art
+    side = np.zeros_like(win)
+    side[~art[:, :3].any(1), :x0] = True
+    side[~art[:, -3:].any(1), x0 + 640:] = True
+    side = ndimage.gaussian_filter(side.astype(np.float32), 8) > 0.5   # round corners
+    yy, xx = np.mgrid[0:480, 0:w169]
+    m = 18                                              # frame along the screen edge
+    side &= (xx > m) & (xx < w169 - m) & (yy > m) & (yy < 480 - m)
+    side[:, x0:x0 + 640] = False
+    return keep, win | side
 
 
 def up(mask: np.ndarray) -> np.ndarray:
@@ -173,9 +215,12 @@ def main() -> None:
     ap.add_argument("--model", default="gemini-3-pro-image")
     ap.add_argument("--only", default="")
     ap.add_argument("--force", action="store_true", help="paint again")
+    ap.add_argument("--style", choices=("original", "panorama"), default="original")
     a = ap.parse_args()
     dump, hd_dir = ROOT / a.dump, ROOT / a.hd
     out_dir, raw_dir = hd_dir / "cockpit", ROOT / "runs" / "cockpit"
+    if a.style == "original":
+        raw_dir = raw_dir / "original"
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
     key = None
@@ -190,13 +235,14 @@ def main() -> None:
             print("no instrument layout for", bright.stem)
             continue
         hd = hd_art(hd_dir, bright)
-        keep, win = layout(o, rects)
+        keep, win = layout_original(o) if a.style == "original" else layout(o, rects)
         raw = raw_dir / f"{bright.stem}.png"
         if not raw.exists() or a.force:
             cv = canvas(hd, keep, win)
             cv.save(raw_dir / f"{bright.stem}_layout.png")
             key = key or SECRET.read_text(encoding="utf-8").strip()
-            img = generate(key, cv.resize((W // 2, H // 2), Image.LANCZOS), PROMPT, a.model)
+            img = generate(key, cv.resize((W // 2, H // 2), Image.LANCZOS),
+                           PROMPT_ORIGINAL if a.style == "original" else PROMPT, a.model)
             log_spend(f"cockpit_wide {bright.stem}")
             img.save(raw)
             print("painted", bright.stem, img.size, flush=True)
