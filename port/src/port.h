@@ -188,6 +188,7 @@ const char *script_shot_wanted(void);
 void script_shot_done(void);
 void script_shot_hotkey(void);
 int  script_shot_is_hotkey(void);
+int  script_selftest(void);
 int  write_bmp24(const char *path, int w, int h, const uint8_t *rows,
                  int stride);
 int  write_bmp_argb(const char *path, int w, int h, const uint32_t *px);

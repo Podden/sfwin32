@@ -43,10 +43,53 @@ static Uint32        g_shot_deadline;
  * before the game chdirs into its assets. */
 void script_set_shot_dir(const char *dir)
 {
-    char full[MAX_PATH];
-    if (dir) strncpy(g_shot_dir, dir, sizeof g_shot_dir - 1);
-    if (GetFullPathNameA(g_shot_dir, sizeof full, full, NULL))
+    char  full[MAX_PATH];
+    DWORD n;
+    if (dir) {
+        strncpy(g_shot_dir, dir, sizeof g_shot_dir - 1);
+        g_shot_dir[sizeof g_shot_dir - 1] = 0;
+    }
+    /* GetFullPathNameA returns the size it would have needed when the buffer
+     * is too small and leaves it unfilled, so only copy a result that fits
+     * (0 < n < sizeof full); a path past MAX_PATH keeps the directory as is. */
+    n = GetFullPathNameA(g_shot_dir, sizeof full, full, NULL);
+    if (n > 0 && n < sizeof full) {
         strncpy(g_shot_dir, full, sizeof g_shot_dir - 1);
+        g_shot_dir[sizeof g_shot_dir - 1] = 0;
+    }
+}
+
+/* Guards the GetFullPathNameA buffer-size contract above: a directory that
+ * canonicalizes past MAX_PATH must leave g_shot_dir NUL-terminated and free
+ * of uninitialized stack, and a normal path must come back absolute. Saves
+ * and restores g_shot_dir so a startup call stays unaffected. */
+int script_selftest(void)
+{
+    char   saved[sizeof g_shot_dir];
+    size_t i;
+    int    ok = 1;
+
+    memcpy(saved, g_shot_dir, sizeof g_shot_dir);
+
+    /* A relative directory as long as the buffer canonicalizes past MAX_PATH
+     * (current dir is prepended): script_set_shot_dir must skip the fill and
+     * keep the truncated input terminated, never copy stack garbage from full. */
+    for (i = 0; i < sizeof g_shot_dir - 1; i++) g_shot_dir[i] = 'a';
+    g_shot_dir[sizeof g_shot_dir - 1] = 0;
+    script_set_shot_dir(NULL);
+    ok &= g_shot_dir[sizeof g_shot_dir - 1] == 0;
+    for (i = 0; i < sizeof g_shot_dir - 1; i++)
+        if (g_shot_dir[i] != 'a') { ok = 0; break; }
+
+    /* A normal path comes back absolute (drive or UNC) and NUL-terminated. */
+    script_set_shot_dir("shots");
+    ok &= g_shot_dir[sizeof g_shot_dir - 1] == 0;
+    ok &= (g_shot_dir[1] == ':' && g_shot_dir[2] == '\\') ||
+          (g_shot_dir[0] == '\\' && g_shot_dir[1] == '\\');
+    ok &= strstr(g_shot_dir, "shots") != NULL;
+
+    memcpy(g_shot_dir, saved, sizeof g_shot_dir);
+    return ok;
 }
 
 /* The screenshot key (Print Screen, see video.c): a shot into the shot
