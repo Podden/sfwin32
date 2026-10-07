@@ -591,6 +591,7 @@ int main(int argc, char **argv)
 
     /* The game opens its data with DOS-relative paths, so the asset directory
      * has to be the working directory. */
+    if (!script_selftest()) LOGW("script: self-test failed, shot paths may be off");
     script_set_shot_dir(NULL);
     if (assets) {
         if (!SetCurrentDirectoryA(assets)) {
