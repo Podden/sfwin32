@@ -208,6 +208,24 @@ def build(painted: np.ndarray, hd: np.ndarray, keep: np.ndarray, win: np.ndarray
     return np.concatenate([rgb.clip(0, 255), (a * 255)[..., None]], axis=2).astype(np.uint8)
 
 
+def style_dirs(hd_dir: Path, runs_root: Path, style: str) -> tuple[Path, Path]:
+    """Resolve (out_dir, raw_dir) for a cockpit style.
+
+    The final asset is consumed by the game at <hd>/cockpit/<name>.png, so the
+    default 'original' style keeps that canonical path. Any other style writes
+    its final asset to its own <hd>/cockpit/<style>/ subfolder, so building one
+    style never silently overwrites the asset built with another (the docstring
+    above compares both approaches -- both outputs must survive side by side).
+    raw_dir is the paint cache and keeps its existing per-style layout.
+    """
+    out_dir, raw_dir = hd_dir / "cockpit", runs_root / "cockpit"
+    if style == "original":
+        raw_dir = raw_dir / "original"
+    else:
+        out_dir = out_dir / style
+    return out_dir, raw_dir
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", default="dump_v2")
@@ -218,9 +236,7 @@ def main() -> None:
     ap.add_argument("--style", choices=("original", "panorama"), default="original")
     a = ap.parse_args()
     dump, hd_dir = ROOT / a.dump, ROOT / a.hd
-    out_dir, raw_dir = hd_dir / "cockpit", ROOT / "runs" / "cockpit"
-    if a.style == "original":
-        raw_dir = raw_dir / "original"
+    out_dir, raw_dir = style_dirs(hd_dir, ROOT / "runs", a.style)
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
     key = None
