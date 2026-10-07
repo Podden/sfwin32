@@ -88,6 +88,10 @@ def main() -> None:
     sheet = []
     for data, paths in by_data.items():
         ims = [np.asarray(Image.open(p).convert("RGBA")) for p in paths]
+        shapes = {im.shape for im in ims}
+        if len(shapes) > 1:
+            print("skip", data, "mismatched sizes", shapes)
+            continue
         m = np.max([mask(a) for a in ims], axis=0)
         if (m > 0.3).sum() < 4:
             continue
